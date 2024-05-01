@@ -301,7 +301,7 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         let mut writer_offset = 0;
         let page_size = get_page_size().map_err(MemoryError::PageSize)?;
 
-        self.iter()
+        let write_result = self.iter()
             .enumerate()
             .try_for_each(|(slot, region)| {
                 let kvm_bitmap = dirty_bitmap.get(&slot).unwrap();
@@ -314,6 +314,7 @@ impl GuestMemoryExtension for GuestMemoryMmap {
                         let is_kvm_page_dirty = ((v >> j) & 1u64) != 0u64;
                         let page_offset = ((i * 64) + j) * page_size;
                         let is_firecracker_page_dirty = firecracker_bitmap.dirty_at(page_offset);
+
                         if is_kvm_page_dirty || is_firecracker_page_dirty {
                             // We are at the start of a new batch of dirty pages.
                             if write_size == 0 {
@@ -324,6 +325,7 @@ impl GuestMemoryExtension for GuestMemoryMmap {
                                 dirty_batch_start = page_offset as u64;
                             }
                             write_size += page_size;
+
                         } else if write_size > 0 {
                             // We are at the end of a batch of dirty pages.
                             writer.write_all_volatile(
@@ -344,13 +346,32 @@ impl GuestMemoryExtension for GuestMemoryMmap {
                     )?;
                 }
                 writer_offset += region.len();
-                if let Some(bitmap) = firecracker_bitmap {
-                    bitmap.reset();
-                }
 
                 Ok(())
-            })
-            .map_err(MemoryError::WriteMemory)
+            });
+
+        if write_result.is_err() {
+            self.iter().enumerate().for_each(|(slot, region)| {
+                let kvm_bitmap = dirty_bitmap.get(&slot).unwrap();
+                let firecracker_bitmap = region.bitmap();
+
+                for (i, v) in kvm_bitmap.iter().enumerate() {
+                    for j in 0..64 {
+                        let is_kvm_page_dirty = ((v >> j) & 1u64) != 0u64;
+
+                        if is_kvm_page_dirty {
+                            let page_offset = ((i * 64) + j) * page_size;
+
+                            firecracker_bitmap.mark_dirty(page_offset, 1)
+                        }
+                    }
+                }
+            });
+        } else {
+            self.reset_dirty();
+        }
+
+        write_result.map_err(MemoryError::WriteMemory)
     }
 
     /// Resets all the memory region bitmaps
