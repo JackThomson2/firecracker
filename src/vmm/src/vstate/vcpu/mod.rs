@@ -12,7 +12,7 @@ use std::sync::{Arc, Barrier};
 use std::{fmt, io, thread};
 
 use kvm_bindings::{KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
-use kvm_ioctls::VcpuExit;
+use kvm_ioctls::{VcpuExit, VcpuFd};
 use libc::{c_int, c_void, siginfo_t};
 use log::{error, info, warn};
 use seccompiler::{BpfProgram, BpfProgramRef};
@@ -20,8 +20,10 @@ use utils::errno;
 use utils::eventfd::EventFd;
 use utils::signal::{register_signal_handler, sigrtmin, Killable};
 use utils::sm::StateMachine;
+use vm_memory::GuestAddress;
 
 use crate::cpu_config::templates::{CpuConfiguration, GuestConfigError};
+use crate::gdb::server::kvm_debug;
 use crate::logger::{IncMetric, METRICS};
 use crate::vstate::vm::Vm;
 use crate::FcExitCode;
@@ -89,11 +91,13 @@ pub struct Vcpu {
 
     /// File descriptor for vcpu to trigger exit event on vmm.
     exit_evt: EventFd,
+    /// Debugger emitter for gdb events
+    gdb_event: Option<EventFd>,
     /// The receiving end of events channel owned by the vcpu side.
     event_receiver: Receiver<VcpuEvent>,
     /// The transmitting end of the events channel which will be given to the handler.
     event_sender: Option<Sender<VcpuEvent>>,
-    /// The receiving end of the responses channel which will be given to the handler.
+    /// The receiving end of the responses channel which will be given to the handler..
     response_receiver: Option<Receiver<VcpuResponse>>,
     /// The transmitting end of the responses channel owned by the vcpu side.
     response_sender: Sender<VcpuResponse>,
@@ -200,6 +204,7 @@ impl Vcpu {
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
             response_sender,
+            gdb_event: None,
             kvm_vcpu,
         })
     }
@@ -207,6 +212,26 @@ impl Vcpu {
     /// Sets a MMIO bus for this vcpu.
     pub fn set_mmio_bus(&mut self, mmio_bus: crate::devices::Bus) {
         self.kvm_vcpu.peripherals.mmio_bus = Some(mmio_bus);
+    }
+
+    /// Attaches the GDB event fd to the vcpu
+    pub fn attach_gdb_event_fd(&mut self, gdb_event: EventFd) {
+        self.gdb_event = Some(gdb_event)
+    }
+
+    /// Get a sender for vcpu events
+    pub fn get_event_sender(&self) -> Option<Sender<VcpuEvent>> {
+        let sender = self.event_sender.clone()?;
+        Some(sender)
+    }
+
+    /// Uses the kvm api to translate the virtual address
+    fn translate_gva(&self, address: u64) -> u64 {
+        let tr = self.kvm_vcpu.fd.translate_gva(address).unwrap();
+        match tr.valid {
+            0 => 0,
+            _ => tr.physical_address
+        }
     }
 
     /// Moves the vcpu to its own thread and constructs a VcpuHandle.
@@ -260,6 +285,9 @@ impl Vcpu {
     fn running(&mut self) -> StateMachine<Self> {
         // This loop is here just for optimizing the emulation path.
         // No point in ticking the state machine if there are no external events.
+        // By default don't change state.
+        let mut state = StateMachine::next(Self::running);
+
         loop {
             match self.run_emulation() {
                 // Emulation ran successfully, continue.
@@ -271,13 +299,15 @@ impl Vcpu {
                 // - the other vCPUs won't ever exit out of `KVM_RUN`, but they won't consume CPU.
                 // So we pause vCPU0 and send a signal to the emulation thread to stop the VMM.
                 Ok(VcpuEmulation::Stopped) => return self.exit(FcExitCode::Ok),
+                // If the emulation requests a pause lets do this
+                Ok(VcpuEmulation::Paused) => {
+                    state = StateMachine::next(Self::paused);
+                    break;
+                }
                 // Emulation errors lead to vCPU exit.
                 Err(_) => return self.exit(FcExitCode::GenericError),
             }
         }
-
-        // By default don't change state.
-        let mut state = StateMachine::next(Self::running);
 
         // Break this emulation loop on any transition request/external event.
         match self.event_receiver.try_recv() {
@@ -312,6 +342,27 @@ impl Vcpu {
                 self.response_sender
                     .send(VcpuResponse::NotAllowed(String::from(
                         "cpu config dump is unavailable while running",
+                    )))
+                    .expect("vcpu channel unexpectedly closed");
+            }
+            Ok(VcpuEvent::SetHwBP(memory_addresses)) => {
+                kvm_debug(&self.kvm_vcpu.fd, &memory_addresses, false);
+                self.response_sender
+                    .send(VcpuResponse::Resumed)
+                    .expect("vcpu channel unexpectedly closed");
+            }
+            Ok(VcpuEvent::EnableSingleStep(enabled)) => {
+                info!("Setting single step to {enabled}");
+                kvm_debug(&self.kvm_vcpu.fd, &vec![], enabled);
+                self.response_sender
+                    .send(VcpuResponse::Paused)
+                    .expect("vcpu channel unexpectedly closed");
+            }
+            Ok(VcpuEvent::GvaTranslate(_)) => {
+                info!("Gva translate inside running..");
+                self.response_sender
+                    .send(VcpuResponse::NotAllowed(String::from(
+                        "gva translate is unavailable while running",
                     )))
                     .expect("vcpu channel unexpectedly closed");
             }
@@ -386,6 +437,33 @@ impl Vcpu {
 
                 StateMachine::next(Self::paused)
             }
+            Ok(VcpuEvent::SetHwBP(memory_addresses)) => {
+                info!("Setting hw bp");
+                kvm_debug(&self.kvm_vcpu.fd, &memory_addresses, false);
+                self.response_sender
+                    .send(VcpuResponse::Paused)
+                    .expect("vcpu channel unexpectedly closed");
+
+                StateMachine::next(Self::paused)
+            }
+            Ok(VcpuEvent::EnableSingleStep(enabled)) => {
+                info!("Setting single step to {enabled}");
+                kvm_debug(&self.kvm_vcpu.fd, &vec![], enabled);
+                self.response_sender
+                    .send(VcpuResponse::Paused)
+                    .expect("vcpu channel unexpectedly closed");
+
+                StateMachine::next(Self::paused)
+            }
+            Ok(VcpuEvent::GvaTranslate(address)) => {
+                info!("Translating guest virtual address");
+                let response = self.translate_gva(address);
+                self.response_sender
+                    .send(VcpuResponse::GvaTranslation(response))
+                    .expect("vcpu channel unexpectedly closed");
+
+                StateMachine::next(Self::paused)
+            }
             Ok(VcpuEvent::Finish) => StateMachine::finish(),
             // Unhandled exit of the other end.
             Err(_) => {
@@ -447,7 +525,15 @@ impl Vcpu {
                 self.kvm_vcpu.fd.set_kvm_immediate_exit(0);
                 // Notify that this KVM_RUN was interrupted.
                 Ok(VcpuEmulation::Interrupted)
-            }
+            },
+            Ok(VcpuExit::Debug(_)) => {
+                info!("We got a cpu debug exit!");
+                if let Some(gdb_event) = &self.gdb_event {
+                    gdb_event.write(1).expect("Unable to notify gdb event");
+                }
+
+                Ok(VcpuEmulation::Paused)
+            },
             emulation_result => handle_kvm_exit(&mut self.kvm_vcpu.peripherals, emulation_result),
         }
     }
@@ -572,6 +658,12 @@ pub enum VcpuEvent {
     SaveState,
     /// Event to dump CPU configuration of a paused Vcpu.
     DumpCpuConfig,
+    /// Sets a HW breakpoint
+    SetHwBP(Vec<GuestAddress>),
+    /// Enables single step on the guest
+    EnableSingleStep(bool),
+    /// Translate a guest virtual address
+    GvaTranslate(u64),
 }
 
 /// List of responses that the Vcpu reports.
@@ -590,6 +682,8 @@ pub enum VcpuResponse {
     SavedState(Box<VcpuState>),
     /// Vcpu is in the state where CPU config is dumped.
     DumpedCpuConfig(Box<CpuConfiguration>),
+    /// The response with a translated virtual address
+    GvaTranslation(u64)
 }
 
 impl fmt::Debug for VcpuResponse {
@@ -603,6 +697,7 @@ impl fmt::Debug for VcpuResponse {
             Error(ref err) => write!(f, "VcpuResponse::Error({:?})", err),
             NotAllowed(ref reason) => write!(f, "VcpuResponse::NotAllowed({})", reason),
             DumpedCpuConfig(_) => write!(f, "VcpuResponse::DumpedCpuConfig"),
+            GvaTranslation(_) => write!(f, "VcpuResponse::GvaTranslation"),
         }
     }
 }
@@ -688,6 +783,8 @@ pub enum VcpuEmulation {
     Interrupted,
     /// Stopped.
     Stopped,
+    /// Pause request
+    Paused,
 }
 
 #[cfg(test)]

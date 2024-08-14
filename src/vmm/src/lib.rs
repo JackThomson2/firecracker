@@ -83,6 +83,8 @@ pub(crate) mod device_manager;
 pub mod devices;
 /// minimalist HTTP/TCP/IPv4 stack named DUMBO
 pub mod dumbo;
+/// GDB support for guest
+pub mod gdb;
 /// Logger
 pub mod logger;
 /// microVM Metadata Service MMDS

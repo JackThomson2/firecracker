@@ -57,6 +57,7 @@ use crate::devices::virtio::net::Net;
 use crate::devices::virtio::rng::Entropy;
 use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
 use crate::devices::BusDevice;
+use crate::gdb;
 use crate::logger::{debug, error};
 use crate::persist::{MicrovmState, MicrovmStateError};
 use crate::resources::VmResources;
@@ -304,6 +305,10 @@ pub fn build_microvm_for_boot(
         cpu_template.kvm_capabilities.clone(),
     )?;
 
+    let gdb_event = EventFd::new(EFD_NONBLOCK).unwrap();
+    vcpus.iter_mut()
+        .for_each(|vcpu| vcpu.attach_gdb_event_fd(gdb_event.try_clone().unwrap()));
+
     // The boot timer device needs to be the first device attached in order
     // to maintain the same MMIO address referenced in the documentation
     // and tests.
@@ -341,6 +346,7 @@ pub fn build_microvm_for_boot(
 
     attach_vmgenid_device(&mut vmm)?;
 
+
     configure_system_for_boot(
         &mut vmm,
         vcpus.as_mut(),
@@ -351,8 +357,12 @@ pub fn build_microvm_for_boot(
         boot_cmdline,
     )?;
 
+    let vmm = Arc::new(Mutex::new(vmm));
+
+    gdb::server::gdb_thread(vmm.clone(), &vcpus, gdb_event, entry_addr);
+
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
-    vmm.start_vcpus(
+    vmm.lock().unwrap().start_vcpus(
         vcpus,
         seccomp_filters
             .get("vcpu")
@@ -373,9 +383,6 @@ pub fn build_microvm_for_boot(
     )
     .map_err(VmmError::SeccompFilters)
     .map_err(Internal)?;
-
-    let vmm = Arc::new(Mutex::new(vmm));
-    event_manager.add_subscriber(vmm.clone());
 
     Ok(vmm)
 }
@@ -539,6 +546,7 @@ pub fn build_microvm_from_snapshot(
             .notify_vmgenid()
             .map_err(BuildMicrovmFromSnapshotError::VMGenIDUpdate)?;
     }
+
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
     vmm.start_vcpus(
