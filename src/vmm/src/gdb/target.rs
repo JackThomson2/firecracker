@@ -1,8 +1,9 @@
-use std::arch;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use gdbstub::arch::Arch;
 use gdbstub::common::Signal;
+use gdbstub::stub::{BaseStopReason, SingleThreadStopReason};
 use gdbstub::target::{Target, TargetError, TargetResult};
 use gdbstub::target::ext::base::BaseOps;
 use gdbstub::target::ext::base::singlethread::{
@@ -23,7 +24,7 @@ use gdbstub_arch::x86::reg::X86_64CoreRegs as CoreRegs;
 use gdbstub_arch::x86::X86_64_SSE as GdbArch;
 use kvm_bindings::kvm_regs;
 use utils::eventfd::EventFd;
-use vm_memory::{Bytes, GuestAddress, GuestMemory};
+use vm_memory::{Bytes, GuestAddress};
 
 use crate::logger::{info, error};
 use crate::{VcpuEvent, VcpuHandle, VcpuResponse, Vmm};
@@ -34,8 +35,9 @@ pub struct FirecrackerTarget {
     pub gdb_event: EventFd,
 
     hw_breakpoints: Vec<GuestAddress>,
+    sw_breakpoints: HashMap<<GdbArch as Arch>::Usize, [u8;1]>,
 
-    single_step: bool
+    pub single_step: bool
 }
 
 impl FirecrackerTarget {
@@ -44,8 +46,19 @@ impl FirecrackerTarget {
             vmm,
             gdb_event,
             hw_breakpoints: Vec::new(),
+            sw_breakpoints: HashMap::new(),
             single_step: false,
         }
+    }
+
+    pub fn request_pause(&self) {
+        let cpu_handle = &self.vmm
+            .lock()
+            .expect("error unlocking vmm")
+            .vcpus_handles[0];
+        
+        cpu_handle.send_event(VcpuEvent::Pause).unwrap();
+        let _ = cpu_handle.response_receiver().recv().unwrap();
     }
 
     fn get_regs(&self) -> Option<kvm_regs> {
@@ -54,25 +67,31 @@ impl FirecrackerTarget {
             .expect("error unlocking vmm")
             .vcpus_handles[0];
         
-        cpu_handle.send_event(VcpuEvent::SaveState).unwrap();
+        cpu_handle.send_event(VcpuEvent::GetRegisters).unwrap();
         let response = cpu_handle.response_receiver().recv().unwrap();
 
-        if let VcpuResponse::SavedState(response) = response {
-            let regs = response.regs;
-            return Some(regs);
+        if let VcpuResponse::KvmRegisters(response) = response {
+            return Some(response);
+        }
+
+        if let VcpuResponse::NotAllowed(message) = response {
+            info!("Response from get regs: {message}");
         }
 
         None
     }
 
-    fn update_breakpoints(&self) {
+    fn set_regs(&self, regs: kvm_regs) {
         let cpu_handle = &self.vmm
             .lock()
             .expect("error unlocking vmm")
             .vcpus_handles[0];
-
-        cpu_handle.send_event(VcpuEvent::SetHwBP(self.hw_breakpoints.clone())).unwrap();
-        let _ = cpu_handle.response_receiver().recv().unwrap();
+        
+        cpu_handle.send_event(VcpuEvent::SetRegisters(regs)).unwrap();
+        let response = cpu_handle.response_receiver().recv().unwrap();
+        if let VcpuResponse::NotAllowed(message) = response {
+            info!("Response from set regs: {message}");
+        }
     }
 
     fn resume_execution(&self) {
@@ -82,48 +101,69 @@ impl FirecrackerTarget {
             .vcpus_handles[0];
 
         // Ensure breakpoints are correctly in sync before resuming
-        cpu_handle.send_event(VcpuEvent::SetHwBP(self.hw_breakpoints.clone())).unwrap();
-        let _ = cpu_handle.response_receiver().recv().unwrap();
+        cpu_handle.send_event(VcpuEvent::SetKvmDebug(self.hw_breakpoints.clone(), self.single_step)).unwrap();
+        let response = cpu_handle.response_receiver().recv().unwrap();
+        if let VcpuResponse::NotAllowed(message) = response {
+            info!("Response from set kvm debug: {message}");
+        }
 
         cpu_handle.send_event(VcpuEvent::Resume).unwrap();
-        let _ = cpu_handle.response_receiver().recv().unwrap();
-    }
-
-    fn set_single_step(&self, enabled: bool) {
-        let cpu_handle = &self.vmm
-            .lock()
-            .expect("error unlocking vmm")
-            .vcpus_handles[0];
-
-        // Ensure breakpoints are correctly in sync before resuming
-        cpu_handle.send_event(VcpuEvent::EnableSingleStep(enabled)).unwrap();
-        let _ = cpu_handle.response_receiver().recv().unwrap();
-    }
-
-    fn send_resume(&self) {
-        let cpu_handle = &self.vmm
-            .lock()
-            .expect("error unlocking vmm")
-            .vcpus_handles[0];
-
-        // Ensure breakpoints are correctly in sync before resuming
-        cpu_handle.send_event(VcpuEvent::Resume).unwrap();
-        let _ = cpu_handle.response_receiver().recv().unwrap();
+        let response = cpu_handle.response_receiver().recv().unwrap();
+        if let VcpuResponse::NotAllowed(message) = response {
+            info!("Response resume : {message}");
+        }
     }
 
     fn translate_gva(&self, cpu_handle: &VcpuHandle, address: u64) -> Option<u64> {
-        info!("Sending event to cpu");
-        
         cpu_handle.send_event(VcpuEvent::GvaTranslate(address)).unwrap();
         let response = cpu_handle.response_receiver().recv().unwrap();
-
-        info!("Got event back from cpu");
 
         if let VcpuResponse::GvaTranslation(response) = response {
             return Some(response);
         }
 
+        if let VcpuResponse::NotAllowed(message) = response {
+            info!("Response from gva: {message}");
+        }
+
         None
+    }
+
+    pub fn get_stop_reason(&mut self) -> Option<BaseStopReason<(), u64>> {
+        let cpu_regs = self.get_regs();
+
+        if self.single_step {
+            return Some(SingleThreadStopReason::DoneStep);
+        }
+
+        if let Some(regs) = cpu_regs {
+            info!("Stopped at reg: {:X}", regs.rip);
+            if let Some(removed) = self.sw_breakpoints.remove(&regs.rip) {
+                info!("Hit sw breakpoint clearing it and returning that");
+                let _ = self.write_addrs(regs.rip, &removed);
+                return Some(SingleThreadStopReason::SwBreak(()));
+            }
+
+            if self.hw_breakpoints.contains(&GuestAddress(regs.rip)) {
+                info!("Hit hw breakpoint returning that");
+                return Some(SingleThreadStopReason::HwBreak(()));
+            }
+
+            info!("Found bp we didn't set lets just break out here");
+
+            return Some(SingleThreadStopReason::SwBreak(()));
+
+            // let mut coreregs: CoreRegs = Default::default();
+            // let _ = self.read_registers(&mut coreregs);
+            // coreregs.rip += 1;
+            // let _ = self.write_registers(&coreregs);
+            //
+            // return None
+        } else {
+            info!("No reg info");
+        }
+
+        return Some(SingleThreadStopReason::SwBreak(()));
     }
 }
 
@@ -144,7 +184,7 @@ impl Target for FirecrackerTarget {
 
     #[inline(always)]
     fn guard_rail_implicit_sw_breakpoints(&self) -> bool {
-        true
+        false
     }
 }
 
@@ -174,6 +214,8 @@ impl SingleThreadBase for FirecrackerTarget {
 
             regs.rip = cpu_regs.rip;
             regs.eflags = cpu_regs.rflags as u32;
+        } else {
+            info!("Failed to ready cpu registers");
         }
 
         Ok(()) 
@@ -183,9 +225,39 @@ impl SingleThreadBase for FirecrackerTarget {
         &mut self,
         regs: &CoreRegs
     ) -> TargetResult<(), Self> {
+        info!(".................Writing cpu registers..............");
+        let mut new_regs: kvm_regs = Default::default();
+
+        new_regs.rax = regs.regs[0];
+        new_regs.rbx = regs.regs[1];
+        new_regs.rcx = regs.regs[2];
+        new_regs.rdx = regs.regs[3];
+        new_regs.rsi = regs.regs[4];
+        new_regs.rdi = regs.regs[5];
+        new_regs.rbp = regs.regs[6];
+        new_regs.rsp = regs.regs[7];
+
+        new_regs.r8 = regs.regs[8];
+        new_regs.r9 = regs.regs[9];
+        new_regs.r10 = regs.regs[10];
+        new_regs.r11 = regs.regs[11];
+        new_regs.r12 = regs.regs[12];
+        new_regs.r13 = regs.regs[13];
+        new_regs.r14 = regs.regs[14];
+        new_regs.r15 = regs.regs[15];
+
+        new_regs.rip = regs.rip;
+        new_regs.rflags = regs.eflags as u64;
+
+        if let Some(old_regs) = self.get_regs() {
+            info!("Old registers: {old_regs:?}");
+            info!("New registers: {new_regs:?}");
+        }
+
+        self.set_regs(new_regs);
+
         Ok(()) 
     }
-
 
     fn read_addrs(
         &mut self,
@@ -200,39 +272,35 @@ impl SingleThreadBase for FirecrackerTarget {
 
         let mut total_read = 0_u64;
 
+        if len == 1 {
+            info!("Reading 1 byte from: {start_addr:X}");
+        }
+
         while total_read < len as u64 {
             let gaddr = start_addr + total_read;
             let paddr = match self.translate_gva(&vmm.vcpus_handles[0], gaddr) {
                 Some(paddr) => paddr,
-                None => return Err(TargetError::NonFatal)
+                None => {
+                    info!("Error translating gva on read address: {start_addr:X}");
+                    gaddr
+                }
             };
             let psize = 4096;
             let read_len = std::cmp::min(len as u64 - total_read, psize - (paddr & (psize - 1)));
-            memory 
+            if memory 
                 .read(
                     &mut data[total_read as usize..total_read as usize + read_len as usize],
                     GuestAddress(paddr),
-                )
-                .expect("Error");
+                ).is_err() {
+                    error!("Error while reading memory");
+                    return Err(TargetError::NonFatal)
+            }
             total_read += read_len;
         }
 
-        let real_address = match self.translate_gva(&vmm.vcpus_handles[0], start_addr) {
-            Some(res ) if res > 0 => res,
-            _ => {
-                info!("Error translating gva");
-                return Err(TargetError::NonFatal)
-            }
-        };
-        info!("Got real address");
+        info!("Read {total_read} bytes");
 
-        match memory.read(data, GuestAddress(real_address)) {
-            Ok(res) => Ok(res),
-            Err(e) => {
-                error!("Failed to request ReadMem: {:?}", e);
-                Err(TargetError::NonFatal)
-            }
-        }
+        Ok(total_read as usize)
     }
 
     fn write_addrs(
@@ -242,17 +310,43 @@ impl SingleThreadBase for FirecrackerTarget {
     ) -> TargetResult<(), Self> {
         let vmm = &self.vmm.lock().expect("Error unlocking vmm");
         let memory = vmm.guest_memory();
+        let len = data.len();
 
-        match memory.write(data, GuestAddress(start_addr)) {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                error!("Failed to request ReadMem: {:?}", e);
-                Err(TargetError::NonFatal)
-            }
+        info!("Editing address data, we are writing {len} bytes");
+        let mut total_written = 0_u64;
+
+        if len == 1 {
+            info!("Writing {:X} at {start_addr:X}", data[0]);
         }
-    }
 
-    // most targets will want to support at resumption as well...
+        while total_written < len as u64 {
+            info!("Looping total written {total_written} len {len}");
+            let gaddr = start_addr + total_written;
+            let paddr = match self.translate_gva(&vmm.vcpus_handles[0], gaddr) {
+                Some(paddr) if paddr == u64::MIN => gaddr,
+                Some(paddr) => paddr,
+                None => {
+                    info!("Error translating gva");
+                    return Err(TargetError::NonFatal)
+                }
+            };
+            let psize = 4096;
+            let write_len = std::cmp::min(len as u64 - total_written, psize - (paddr & (psize - 1)));
+            if memory 
+                .write(
+                    &data[total_written as usize..total_written as usize + write_len as usize],
+                    GuestAddress(paddr),
+                ).is_err() {
+                    info!("Error writing memory");
+                    return Err(TargetError::NonFatal)
+            }
+            total_written += write_len;
+        }
+
+        info!("Done writing address data");
+
+        Ok(())
+    }
 
     #[inline(always)]
     fn support_resume(&mut self) -> Option<SingleThreadResumeOps<Self>> {
@@ -266,6 +360,7 @@ impl SingleThreadResume for FirecrackerTarget {
         _signal: Option<Signal>,
     ) -> Result<(), Self::Error> {
         info!("Got resume command");
+        self.single_step = false;
         self.resume_execution();
 
         Ok(()) 
@@ -285,16 +380,21 @@ impl SingleThreadSingleStep for FirecrackerTarget {
         _signal: Option<Signal>,
     ) -> Result<(), Self::Error> { 
         info!("Got single step command");
-        self.set_single_step(true);
-        self.send_resume();
+        self.single_step = true;
+        self.resume_execution();
+
         Ok(()) 
     }
 }
 
 impl Breakpoints for FirecrackerTarget {
-    // there are several kinds of breakpoints - this target uses software breakpoints
     #[inline(always)]
     fn support_hw_breakpoint(&mut self) -> Option<HwBreakpointOps<Self>> {
+        Some(self)
+    }
+
+    #[inline(always)]
+    fn support_sw_breakpoint(&mut self) -> Option<SwBreakpointOps<Self>> {
         Some(self)
     }
 }
@@ -305,9 +405,8 @@ impl HwBreakpoint for FirecrackerTarget {
         addr: <Self::Arch as Arch>::Usize,
         _kind: <Self::Arch as Arch>::BreakpointKind,
     ) -> TargetResult<bool, Self> {
-        info!("Setting hw breakpoint..");
+        info!("Setting hw breakpoint at {addr:X}");
         self.hw_breakpoints.push(GuestAddress(addr));
-        self.update_breakpoints();
 
         Ok(true)
     }
@@ -317,14 +416,48 @@ impl HwBreakpoint for FirecrackerTarget {
         addr: <Self::Arch as Arch>::Usize,
         _kind: <Self::Arch as Arch>::BreakpointKind,
     ) -> TargetResult<bool, Self> {
-        info!("Removing hw breakpoint..");
+        info!("Removing hw breakpoint at {addr:X}");
         match self.hw_breakpoints.iter().position(|&b| b.0 == addr) {
             None => return Ok(false),
             Some(pos) => self.hw_breakpoints.remove(pos),
         };
         info!("Removed hw breakpoint..");
-        self.update_breakpoints();
 
         Ok(true)
+    }
+}
+
+impl SwBreakpoint for FirecrackerTarget {
+    fn add_sw_breakpoint(
+        &mut self,
+        addr: <Self::Arch as Arch>::Usize,
+        _kind: <Self::Arch as Arch>::BreakpointKind,
+    ) -> TargetResult<bool, Self> {
+        info!("Setting sw breakpoint at {addr:X}");
+        if self.sw_breakpoints.contains_key(&addr) {
+            return Ok(true);
+        }
+
+        let mut saved_register = [0];
+        let _ = self.read_addrs(addr, &mut saved_register);
+        self.sw_breakpoints.insert(addr, saved_register);
+        
+        let break_point = [0xCC];
+        let _ = self.write_addrs(addr, &break_point);
+        Ok(true)
+    }
+
+    fn remove_sw_breakpoint(
+        &mut self,
+        addr: <Self::Arch as Arch>::Usize,
+        _kind: <Self::Arch as Arch>::BreakpointKind,
+    ) -> TargetResult<bool, Self> {
+        info!("Removing sw breakpoint at {addr:X}");
+        if let Some(removed) = self.sw_breakpoints.remove(&addr) {
+            let _ = self.write_addrs(addr, &removed);
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 }

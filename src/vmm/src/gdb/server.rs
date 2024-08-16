@@ -1,5 +1,5 @@
 use event_manager::{EventOps, EventSet, Events, MutEventSubscriber, SubscriberOps};
-use gdbstub::{arch::Arch, common::Signal, conn::{Connection, ConnectionExt}, stub::{run_blocking, DisconnectReason, GdbStub, SingleThreadStopReason}, target::Target};
+use gdbstub::{arch::Arch, common::Signal, conn::{Connection, ConnectionExt}, stub::{run_blocking, DisconnectReason, GdbStub, SingleThreadStopReason}, target::{ext::base::singlethread::SingleThreadSingleStep, Target}};
 use kvm_bindings::{kvm_guest_debug, kvm_guest_debug_arch, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP, KVM_GUESTDBG_USE_HW_BP, KVM_GUESTDBG_USE_SW_BP};
 use kvm_ioctls::VcpuFd;
 use utils::eventfd::EventFd;
@@ -34,7 +34,7 @@ fn event_loop(connection: UnixStream, vmm: Arc<Mutex<Vmm>>, gdb_event_fd: EventF
 }
 
 pub fn kvm_debug(vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool) {
-    let mut control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP;
+    let mut control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP | KVM_GUESTDBG_USE_SW_BP;
     if step {
         control |= KVM_GUESTDBG_SINGLESTEP;
     }
@@ -54,7 +54,7 @@ pub fn kvm_debug(vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool) {
     if let Err(_) = vcpu.set_guest_debug(&dbg) {
         error!("Error setting debug");
     } else {
-        info!("Debug setup succesfully")
+        info!("Debug setup succesfully. Single Step: {step} BP count: {}", addrs.len())
     }
 }
 
@@ -94,21 +94,21 @@ impl run_blocking::BlockingEventLoop for MyGdbBlockingEventLoop {
             <Self::Connection as Connection>::Error,
         >,
     > {
-        // the specific mechanism to "select" between incoming data and target
-        // events will depend on your project's architecture.
-        //
-        // some examples of how you might implement this method include: `epoll`,
-        // `select!` across multiple event channels, periodic polling, etc...
-        //
-        // in this example, lets assume the target has a magic method that handles
-        // this for us.
-        //
-
         loop {
             match target.gdb_event.read() {
                 Ok(_) => {
-                    info!("Got notification from gdb eventfd");
-                    return Ok(run_blocking::Event::TargetStopped(SingleThreadStopReason::HwBreak(())));
+                    // thread::sleep(Duration::from_secs(1));
+                    info!("Got notification from gdb eventfd ensuring cpu paused");
+                    target.request_pause();
+
+                    let stop_resonse = match target.get_stop_reason() {
+                        Some(res) => res,
+                        None => {
+                            continue;
+                        }
+                    };
+
+                    return Ok(run_blocking::Event::TargetStopped(stop_resonse));
                 },
                 Err(e) => {
                     if e.kind() != ErrorKind::WouldBlock {

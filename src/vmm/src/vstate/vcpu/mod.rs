@@ -11,7 +11,7 @@ use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Barrier};
 use std::{fmt, io, thread};
 
-use kvm_bindings::{KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
+use kvm_bindings::{kvm_regs, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
 use kvm_ioctls::{VcpuExit, VcpuFd};
 use libc::{c_int, c_void, siginfo_t};
 use log::{error, info, warn};
@@ -301,8 +301,7 @@ impl Vcpu {
                 Ok(VcpuEmulation::Stopped) => return self.exit(FcExitCode::Ok),
                 // If the emulation requests a pause lets do this
                 Ok(VcpuEmulation::Paused) => {
-                    state = StateMachine::next(Self::paused);
-                    break;
+                    return StateMachine::next(Self::paused);
                 }
                 // Emulation errors lead to vCPU exit.
                 Err(_) => return self.exit(FcExitCode::GenericError),
@@ -345,21 +344,28 @@ impl Vcpu {
                     )))
                     .expect("vcpu channel unexpectedly closed");
             }
-            Ok(VcpuEvent::SetHwBP(memory_addresses)) => {
-                kvm_debug(&self.kvm_vcpu.fd, &memory_addresses, false);
+            Ok(VcpuEvent::GetRegisters) => {
                 self.response_sender
-                    .send(VcpuResponse::Resumed)
+                    .send(VcpuResponse::NotAllowed(String::from(
+                        "get registers is unavailable while running",
+                    )))
                     .expect("vcpu channel unexpectedly closed");
             }
-            Ok(VcpuEvent::EnableSingleStep(enabled)) => {
-                info!("Setting single step to {enabled}");
-                kvm_debug(&self.kvm_vcpu.fd, &vec![], enabled);
+            Ok(VcpuEvent::SetRegisters(regs)) => {
                 self.response_sender
-                    .send(VcpuResponse::Paused)
+                    .send(VcpuResponse::NotAllowed(String::from(
+                        "dump is unavailable while running",
+                    )))
                     .expect("vcpu channel unexpectedly closed");
             }
-            Ok(VcpuEvent::GvaTranslate(_)) => {
-                info!("Gva translate inside running..");
+            Ok(VcpuEvent::SetKvmDebug(memory_addresses, single_step)) => {
+                self.response_sender
+                    .send(VcpuResponse::NotAllowed(String::from(
+                        "kvm debug is unavailable while running",
+                    )))
+                    .expect("vcpu channel unexpectedly closed");
+            }
+            Ok(VcpuEvent::GvaTranslate(address)) => {
                 self.response_sender
                     .send(VcpuResponse::NotAllowed(String::from(
                         "gva translate is unavailable while running",
@@ -421,6 +427,19 @@ impl Vcpu {
 
                 StateMachine::next(Self::paused)
             }
+            Ok(VcpuEvent::GetRegisters) => {
+                self.response_sender
+                    .send(VcpuResponse::KvmRegisters(self.kvm_vcpu.fd.get_regs().expect("Unable to load kvm regs")))
+                    .expect("vcpu channel unexpectedly closed");
+                StateMachine::next(Self::paused)
+            }
+            Ok(VcpuEvent::SetRegisters(regs)) => {
+                self.kvm_vcpu.fd.set_regs(&regs).expect("Unable to set vcpu registers");
+                self.response_sender
+                    .send(VcpuResponse::Paused)
+                    .expect("vcpu channel unexpectedly closed");
+                StateMachine::next(Self::paused)
+            }
             Ok(VcpuEvent::DumpCpuConfig) => {
                 self.kvm_vcpu
                     .dump_cpu_config()
@@ -437,18 +456,9 @@ impl Vcpu {
 
                 StateMachine::next(Self::paused)
             }
-            Ok(VcpuEvent::SetHwBP(memory_addresses)) => {
-                info!("Setting hw bp");
-                kvm_debug(&self.kvm_vcpu.fd, &memory_addresses, false);
-                self.response_sender
-                    .send(VcpuResponse::Paused)
-                    .expect("vcpu channel unexpectedly closed");
-
-                StateMachine::next(Self::paused)
-            }
-            Ok(VcpuEvent::EnableSingleStep(enabled)) => {
-                info!("Setting single step to {enabled}");
-                kvm_debug(&self.kvm_vcpu.fd, &vec![], enabled);
+            Ok(VcpuEvent::SetKvmDebug(memory_addresses, single_step)) => {
+                info!("Setting kvm debug");
+                kvm_debug(&self.kvm_vcpu.fd, &memory_addresses, single_step);
                 self.response_sender
                     .send(VcpuResponse::Paused)
                     .expect("vcpu channel unexpectedly closed");
@@ -530,6 +540,8 @@ impl Vcpu {
                 info!("We got a cpu debug exit!");
                 if let Some(gdb_event) = &self.gdb_event {
                     gdb_event.write(1).expect("Unable to notify gdb event");
+                } else {
+                    info!("No gdb event?");
                 }
 
                 Ok(VcpuEmulation::Paused)
@@ -658,10 +670,12 @@ pub enum VcpuEvent {
     SaveState,
     /// Event to dump CPU configuration of a paused Vcpu.
     DumpCpuConfig,
-    /// Sets a HW breakpoint
-    SetHwBP(Vec<GuestAddress>),
-    /// Enables single step on the guest
-    EnableSingleStep(bool),
+    /// Set vcpu register
+    GetRegisters,
+    /// Set vcpu register
+    SetRegisters(kvm_regs),
+    /// Sets kvm debug flags
+    SetKvmDebug(Vec<GuestAddress>, bool),
     /// Translate a guest virtual address
     GvaTranslate(u64),
 }
@@ -682,6 +696,8 @@ pub enum VcpuResponse {
     SavedState(Box<VcpuState>),
     /// Vcpu is in the state where CPU config is dumped.
     DumpedCpuConfig(Box<CpuConfiguration>),
+    /// Vcpu kvm registers
+    KvmRegisters(kvm_regs),
     /// The response with a translated virtual address
     GvaTranslation(u64)
 }
@@ -696,6 +712,7 @@ impl fmt::Debug for VcpuResponse {
             SavedState(_) => write!(f, "VcpuResponse::SavedState"),
             Error(ref err) => write!(f, "VcpuResponse::Error({:?})", err),
             NotAllowed(ref reason) => write!(f, "VcpuResponse::NotAllowed({})", reason),
+            KvmRegisters(_) => write!(f, "VcpuResponse::KvmRegisters"),
             DumpedCpuConfig(_) => write!(f, "VcpuResponse::DumpedCpuConfig"),
             GvaTranslation(_) => write!(f, "VcpuResponse::GvaTranslation"),
         }
