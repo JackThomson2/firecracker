@@ -1,6 +1,6 @@
 use event_manager::{EventOps, EventSet, Events, MutEventSubscriber, SubscriberOps};
 use gdbstub::{arch::Arch, common::Signal, conn::{Connection, ConnectionExt}, stub::{run_blocking, DisconnectReason, GdbStub, SingleThreadStopReason}, target::{ext::base::singlethread::SingleThreadSingleStep, Target}};
-use kvm_bindings::{kvm_guest_debug, kvm_guest_debug_arch, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP, KVM_GUESTDBG_USE_HW_BP, KVM_GUESTDBG_USE_SW_BP};
+use kvm_bindings::{kvm_guest_debug, kvm_guest_debug_arch, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_INJECT_BP, KVM_GUESTDBG_SINGLESTEP, KVM_GUESTDBG_USE_HW_BP, KVM_GUESTDBG_USE_SW_BP};
 use kvm_ioctls::VcpuFd;
 use utils::eventfd::EventFd;
 use vm_memory::GuestAddress;
@@ -58,6 +58,31 @@ pub fn kvm_debug(vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool) {
     }
 }
 
+pub fn kvm_inject_bp(vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool) {
+    let mut control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP | KVM_GUESTDBG_USE_SW_BP | KVM_GUESTDBG_INJECT_BP;
+    if step {
+        control |= KVM_GUESTDBG_SINGLESTEP;
+    }
+    let mut dbg = kvm_guest_debug {
+        control,
+        ..Default::default()
+    };
+
+     dbg.arch.debugreg[7] = 0x0600;
+
+    for (i, addr) in addrs.iter().enumerate() {
+        dbg.arch.debugreg[i] = addr.0;
+        // Set global breakpoint enable flag
+        dbg.arch.debugreg[7] |= 2 << (i * 2);
+    }
+
+    if let Err(_) = vcpu.set_guest_debug(&dbg) {
+        error!("Error setting debug");
+    } else {
+        info!("Injected breakpoint to guest. Single Step: {step} BP count: {}", addrs.len())
+    }
+}
+
 pub fn gdb_thread(vmm: Arc<Mutex<Vmm>>, vcpu: &Vec<Vcpu>, gdb_event_fd: EventFd, entry_addr: GuestAddress) {
     kvm_debug(&vcpu[0].kvm_vcpu.fd, &vec![entry_addr], false);
 
@@ -104,6 +129,7 @@ impl run_blocking::BlockingEventLoop for MyGdbBlockingEventLoop {
                     let stop_resonse = match target.get_stop_reason() {
                         Some(res) => res,
                         None => {
+                            target.request_resume();
                             continue;
                         }
                     };

@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use gdbstub::arch::Arch;
 use gdbstub::common::Signal;
 use gdbstub::stub::{BaseStopReason, SingleThreadStopReason};
+use gdbstub::target::ext::thread_extra_info;
 use gdbstub::target::{Target, TargetError, TargetResult};
 use gdbstub::target::ext::base::BaseOps;
 use gdbstub::target::ext::base::singlethread::{
@@ -94,6 +95,19 @@ impl FirecrackerTarget {
         }
     }
 
+    pub fn request_resume(&self) {
+        let cpu_handle = &self.vmm
+            .lock()
+            .expect("error unlocking vmm")
+            .vcpus_handles[0];
+
+        cpu_handle.send_event(VcpuEvent::Resume).unwrap();
+        let response = cpu_handle.response_receiver().recv().unwrap();
+        if let VcpuResponse::NotAllowed(message) = response {
+            info!("Response resume : {message}");
+        }
+    }
+
     fn resume_execution(&self) {
         let cpu_handle = &self.vmm
             .lock()
@@ -129,6 +143,19 @@ impl FirecrackerTarget {
         None
     }
 
+    fn inject_bp_to_guest(&self) {
+        let cpu_handle = &self.vmm
+            .lock()
+            .expect("error unlocking vmm")
+            .vcpus_handles[0];
+
+        cpu_handle.send_event(VcpuEvent::InjectKvmBP(self.hw_breakpoints.clone(), self.single_step)).unwrap();
+        let response = cpu_handle.response_receiver().recv().unwrap();
+        if let VcpuResponse::NotAllowed(message) = response {
+            info!("Response resume : {message}");
+        }
+    }
+
     pub fn get_stop_reason(&mut self) -> Option<BaseStopReason<(), u64>> {
         let cpu_regs = self.get_regs();
 
@@ -149,9 +176,16 @@ impl FirecrackerTarget {
                 return Some(SingleThreadStopReason::HwBreak(()));
             }
 
-            info!("Found bp we didn't set lets just break out here");
+            if regs.rip == 0x1000000 {
+                info!("This was the injected bp...");
+                return Some(SingleThreadStopReason::HwBreak(()));
+            }
 
-            return Some(SingleThreadStopReason::SwBreak(()));
+            info!("Found bp we didn't set lets notify the guest");
+            self.inject_bp_to_guest();
+
+            // return Some(SingleThreadStopReason::SwBreak(()));
+            return None
 
             // let mut coreregs: CoreRegs = Default::default();
             // let _ = self.read_registers(&mut coreregs);
@@ -247,7 +281,7 @@ impl SingleThreadBase for FirecrackerTarget {
         new_regs.r15 = regs.regs[15];
 
         new_regs.rip = regs.rip;
-        new_regs.rflags = regs.eflags as u64;
+        new_regs.rflags = regs.eflags  as u64;
 
         if let Some(old_regs) = self.get_regs() {
             info!("Old registers: {old_regs:?}");
@@ -296,6 +330,10 @@ impl SingleThreadBase for FirecrackerTarget {
                     return Err(TargetError::NonFatal)
             }
             total_read += read_len;
+        }
+
+        if total_read == 1 {
+            info!("Read data was {:X}", data[0]);
         }
 
         info!("Read {total_read} bytes");

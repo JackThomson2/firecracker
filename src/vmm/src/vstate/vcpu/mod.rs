@@ -23,7 +23,7 @@ use utils::sm::StateMachine;
 use vm_memory::GuestAddress;
 
 use crate::cpu_config::templates::{CpuConfiguration, GuestConfigError};
-use crate::gdb::server::kvm_debug;
+use crate::gdb::server::{kvm_debug, kvm_inject_bp};
 use crate::logger::{IncMetric, METRICS};
 use crate::vstate::vm::Vm;
 use crate::FcExitCode;
@@ -351,17 +351,24 @@ impl Vcpu {
                     )))
                     .expect("vcpu channel unexpectedly closed");
             }
-            Ok(VcpuEvent::SetRegisters(regs)) => {
+            Ok(VcpuEvent::SetRegisters(_)) => {
                 self.response_sender
                     .send(VcpuResponse::NotAllowed(String::from(
                         "dump is unavailable while running",
                     )))
                     .expect("vcpu channel unexpectedly closed");
             }
-            Ok(VcpuEvent::SetKvmDebug(memory_addresses, single_step)) => {
+            Ok(VcpuEvent::SetKvmDebug(_, _)) => {
                 self.response_sender
                     .send(VcpuResponse::NotAllowed(String::from(
                         "kvm debug is unavailable while running",
+                    )))
+                    .expect("vcpu channel unexpectedly closed");
+            }
+            Ok(VcpuEvent::InjectKvmBP(_,_)) => {
+                self.response_sender
+                    .send(VcpuResponse::NotAllowed(String::from(
+                        "Injecting bp is unavailable while running",
                     )))
                     .expect("vcpu channel unexpectedly closed");
             }
@@ -459,6 +466,15 @@ impl Vcpu {
             Ok(VcpuEvent::SetKvmDebug(memory_addresses, single_step)) => {
                 info!("Setting kvm debug");
                 kvm_debug(&self.kvm_vcpu.fd, &memory_addresses, single_step);
+                self.response_sender
+                    .send(VcpuResponse::Paused)
+                    .expect("vcpu channel unexpectedly closed");
+
+                StateMachine::next(Self::paused)
+            }
+            Ok(VcpuEvent::InjectKvmBP(memory_addresses, single_step)) => {
+                info!("Setting kvm debug");
+                kvm_inject_bp(&self.kvm_vcpu.fd, &memory_addresses, single_step);
                 self.response_sender
                     .send(VcpuResponse::Paused)
                     .expect("vcpu channel unexpectedly closed");
@@ -676,6 +692,8 @@ pub enum VcpuEvent {
     SetRegisters(kvm_regs),
     /// Sets kvm debug flags
     SetKvmDebug(Vec<GuestAddress>, bool),
+    /// Inject BP
+    InjectKvmBP(Vec<GuestAddress>, bool),
     /// Translate a guest virtual address
     GvaTranslate(u64),
 }
