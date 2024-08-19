@@ -138,9 +138,10 @@ impl FirecrackerTarget {
 
         if let VcpuResponse::NotAllowed(message) = response {
             info!("Response from gva: {message}");
+            return None;
         }
 
-        None
+        Some(address)
     }
 
     fn inject_bp_to_guest(&self) {
@@ -165,7 +166,12 @@ impl FirecrackerTarget {
 
         if let Some(regs) = cpu_regs {
             info!("Stopped at reg: {:X}", regs.rip);
-            if let Some(removed) = self.sw_breakpoints.remove(&regs.rip) {
+            let physical_addr = {
+               let vmm = &self.vmm.lock().expect("Error unlocking vmm");
+               self.translate_gva(&vmm.vcpus_handles[0], regs.rip).unwrap()
+            };
+
+            if let Some(removed) = self.sw_breakpoints.remove(&physical_addr) {
                 info!("Hit sw breakpoint clearing it and returning that");
                 let _ = self.write_addrs(regs.rip, &removed);
                 return Some(SingleThreadStopReason::SwBreak(()));
@@ -375,7 +381,7 @@ impl SingleThreadBase for FirecrackerTarget {
                     &data[total_written as usize..total_written as usize + write_len as usize],
                     GuestAddress(paddr),
                 ).is_err() {
-                    info!("Error writing memory");
+                    info!("Error writing memory at {paddr:X}");
                     return Err(TargetError::NonFatal)
             }
             total_written += write_len;
@@ -472,13 +478,19 @@ impl SwBreakpoint for FirecrackerTarget {
         _kind: <Self::Arch as Arch>::BreakpointKind,
     ) -> TargetResult<bool, Self> {
         info!("Setting sw breakpoint at {addr:X}");
-        if self.sw_breakpoints.contains_key(&addr) {
+        let physical_addr = {
+           let vmm = &self.vmm.lock().expect("Error unlocking vmm");
+           self.translate_gva(&vmm.vcpus_handles[0], addr).unwrap()
+        };
+
+        if self.sw_breakpoints.contains_key(&physical_addr) {
             return Ok(true);
         }
 
         let mut saved_register = [0];
         let _ = self.read_addrs(addr, &mut saved_register);
-        self.sw_breakpoints.insert(addr, saved_register);
+        self.sw_breakpoints.insert(physical_addr, saved_register);
+        info!("Inserting SW breakpoint at {physical_addr:X}");
         
         let break_point = [0xCC];
         let _ = self.write_addrs(addr, &break_point);
@@ -491,11 +503,18 @@ impl SwBreakpoint for FirecrackerTarget {
         _kind: <Self::Arch as Arch>::BreakpointKind,
     ) -> TargetResult<bool, Self> {
         info!("Removing sw breakpoint at {addr:X}");
-        if let Some(removed) = self.sw_breakpoints.remove(&addr) {
+
+        let physical_addr = {
+           let vmm = &self.vmm.lock().expect("Error unlocking vmm");
+           self.translate_gva(&vmm.vcpus_handles[0], addr).unwrap()
+        };
+        info!("Removing SW breakpoint at {physical_addr:X}");
+
+        if let Some(removed) = self.sw_breakpoints.remove(&physical_addr) {
             let _ = self.write_addrs(addr, &removed);
             return Ok(true);
         }
 
-        Ok(false)
+        Ok(true)
     }
 }
