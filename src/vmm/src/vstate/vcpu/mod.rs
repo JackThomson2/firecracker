@@ -12,7 +12,7 @@ use std::sync::{Arc, Barrier};
 use std::{fmt, io, thread};
 
 use kvm_bindings::{kvm_regs, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
-use kvm_ioctls::{VcpuExit, VcpuFd};
+use kvm_ioctls::VcpuExit;
 use libc::{c_int, c_void, siginfo_t};
 use log::{error, info, warn};
 use seccompiler::{BpfProgram, BpfProgramRef};
@@ -24,6 +24,7 @@ use vm_memory::GuestAddress;
 
 use crate::cpu_config::templates::{CpuConfiguration, GuestConfigError};
 use crate::gdb::server::{kvm_debug, kvm_inject_bp};
+use crate::gdb::target::get_raw_tid;
 use crate::logger::{IncMetric, METRICS};
 use crate::vstate::vm::Vm;
 use crate::FcExitCode;
@@ -93,6 +94,8 @@ pub struct Vcpu {
     exit_evt: EventFd,
     /// Debugger emitter for gdb events
     gdb_event: Option<EventFd>,
+    /// VCPU id this is to track the id of the vcpu
+    id: Option<usize>,
     /// The receiving end of events channel owned by the vcpu side.
     event_receiver: Receiver<VcpuEvent>,
     /// The transmitting end of the events channel which will be given to the handler.
@@ -205,6 +208,7 @@ impl Vcpu {
             response_receiver: Some(response_receiver),
             response_sender,
             gdb_event: None,
+            id: None,
             kvm_vcpu,
         })
     }
@@ -214,9 +218,10 @@ impl Vcpu {
         self.kvm_vcpu.peripherals.mmio_bus = Some(mmio_bus);
     }
 
-    /// Attaches the GDB event fd to the vcpu
-    pub fn attach_gdb_event_fd(&mut self, gdb_event: EventFd) {
-        self.gdb_event = Some(gdb_event)
+    /// Attaches the fields required for debugging
+    pub fn attach_debug_info(&mut self, gdb_event: EventFd, cpu_id: usize) {
+        self.gdb_event = Some(gdb_event);
+        self.id = Some(cpu_id);
     }
 
     /// Get a sender for vcpu events
@@ -230,7 +235,7 @@ impl Vcpu {
         let tr = self.kvm_vcpu.fd.translate_gva(address).unwrap();
         match tr.valid {
             0 => 0,
-            _ => tr.physical_address
+            _ => tr.physical_address,
         }
     }
 
@@ -365,14 +370,14 @@ impl Vcpu {
                     )))
                     .expect("vcpu channel unexpectedly closed");
             }
-            Ok(VcpuEvent::InjectKvmBP(_,_)) => {
+            Ok(VcpuEvent::InjectKvmBP(_, _)) => {
                 self.response_sender
                     .send(VcpuResponse::NotAllowed(String::from(
                         "Injecting bp is unavailable while running",
                     )))
                     .expect("vcpu channel unexpectedly closed");
             }
-            Ok(VcpuEvent::GvaTranslate(address)) => {
+            Ok(VcpuEvent::GvaTranslate(_)) => {
                 self.response_sender
                     .send(VcpuResponse::NotAllowed(String::from(
                         "gva translate is unavailable while running",
@@ -436,12 +441,20 @@ impl Vcpu {
             }
             Ok(VcpuEvent::GetRegisters) => {
                 self.response_sender
-                    .send(VcpuResponse::KvmRegisters(self.kvm_vcpu.fd.get_regs().expect("Unable to load kvm regs")))
+                    .send(VcpuResponse::KvmRegisters(
+                        self.kvm_vcpu
+                            .fd
+                            .get_regs()
+                            .expect("Unable to load kvm regs"),
+                    ))
                     .expect("vcpu channel unexpectedly closed");
                 StateMachine::next(Self::paused)
             }
             Ok(VcpuEvent::SetRegisters(regs)) => {
-                self.kvm_vcpu.fd.set_regs(&regs).expect("Unable to set vcpu registers");
+                self.kvm_vcpu
+                    .fd
+                    .set_regs(&regs)
+                    .expect("Unable to set vcpu registers");
                 self.response_sender
                     .send(VcpuResponse::Paused)
                     .expect("vcpu channel unexpectedly closed");
@@ -551,17 +564,19 @@ impl Vcpu {
                 self.kvm_vcpu.fd.set_kvm_immediate_exit(0);
                 // Notify that this KVM_RUN was interrupted.
                 Ok(VcpuEmulation::Interrupted)
-            },
+            }
             Ok(VcpuExit::Debug(_)) => {
-                info!("We got a cpu debug exit!");
+                let cpu_id = self.id.expect("No cpu id regustered");
+                info!("We got a cpu debug exit on core {cpu_id}!");
                 if let Some(gdb_event) = &self.gdb_event {
-                    gdb_event.write(1).expect("Unable to notify gdb event");
+                    gdb_event.write(get_raw_tid(cpu_id) as u64).expect("Unable to notify gdb event");
+                    info!("Wrote update to event fd");
                 } else {
                     info!("No gdb event?");
                 }
 
                 Ok(VcpuEmulation::Paused)
-            },
+            }
             emulation_result => handle_kvm_exit(&mut self.kvm_vcpu.peripherals, emulation_result),
         }
     }
@@ -717,7 +732,7 @@ pub enum VcpuResponse {
     /// Vcpu kvm registers
     KvmRegisters(kvm_regs),
     /// The response with a translated virtual address
-    GvaTranslation(u64)
+    GvaTranslation(u64),
 }
 
 impl fmt::Debug for VcpuResponse {

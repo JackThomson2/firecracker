@@ -306,8 +306,10 @@ pub fn build_microvm_for_boot(
     )?;
 
     let gdb_event = EventFd::new(EFD_NONBLOCK).unwrap();
-    vcpus.iter_mut()
-        .for_each(|vcpu| vcpu.attach_gdb_event_fd(gdb_event.try_clone().unwrap()));
+    vcpus
+        .iter_mut()
+        .enumerate()
+        .for_each(|(id, vcpu)| vcpu.attach_debug_info(gdb_event.try_clone().unwrap(), id));
 
     // The boot timer device needs to be the first device attached in order
     // to maintain the same MMIO address referenced in the documentation
@@ -346,7 +348,6 @@ pub fn build_microvm_for_boot(
 
     attach_vmgenid_device(&mut vmm)?;
 
-
     configure_system_for_boot(
         &mut vmm,
         vcpus.as_mut(),
@@ -362,15 +363,17 @@ pub fn build_microvm_for_boot(
     gdb::server::gdb_thread(vmm.clone(), &vcpus, gdb_event, entry_addr);
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
-    vmm.lock().unwrap().start_vcpus(
-        vcpus,
-        seccomp_filters
-            .get("vcpu")
-            .ok_or_else(|| MissingSeccompFilters("vcpu".to_string()))?
-            .clone(),
-    )
-    .map_err(VmmError::VcpuStart)
-    .map_err(Internal)?;
+    vmm.lock()
+        .unwrap()
+        .start_vcpus(
+            vcpus,
+            seccomp_filters
+                .get("vcpu")
+                .ok_or_else(|| MissingSeccompFilters("vcpu".to_string()))?
+                .clone(),
+        )
+        .map_err(VmmError::VcpuStart)
+        .map_err(Internal)?;
 
     // Load seccomp filters for the VMM thread.
     // Execution panics if filters cannot be loaded, use --no-seccomp if skipping filters
@@ -546,7 +549,6 @@ pub fn build_microvm_from_snapshot(
             .notify_vmgenid()
             .map_err(BuildMicrovmFromSnapshotError::VMGenIDUpdate)?;
     }
-
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
     vmm.start_vcpus(
