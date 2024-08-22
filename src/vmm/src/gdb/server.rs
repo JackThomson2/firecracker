@@ -47,12 +47,7 @@ fn event_loop(connection: UnixStream, vmm: Arc<Mutex<Vmm>>, gdb_event_fd: EventF
     gdb_event_loop_thread(debugger, target);
 }
 
-/// TODO DOCS
-pub fn kvm_debug(vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool) {
-    let mut control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP | KVM_GUESTDBG_USE_SW_BP;
-    if step {
-        control |= KVM_GUESTDBG_SINGLESTEP;
-    }
+fn set_kvm_debug(control: u32, vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool) {
     let mut dbg = kvm_guest_debug {
         control,
         ..Default::default()
@@ -77,35 +72,27 @@ pub fn kvm_debug(vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool) {
 }
 
 /// TODO DOCS
+pub fn kvm_debug(vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool) {
+    let mut control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP | KVM_GUESTDBG_USE_SW_BP;
+    if step {
+        control |= KVM_GUESTDBG_SINGLESTEP;
+    }
+
+    set_kvm_debug(control, vcpu, addrs, step)
+}
+
+/// TODO DOCS
 pub fn kvm_inject_bp(vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool) {
     let mut control = KVM_GUESTDBG_ENABLE
         | KVM_GUESTDBG_USE_HW_BP
         | KVM_GUESTDBG_USE_SW_BP
         | KVM_GUESTDBG_INJECT_BP;
+
     if step {
         control |= KVM_GUESTDBG_SINGLESTEP;
     }
-    let mut dbg = kvm_guest_debug {
-        control,
-        ..Default::default()
-    };
 
-    dbg.arch.debugreg[7] = 0x0600;
-
-    for (i, addr) in addrs.iter().enumerate() {
-        dbg.arch.debugreg[i] = addr.0;
-        // Set global breakpoint enable flag
-        dbg.arch.debugreg[7] |= 2 << (i * 2);
-    }
-
-    if let Err(_) = vcpu.set_guest_debug(&dbg) {
-        error!("Error setting debug");
-    } else {
-        info!(
-            "Injected breakpoint to guest. Single Step: {step} BP count: {}",
-            addrs.len()
-        )
-    }
+    set_kvm_debug(control, vcpu, addrs, step)
 }
 
 /// TODO DOCS
@@ -115,6 +102,8 @@ pub fn gdb_thread(
     gdb_event_fd: EventFd,
     entry_addr: GuestAddress,
 ) {
+    // We register a hw breakpoint at the entry point to allow setting
+    // breakpoints in the kernel setup process
     kvm_debug(&vcpu[0].kvm_vcpu.fd, &vec![entry_addr], false);
 
     for i in 1..vcpu.len() {
@@ -165,6 +154,8 @@ impl run_blocking::BlockingEventLoop for MyGdbBlockingEventLoop {
                     let stop_response = match target.get_stop_reason(tid) {
                         Some(res) => res,
                         None => {
+                            // If we returned None this is a breakwhich should be handled by
+                            // the guest kernel (e.g. kernel int3 self testing) so we won't notify GDB
                             target.request_resume(tid);
                             info!("We did an early exit for cpu id {cpu_id}");
                             continue;
@@ -203,9 +194,6 @@ impl run_blocking::BlockingEventLoop for MyGdbBlockingEventLoop {
         target.notify_paused_vcpu(main_core);
 
         let exit_reason = MultiThreadStopReason::SignalWithThread { tid: main_core, signal: Signal::SIGINT };
-
-        // a pretty typical stop reason in response to a Ctrl-C interrupt is to
-        // report a "Signal::SIGINT".
         Ok(Some(exit_reason.into()))
     }
 }

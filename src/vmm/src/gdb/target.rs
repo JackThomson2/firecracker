@@ -1,5 +1,4 @@
-use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use gdbstub::arch::Arch;
@@ -36,12 +35,13 @@ struct VCpuState {
     paused: bool
 }
 
-/// TODO DOCS
+/// The debug target for firecracker. This is used the manage the debug
+/// implementation and handle requests sent via GDB
 #[derive(Debug)]
 pub struct FirecrackerTarget {
     vmm: Arc<Mutex<Vmm>>,
 
-    /// TODO DOCS
+    /// This event fd us used to notify us of cpu debug exits
     pub gdb_event: EventFd,
 
     hw_breakpoints: Vec<GuestAddress>,
@@ -56,12 +56,14 @@ fn tid_to_cpuid(tid: Tid) -> usize {
     tid.get() - 1
 }
 
-/// TODO DOCS
+/// Converts the inernal index of a vcpu to
+/// the Tid required by GDB
 pub fn cpuid_to_tid(cpu_id: usize) -> Tid {
     Tid::new(get_raw_tid(cpu_id)).unwrap()
 }
 
-/// TODO DOCS
+/// Converts the inernal index of a vcpu to
+/// the 1 indexed value for GDB
 pub fn get_raw_tid(cpu_id: usize) -> usize {
     cpu_id + 1
 }
@@ -94,10 +96,12 @@ impl FirecrackerTarget {
         }
     }
 
-    pub fn get_paused_vcpu(&self) -> Tid {
+    fn get_paused_vcpu(&self) -> Tid {
         self.paused_vcpu.expect("Attempt to retrieve vcpu while non are paused..")
     }
 
+    /// This is used to notify the target that the provided Tid
+    /// is in a paused state
     pub fn notify_paused_vcpu(&mut self, tid: Tid) {
         let found = match self.vcpu_state.get_mut(&tid) {
             Some(res) => res,
@@ -146,13 +150,13 @@ impl FirecrackerTarget {
         }
     }
 
-    /// TODO DOCS
+    /// This method is used to shutdown the VMM
     pub fn shutdown(&self) {
         info!("Shutting down the vmm");
         self.vmm.lock().expect("error unlocking vmm").stop(FcExitCode::Ok)
     }
 
-    /// TODO DOCS
+    /// This method can be used to manually pause the requested vcpu
     pub fn request_pause(&mut self, tid: Tid) {
         let vcpu_state = match self.vcpu_state.get(&tid) {
             Some(res) => res,
