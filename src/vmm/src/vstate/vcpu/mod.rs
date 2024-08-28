@@ -11,7 +11,9 @@ use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Barrier};
 use std::{fmt, io, thread};
 
-use kvm_bindings::{kvm_regs, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
+#[cfg(feature = "debug")]
+use kvm_bindings::kvm_regs;
+use kvm_bindings::{KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
 use kvm_ioctls::VcpuExit;
 use libc::{c_int, c_void, siginfo_t};
 use log::{error, info, warn};
@@ -20,10 +22,13 @@ use utils::errno;
 use utils::eventfd::EventFd;
 use utils::signal::{register_signal_handler, sigrtmin, Killable};
 use utils::sm::StateMachine;
+#[cfg(feature = "debug")]
 use vm_memory::GuestAddress;
 
 use crate::cpu_config::templates::{CpuConfiguration, GuestConfigError};
+#[cfg(feature = "debug")]
 use crate::gdb::server::{kvm_debug, kvm_inject_bp};
+#[cfg(feature = "debug")]
 use crate::gdb::target::get_raw_tid;
 use crate::logger::{IncMetric, METRICS};
 use crate::vstate::vm::Vm;
@@ -231,6 +236,7 @@ impl Vcpu {
     }
 
     /// Uses the kvm api to translate the virtual address
+    #[cfg(feature = "debug")]
     fn translate_gva(&self, address: u64) -> u64 {
         let tr = self.kvm_vcpu.fd.translate_gva(address).unwrap();
         match tr.valid {
@@ -349,6 +355,7 @@ impl Vcpu {
                     )))
                     .expect("vcpu channel unexpectedly closed");
             }
+            #[cfg(feature = "debug")]
             Ok(VcpuEvent::GetRegisters) => {
                 self.response_sender
                     .send(VcpuResponse::NotAllowed(String::from(
@@ -356,6 +363,7 @@ impl Vcpu {
                     )))
                     .expect("vcpu channel unexpectedly closed");
             }
+            #[cfg(feature = "debug")]
             Ok(VcpuEvent::SetRegisters(_)) => {
                 self.response_sender
                     .send(VcpuResponse::NotAllowed(String::from(
@@ -363,6 +371,7 @@ impl Vcpu {
                     )))
                     .expect("vcpu channel unexpectedly closed");
             }
+            #[cfg(feature = "debug")]
             Ok(VcpuEvent::SetKvmDebug(_, _)) => {
                 self.response_sender
                     .send(VcpuResponse::NotAllowed(String::from(
@@ -370,6 +379,7 @@ impl Vcpu {
                     )))
                     .expect("vcpu channel unexpectedly closed");
             }
+            #[cfg(feature = "debug")]
             Ok(VcpuEvent::InjectKvmBP(_, _)) => {
                 self.response_sender
                     .send(VcpuResponse::NotAllowed(String::from(
@@ -377,6 +387,7 @@ impl Vcpu {
                     )))
                     .expect("vcpu channel unexpectedly closed");
             }
+            #[cfg(feature = "debug")]
             Ok(VcpuEvent::GvaTranslate(_)) => {
                 self.response_sender
                     .send(VcpuResponse::NotAllowed(String::from(
@@ -439,27 +450,6 @@ impl Vcpu {
 
                 StateMachine::next(Self::paused)
             }
-            Ok(VcpuEvent::GetRegisters) => {
-                self.response_sender
-                    .send(VcpuResponse::KvmRegisters(
-                        self.kvm_vcpu
-                            .fd
-                            .get_regs()
-                            .expect("Unable to load kvm regs"),
-                    ))
-                    .expect("vcpu channel unexpectedly closed");
-                StateMachine::next(Self::paused)
-            }
-            Ok(VcpuEvent::SetRegisters(regs)) => {
-                self.kvm_vcpu
-                    .fd
-                    .set_regs(&regs)
-                    .expect("Unable to set vcpu registers");
-                self.response_sender
-                    .send(VcpuResponse::Paused)
-                    .expect("vcpu channel unexpectedly closed");
-                StateMachine::next(Self::paused)
-            }
             Ok(VcpuEvent::DumpCpuConfig) => {
                 self.kvm_vcpu
                     .dump_cpu_config()
@@ -476,6 +466,30 @@ impl Vcpu {
 
                 StateMachine::next(Self::paused)
             }
+            #[cfg(feature = "debug")]
+            Ok(VcpuEvent::GetRegisters) => {
+                self.response_sender
+                    .send(VcpuResponse::KvmRegisters(
+                        self.kvm_vcpu
+                            .fd
+                            .get_regs()
+                            .expect("Unable to load kvm regs"),
+                    ))
+                    .expect("vcpu channel unexpectedly closed");
+                StateMachine::next(Self::paused)
+            }
+            #[cfg(feature = "debug")]
+            Ok(VcpuEvent::SetRegisters(regs)) => {
+                self.kvm_vcpu
+                    .fd
+                    .set_regs(&regs)
+                    .expect("Unable to set vcpu registers");
+                self.response_sender
+                    .send(VcpuResponse::Paused)
+                    .expect("vcpu channel unexpectedly closed");
+                StateMachine::next(Self::paused)
+            }
+            #[cfg(feature = "debug")]
             Ok(VcpuEvent::SetKvmDebug(memory_addresses, single_step)) => {
                 info!("Setting kvm debug");
                 kvm_debug(&self.kvm_vcpu.fd, &memory_addresses, single_step);
@@ -485,6 +499,7 @@ impl Vcpu {
 
                 StateMachine::next(Self::paused)
             }
+            #[cfg(feature = "debug")]
             Ok(VcpuEvent::InjectKvmBP(memory_addresses, single_step)) => {
                 info!("Setting kvm debug");
                 kvm_inject_bp(&self.kvm_vcpu.fd, &memory_addresses, single_step);
@@ -494,6 +509,7 @@ impl Vcpu {
 
                 StateMachine::next(Self::paused)
             }
+            #[cfg(feature = "debug")]
             Ok(VcpuEvent::GvaTranslate(address)) => {
                 info!("Translating guest virtual address");
                 let response = self.translate_gva(address);
@@ -565,11 +581,14 @@ impl Vcpu {
                 // Notify that this KVM_RUN was interrupted.
                 Ok(VcpuEmulation::Interrupted)
             }
+            #[cfg(feature = "debug")]
             Ok(VcpuExit::Debug(_)) => {
                 let cpu_id = self.id.expect("No cpu id regustered");
                 info!("We got a cpu debug exit on core {cpu_id}!");
                 if let Some(gdb_event) = &self.gdb_event {
-                    gdb_event.write(get_raw_tid(cpu_id) as u64).expect("Unable to notify gdb event");
+                    gdb_event
+                        .write(get_raw_tid(cpu_id) as u64)
+                        .expect("Unable to notify gdb event");
                     info!("Wrote update to event fd");
                 } else {
                     info!("No gdb event?");
@@ -701,15 +720,21 @@ pub enum VcpuEvent {
     SaveState,
     /// Event to dump CPU configuration of a paused Vcpu.
     DumpCpuConfig,
+    #[cfg(feature = "debug")]
     /// Set vcpu register
+    #[cfg(feature = "debug")]
     GetRegisters,
     /// Set vcpu register
+    #[cfg(feature = "debug")]
     SetRegisters(kvm_regs),
     /// Sets kvm debug flags
+    #[cfg(feature = "debug")]
     SetKvmDebug(Vec<GuestAddress>, bool),
     /// Inject BP
+    #[cfg(feature = "debug")]
     InjectKvmBP(Vec<GuestAddress>, bool),
     /// Translate a guest virtual address
+    #[cfg(feature = "debug")]
     GvaTranslate(u64),
 }
 
@@ -730,8 +755,10 @@ pub enum VcpuResponse {
     /// Vcpu is in the state where CPU config is dumped.
     DumpedCpuConfig(Box<CpuConfiguration>),
     /// Vcpu kvm registers
+    #[cfg(feature = "debug")]
     KvmRegisters(kvm_regs),
     /// The response with a translated virtual address
+    #[cfg(feature = "debug")]
     GvaTranslation(u64),
 }
 
@@ -745,8 +772,10 @@ impl fmt::Debug for VcpuResponse {
             SavedState(_) => write!(f, "VcpuResponse::SavedState"),
             Error(ref err) => write!(f, "VcpuResponse::Error({:?})", err),
             NotAllowed(ref reason) => write!(f, "VcpuResponse::NotAllowed({})", reason),
-            KvmRegisters(_) => write!(f, "VcpuResponse::KvmRegisters"),
             DumpedCpuConfig(_) => write!(f, "VcpuResponse::DumpedCpuConfig"),
+            #[cfg(feature = "debug")]
+            KvmRegisters(_) => write!(f, "VcpuResponse::KvmRegisters"),
+            #[cfg(feature = "debug")]
             GvaTranslation(_) => write!(f, "VcpuResponse::GvaTranslation"),
         }
     }

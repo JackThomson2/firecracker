@@ -57,6 +57,7 @@ use crate::devices::virtio::net::Net;
 use crate::devices::virtio::rng::Entropy;
 use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
 use crate::devices::BusDevice;
+#[cfg(feature = "debug")]
 use crate::gdb;
 use crate::logger::{debug, error};
 use crate::persist::{MicrovmState, MicrovmStateError};
@@ -360,6 +361,7 @@ pub fn build_microvm_for_boot(
 
     let vmm = Arc::new(Mutex::new(vmm));
 
+    #[cfg(feature = "debug")]
     gdb::server::gdb_thread(vmm.clone(), &vcpus, gdb_event, entry_addr);
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.

@@ -84,6 +84,7 @@ pub mod devices;
 /// minimalist HTTP/TCP/IPv4 stack named DUMBO
 pub mod dumbo;
 /// GDB support for guest
+#[cfg(feature = "debug")]
 pub mod gdb;
 /// Logger
 pub mod logger;

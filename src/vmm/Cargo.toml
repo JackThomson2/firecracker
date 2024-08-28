@@ -58,6 +58,7 @@ proptest = { version = "1.5.0", default-features = false, features = ["std"] }
 
 [features]
 tracing = ["log-instrument"]
+debug = []
 
 [[bench]]
 name = "cpu_templates"

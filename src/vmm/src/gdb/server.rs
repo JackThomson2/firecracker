@@ -1,14 +1,12 @@
 use gdbstub::{
     common::{Signal, Tid},
     conn::{Connection, ConnectionExt},
-    stub::{
-        run_blocking, DisconnectReason, GdbStub, MultiThreadStopReason,
-    },
+    stub::{run_blocking, DisconnectReason, GdbStub, MultiThreadStopReason},
     target::Target,
 };
 use kvm_bindings::{
-    kvm_guest_debug, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_INJECT_BP,
-    KVM_GUESTDBG_SINGLESTEP, KVM_GUESTDBG_USE_HW_BP, KVM_GUESTDBG_USE_SW_BP,
+    kvm_guest_debug, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_INJECT_BP, KVM_GUESTDBG_SINGLESTEP,
+    KVM_GUESTDBG_USE_HW_BP, KVM_GUESTDBG_USE_SW_BP,
 };
 use kvm_ioctls::VcpuFd;
 use std::io::ErrorKind;
@@ -193,7 +191,10 @@ impl run_blocking::BlockingEventLoop for MyGdbBlockingEventLoop {
         target.request_pause(main_core);
         target.notify_paused_vcpu(main_core);
 
-        let exit_reason = MultiThreadStopReason::SignalWithThread { tid: main_core, signal: Signal::SIGINT };
+        let exit_reason = MultiThreadStopReason::SignalWithThread {
+            tid: main_core,
+            signal: Signal::SIGINT,
+        };
         Ok(Some(exit_reason.into()))
     }
 }
