@@ -63,7 +63,7 @@ fn set_kvm_debug(control: u32, vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool
     }
 }
 
-/// TODO DOCS
+/// Configures the VCPU for 
 pub fn kvm_debug(vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool) {
     let mut control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP | KVM_GUESTDBG_USE_SW_BP;
     if step {
@@ -73,7 +73,8 @@ pub fn kvm_debug(vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool) {
     set_kvm_debug(control, vcpu, addrs, step)
 }
 
-/// TODO DOCS
+/// Injects a BP back into the guest kernel for it to handle, this is particularly useful for the
+/// kernels selftesting which can happen during boot.
 pub fn kvm_inject_bp(vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool) {
     let mut control = KVM_GUESTDBG_ENABLE
         | KVM_GUESTDBG_USE_HW_BP
@@ -87,19 +88,29 @@ pub fn kvm_inject_bp(vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool) {
     set_kvm_debug(control, vcpu, addrs, step)
 }
 
-/// TODO DOCS
+/// This method will kickstart the GDB debugging process, it takes in the VMM object, a slice of
+/// the paused Vcpu's, the GDB event queue which is used as a mechanism for the VCPU's to notify
+/// our GDB thread that they've been paused, then finally the entry address of the kernel.
+///
+/// Firstly the function will start by configuring the vcpus with KVM for debugging
+///
+/// This will then create the GDB socket which will be used for communication to the GDB process.
+/// After creating this, the function will block while waiting for GDB to connect.
+///
+/// After the connection has been established the function will start a new thread for handling
+/// communcation to the GDB server
 pub fn gdb_thread(
     vmm: Arc<Mutex<Vmm>>,
-    vcpu: &[Vcpu],
-    gdb_event_fd: Receiver<usize>,
+    vcpus: &[Vcpu],
+    gdb_event_receiver: Receiver<usize>,
     entry_addr: GuestAddress,
 ) {
-    // We register a hw breakpoint at the entry point to allow setting
-    // breakpoints in the kernel setup process
-    kvm_debug(&vcpu[0].kvm_vcpu.fd, &[entry_addr], false);
+    // We register a hw breakpoint at the entry point as GDB  expects the application 
+    // to be stopped. This also allows us to set breakpoints before kernel starts
+    kvm_debug(&vcpus[0].kvm_vcpu.fd, &[entry_addr], false);
 
-    for cpu in vcpu.iter().skip(1) {
-        kvm_debug(&cpu.kvm_vcpu.fd, &[], false);
+    for vcpu in vcpus.iter().skip(1) {
+        kvm_debug(&vcpu.kvm_vcpu.fd, &[], false);
     }
 
     let path = Path::new("/tmp/gdb.socket");
@@ -107,12 +118,12 @@ pub fn gdb_thread(
 
     std::thread::Builder::new()
         .name("gdb".into())
-        .spawn(move || event_loop(connection, vmm, gdb_event_fd, entry_addr))
-        .unwrap();
+        .spawn(move || event_loop(connection, vmm, gdb_event_receiver, entry_addr))
+        .expect("Error spawning GDB thread");
 }
 
-fn event_loop(connection: UnixStream, vmm: Arc<Mutex<Vmm>>, gdb_event_fd: Receiver<usize>, entry_addr: GuestAddress) {
-    let target = FirecrackerTarget::new(vmm, gdb_event_fd, entry_addr);
+fn event_loop(connection: UnixStream, vmm: Arc<Mutex<Vmm>>, gdb_event_receiver: Receiver<usize>, entry_addr: GuestAddress) {
+    let target = FirecrackerTarget::new(vmm, gdb_event_receiver, entry_addr);
     let connection: Box<dyn ConnectionExt<Error = std::io::Error>> = { Box::new(connection) };
     let debugger = GdbStub::new(connection);
 

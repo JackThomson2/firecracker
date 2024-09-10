@@ -28,6 +28,8 @@ use vm_memory::{Bytes, GuestAddress};
 use crate::logger::{error, info};
 use crate::{FcExitCode, VcpuEvent, VcpuHandle, VcpuResponse, Vmm};
 
+const X86_SW_BP_OP: u8 = 0xCC;
+
 #[derive(Default, Debug)]
 struct VCpuState {
     single_step: bool,
@@ -69,7 +71,9 @@ pub fn get_raw_tid(cpu_id: usize) -> usize {
 }
 
 impl FirecrackerTarget {
-    /// TODO DOCS
+    /// Creates a new Target for GDB stub. This is used as the layer between GDB and the VMM it
+    /// will handle requests from GDB and perform the appropriate actions, while also updating GDB
+    /// with the state of the VMM / VCPU's as we hit debug events
     pub fn new(vmm: Arc<Mutex<Vmm>>, gdb_event: Receiver<usize>, entry_addr: GuestAddress) -> Self {
         let mut vcpu_state = HashMap::new();
         let cpu_count = {
@@ -310,9 +314,7 @@ impl FirecrackerTarget {
     /// if the function returns None this means we want to handle this internally and don't want
     /// to notify GDB as it's likely the guest self testing
     pub fn get_stop_reason(&mut self, mut tid: Tid) -> Option<BaseStopReason<Tid, u64>> {
-        info!("Checking stop reason");
         if self.is_tid_out_of_range(tid) {
-            info!("TID out of range??");
             tid = self.get_paused_vcpu();
         }
 
@@ -321,7 +323,6 @@ impl FirecrackerTarget {
         let vcpu_state = match self.vcpu_state.get(&tid) {
             Some(res) => res,
             None => {
-                info!("We couldn't get vcpu state...");
                 return None;
             }
         };
@@ -404,7 +405,7 @@ impl MultiThreadBase for FirecrackerTarget {
             regs.rip = cpu_regs.rip;
             regs.eflags = u32::try_from(cpu_regs.rflags).expect("Error converting rflags")
         } else {
-            info!("Failed to read cpu registers");
+            error!("Failed to read cpu registers");
         }
 
         Ok(())
@@ -459,7 +460,7 @@ impl MultiThreadBase for FirecrackerTarget {
                 match self.translate_gva(&vmm.vcpus_handles[tid_to_cpuid(tid)], gaddr as u64) {
                     Some(paddr) => usize::try_from(paddr).expect("Unable to convert addr to usize"),
                     None => {
-                        info!("Error translating gva on read address: {start_addr:X}");
+                        error!("Error translating gva on read address: {start_addr:X}");
                         gaddr
                     }
                 };
@@ -501,7 +502,7 @@ impl MultiThreadBase for FirecrackerTarget {
                     Some(paddr) if paddr == <Self::Arch as Arch>::Usize::MIN => gaddr,
                     Some(paddr) => usize::try_from(paddr).expect("Error converting addr to usize"),
                     None => {
-                        info!("Error translating gva");
+                        error!("Error translating gva");
                         return Err(TargetError::NonFatal);
                     }
                 };
@@ -567,14 +568,12 @@ impl MultiThreadResume for FirecrackerTarget {
     }
 
     fn resume(&mut self) -> Result<(), Self::Error> {
-        info!("COMMAND: Got resume command");
         self.resume_execution();
 
         Ok(())
     }
 
     fn clear_resume_actions(&mut self) -> Result<(), Self::Error> {
-        info!("COMMAND: Got clear all actions command");
         self.reset_all_states();
 
         Ok(())
@@ -592,7 +591,6 @@ impl MultiThreadSingleStep for FirecrackerTarget {
         tid: Tid,
         _signal: Option<Signal>,
     ) -> Result<(), Self::Error> {
-        info!("COMMAND: Got single step command tid: {tid:?}");
         let vcpu_state = match self.vcpu_state.get_mut(&tid) {
             Some(res) => res,
             None => {
@@ -668,7 +666,7 @@ impl SwBreakpoint for FirecrackerTarget {
         let _ = self.read_addrs(addr, &mut saved_register, self.get_paused_vcpu());
         self.sw_breakpoints.insert(physical_addr, saved_register);
 
-        let break_point = [0xCC];
+        let break_point = [X86_SW_BP_OP];
         let _ = self.write_addrs(addr, &break_point, self.get_paused_vcpu());
         Ok(true)
     }
