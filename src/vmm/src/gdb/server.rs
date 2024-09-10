@@ -9,8 +9,7 @@ use kvm_bindings::{
     KVM_GUESTDBG_USE_HW_BP, KVM_GUESTDBG_USE_SW_BP,
 };
 use kvm_ioctls::VcpuFd;
-use std::io::ErrorKind;
-use utils::eventfd::EventFd;
+use std::sync::mpsc::{Receiver, TryRecvError::Empty};
 use vm_memory::GuestAddress;
 
 use crate::{
@@ -26,6 +25,8 @@ use std::{
 
 use super::target::{cpuid_to_tid, FirecrackerTarget};
 
+const X86_SW_BP_CODE: u64 = 0x0600;
+
 fn listen_for_connection(path: &std::path::Path) -> Result<UnixStream, Box<dyn std::error::Error>> {
     info!("Binding gdb socket");
     let listener = UnixListener::bind(path)?;
@@ -37,13 +38,6 @@ fn listen_for_connection(path: &std::path::Path) -> Result<UnixStream, Box<dyn s
     return Ok(stream);
 }
 
-fn event_loop(connection: UnixStream, vmm: Arc<Mutex<Vmm>>, gdb_event_fd: EventFd) {
-    let target = FirecrackerTarget::new(vmm, gdb_event_fd);
-    let connection: Box<dyn ConnectionExt<Error = std::io::Error>> = { Box::new(connection) };
-    let debugger = GdbStub::new(connection);
-
-    gdb_event_loop_thread(debugger, target);
-}
 
 fn set_kvm_debug(control: u32, vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool) {
     let mut dbg = kvm_guest_debug {
@@ -51,7 +45,7 @@ fn set_kvm_debug(control: u32, vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool
         ..Default::default()
     };
 
-    dbg.arch.debugreg[7] = 0x0600;
+    dbg.arch.debugreg[7] = X86_SW_BP_CODE;
 
     for (i, addr) in addrs.iter().enumerate() {
         dbg.arch.debugreg[i] = addr.0;
@@ -65,7 +59,7 @@ fn set_kvm_debug(control: u32, vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool
         info!(
             "Debug setup succesfully. Single Step: {step} BP count: {}",
             addrs.len()
-        )
+        );
     }
 }
 
@@ -97,7 +91,7 @@ pub fn kvm_inject_bp(vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool) {
 pub fn gdb_thread(
     vmm: Arc<Mutex<Vmm>>,
     vcpu: &Vec<Vcpu>,
-    gdb_event_fd: EventFd,
+    gdb_event_fd: Receiver<usize>,
     entry_addr: GuestAddress,
 ) {
     // We register a hw breakpoint at the entry point to allow setting
@@ -113,8 +107,16 @@ pub fn gdb_thread(
 
     std::thread::Builder::new()
         .name("gdb".into())
-        .spawn(move || event_loop(connection, vmm, gdb_event_fd))
+        .spawn(move || event_loop(connection, vmm, gdb_event_fd, entry_addr))
         .unwrap();
+}
+
+fn event_loop(connection: UnixStream, vmm: Arc<Mutex<Vmm>>, gdb_event_fd: Receiver<usize>, entry_addr: GuestAddress) {
+    let target = FirecrackerTarget::new(vmm, gdb_event_fd, entry_addr);
+    let connection: Box<dyn ConnectionExt<Error = std::io::Error>> = { Box::new(connection) };
+    let debugger = GdbStub::new(connection);
+
+    gdb_event_loop_thread(debugger, target);
 }
 
 struct MyGdbBlockingEventLoop {}
@@ -142,37 +144,46 @@ impl run_blocking::BlockingEventLoop for MyGdbBlockingEventLoop {
         >,
     > {
         loop {
-            match target.gdb_event.read() {
+            let mut stopped_tid = None;
+            match target.gdb_event.try_recv() {
                 Ok(cpu_id) => {
-                    info!("Got notification from gdb eventfd cpu id: {cpu_id} ensuring cpu paused");
-
                     // The VCPU reports it's id from raw_id so we straight convert here
                     let tid = Tid::new(cpu_id as usize).expect("Error converting cpu id to Tid");
-
-                    let stop_response = match target.get_stop_reason(tid) {
-                        Some(res) => res,
-                        None => {
-                            // If we returned None this is a breakwhich should be handled by
-                            // the guest kernel (e.g. kernel int3 self testing) so we won't notify GDB
-                            target.request_resume(tid);
-                            info!("We did an early exit for cpu id {cpu_id}");
-                            continue;
-                        }
-                    };
-
-                    target.notify_paused_vcpu(tid);
-
-                    info!("Returned stop reason is: {stop_response:?}");
-                    return Ok(run_blocking::Event::TargetStopped(stop_response));
-                }
-                Err(e) => {
-                    if e.kind() != ErrorKind::WouldBlock {
-                        info!("Error {e:?}")
+                    // If notify paused returns false this means we were already debugging a single
+                    // core, the target will track this for us to pick up later
+                    if !target.notify_paused_vcpu(tid) {
+                        continue;
                     }
+
+                    stopped_tid = Some(tid);
+                }
+                Err(e) if e == Empty => (),
+                Err(e) => {
+                    info!("Error {e:?}");
                 }
             }
 
-            if conn.peek().map(|b| b.is_some()).unwrap_or(true) {
+            if stopped_tid.is_none() {
+                stopped_tid = target.check_for_waiting_cpus();
+            }
+
+            if let Some(tid) = stopped_tid {
+                let stop_response = match target.get_stop_reason(tid) {
+                    Some(res) => res,
+                    None => {
+                        // If we returned None this is a breakwhich should be handled by
+                        // the guest kernel (e.g. kernel int3 self testing) so we won't notify GDB
+                        target.request_resume(tid);
+                        continue;
+                    }
+                };
+
+                info!("Stop reason: {stop_response:?}");
+
+                return Ok(run_blocking::Event::TargetStopped(stop_response));
+            }
+
+            if conn.peek().map(|b| b.is_some()).unwrap_or(false) {
                 let byte = conn
                     .read()
                     .map_err(run_blocking::WaitForStopReasonError::Connection)?;

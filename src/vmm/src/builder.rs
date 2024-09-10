@@ -7,7 +7,7 @@
 use std::convert::TryFrom;
 use std::fmt::Debug;
 use std::io::{self, Seek, SeekFrom};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 
 use event_manager::{MutEventSubscriber, SubscriberOps};
 use libc::EFD_NONBLOCK;
@@ -306,11 +306,13 @@ pub fn build_microvm_for_boot(
         cpu_template.kvm_capabilities.clone(),
     )?;
 
-    let gdb_event = EventFd::new(EFD_NONBLOCK).unwrap();
+    #[cfg(feature = "debug")]
+    let (gdb_tx, gdb_rx) = mpsc::channel();
+    #[cfg(feature = "debug")]
     vcpus
         .iter_mut()
         .enumerate()
-        .for_each(|(id, vcpu)| vcpu.attach_debug_info(gdb_event.try_clone().unwrap(), id));
+        .for_each(|(id, vcpu)| vcpu.attach_debug_info(gdb_tx.clone(), id));
 
     // The boot timer device needs to be the first device attached in order
     // to maintain the same MMIO address referenced in the documentation
@@ -362,7 +364,7 @@ pub fn build_microvm_for_boot(
     let vmm = Arc::new(Mutex::new(vmm));
 
     #[cfg(feature = "debug")]
-    gdb::server::gdb_thread(vmm.clone(), &vcpus, gdb_event, entry_addr);
+    gdb::server::gdb_thread(vmm.clone(), &vcpus, gdb_rx, entry_addr);
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
     vmm.lock()

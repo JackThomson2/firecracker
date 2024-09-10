@@ -19,8 +19,8 @@ crc64 = "2.0.0"
 derive_more = { version = "1.0.0", default-features = false, features = ["from", "display"] }
 displaydoc = "0.2.5"
 event-manager = "0.4.0"
-gdbstub = "0.7.1"
-gdbstub_arch = "0.3.0"
+gdbstub = { version = "0.7.2", optional = true }
+gdbstub_arch = { version = "0.3.0", optional = true }
 kvm-bindings = { version = "0.9.1", features = ["fam-wrappers", "serde"] }
 kvm-ioctls = "0.18.0"
 lazy_static = "1.5.0"
@@ -57,8 +57,9 @@ itertools = "0.13.0"
 proptest = { version = "1.5.0", default-features = false, features = ["std"] }
 
 [features]
+default = ["debug"]
 tracing = ["log-instrument"]
-debug = []
+debug = ["gdbstub", "gdbstub_arch"]
 
 [[bench]]
 name = "cpu_templates"

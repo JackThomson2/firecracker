@@ -98,7 +98,8 @@ pub struct Vcpu {
     /// File descriptor for vcpu to trigger exit event on vmm.
     exit_evt: EventFd,
     /// Debugger emitter for gdb events
-    gdb_event: Option<EventFd>,
+    #[cfg(feature = "debug")]
+    gdb_event: Option<Sender<usize>>,
     /// VCPU id this is to track the id of the vcpu
     id: Option<usize>,
     /// The receiving end of events channel owned by the vcpu side.
@@ -212,6 +213,7 @@ impl Vcpu {
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
             response_sender,
+            #[cfg(feature = "debug")]
             gdb_event: None,
             id: None,
             kvm_vcpu,
@@ -224,7 +226,8 @@ impl Vcpu {
     }
 
     /// Attaches the fields required for debugging
-    pub fn attach_debug_info(&mut self, gdb_event: EventFd, cpu_id: usize) {
+    #[cfg(feature = "debug")]
+    pub fn attach_debug_info(&mut self, gdb_event: Sender<usize>, cpu_id: usize) {
         self.gdb_event = Some(gdb_event);
         self.id = Some(cpu_id);
     }
@@ -511,7 +514,6 @@ impl Vcpu {
             }
             #[cfg(feature = "debug")]
             Ok(VcpuEvent::GvaTranslate(address)) => {
-                info!("Translating guest virtual address");
                 let response = self.translate_gva(address);
                 self.response_sender
                     .send(VcpuResponse::GvaTranslation(response))
@@ -583,13 +585,12 @@ impl Vcpu {
             }
             #[cfg(feature = "debug")]
             Ok(VcpuExit::Debug(_)) => {
-                let cpu_id = self.id.expect("No cpu id regustered");
-                info!("We got a cpu debug exit on core {cpu_id}!");
+                let cpu_id = self.id.expect("No cpu id registered");
                 if let Some(gdb_event) = &self.gdb_event {
                     gdb_event
-                        .write(get_raw_tid(cpu_id) as u64)
+                        .send(get_raw_tid(cpu_id))
                         .expect("Unable to notify gdb event");
-                    info!("Wrote update to event fd");
+                    info!("Wrote update to event fd for id {cpu_id}");
                 } else {
                     info!("No gdb event?");
                 }
