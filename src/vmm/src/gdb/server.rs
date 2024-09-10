@@ -25,7 +25,7 @@ use std::{
 
 use super::target::{cpuid_to_tid, FirecrackerTarget};
 
-const X86_SW_BP_CODE: u64 = 0x0600;
+const KVM_DEBUG_ENABLE: u64 = 0x0600;
 
 fn listen_for_connection(path: &std::path::Path) -> Result<UnixStream, Box<dyn std::error::Error>> {
     info!("Binding gdb socket");
@@ -35,7 +35,7 @@ fn listen_for_connection(path: &std::path::Path) -> Result<UnixStream, Box<dyn s
     let (stream, addr) = listener.accept()?;
     info!("GDB connected from {addr:?}");
 
-    return Ok(stream);
+    Ok(stream)
 }
 
 
@@ -45,7 +45,7 @@ fn set_kvm_debug(control: u32, vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool
         ..Default::default()
     };
 
-    dbg.arch.debugreg[7] = X86_SW_BP_CODE;
+    dbg.arch.debugreg[7] = KVM_DEBUG_ENABLE;
 
     for (i, addr) in addrs.iter().enumerate() {
         dbg.arch.debugreg[i] = addr.0;
@@ -53,7 +53,7 @@ fn set_kvm_debug(control: u32, vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool
         dbg.arch.debugreg[7] |= 2 << (i * 2);
     }
 
-    if let Err(_) = vcpu.set_guest_debug(&dbg) {
+    if vcpu.set_guest_debug(&dbg).is_err() {
         error!("Error setting debug");
     } else {
         info!(
@@ -90,16 +90,16 @@ pub fn kvm_inject_bp(vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool) {
 /// TODO DOCS
 pub fn gdb_thread(
     vmm: Arc<Mutex<Vmm>>,
-    vcpu: &Vec<Vcpu>,
+    vcpu: &[Vcpu],
     gdb_event_fd: Receiver<usize>,
     entry_addr: GuestAddress,
 ) {
     // We register a hw breakpoint at the entry point to allow setting
     // breakpoints in the kernel setup process
-    kvm_debug(&vcpu[0].kvm_vcpu.fd, &vec![entry_addr], false);
+    kvm_debug(&vcpu[0].kvm_vcpu.fd, &[entry_addr], false);
 
-    for i in 1..vcpu.len() {
-        kvm_debug(&vcpu[i].kvm_vcpu.fd, &vec![], false);
+    for cpu in vcpu.iter().skip(1) {
+        kvm_debug(&cpu.kvm_vcpu.fd, &[], false);
     }
 
     let path = Path::new("/tmp/gdb.socket");
@@ -121,18 +121,12 @@ fn event_loop(connection: UnixStream, vmm: Arc<Mutex<Vmm>>, gdb_event_fd: Receiv
 
 struct MyGdbBlockingEventLoop {}
 
-// The `run_blocking::BlockingEventLoop` groups together various callbacks
-// the `GdbStub::run_blocking` event loop requires you to implement.
 impl run_blocking::BlockingEventLoop for MyGdbBlockingEventLoop {
     type Target = FirecrackerTarget;
     type Connection = Box<dyn ConnectionExt<Error = std::io::Error>>;
 
-    // or MultiThreadStopReason on multi threaded targets
     type StopReason = MultiThreadStopReason<u64>;
 
-    // Invoked immediately after the target's `resume` method has been
-    // called. The implementation should block until either the target
-    // reports a stop reason, or if new data was sent over the connection.
     fn wait_for_stop_reason(
         target: &mut FirecrackerTarget,
         conn: &mut Self::Connection,
@@ -148,37 +142,29 @@ impl run_blocking::BlockingEventLoop for MyGdbBlockingEventLoop {
             match target.gdb_event.try_recv() {
                 Ok(cpu_id) => {
                     // The VCPU reports it's id from raw_id so we straight convert here
-                    let tid = Tid::new(cpu_id as usize).expect("Error converting cpu id to Tid");
+                    let tid = Tid::new(cpu_id).expect("Error converting cpu id to Tid");
                     // If notify paused returns false this means we were already debugging a single
                     // core, the target will track this for us to pick up later
-                    if !target.notify_paused_vcpu(tid) {
-                        continue;
-                    }
+                    target.notify_paused_vcpu(tid);
 
                     stopped_tid = Some(tid);
                 }
-                Err(e) if e == Empty => (),
+                Err(Empty) => (),
                 Err(e) => {
                     info!("Error {e:?}");
                 }
-            }
-
-            if stopped_tid.is_none() {
-                stopped_tid = target.check_for_waiting_cpus();
             }
 
             if let Some(tid) = stopped_tid {
                 let stop_response = match target.get_stop_reason(tid) {
                     Some(res) => res,
                     None => {
-                        // If we returned None this is a breakwhich should be handled by
+                        // If we returned None this is a break which should be handled by
                         // the guest kernel (e.g. kernel int3 self testing) so we won't notify GDB
                         target.request_resume(tid);
                         continue;
                     }
                 };
-
-                info!("Stop reason: {stop_response:?}");
 
                 return Ok(run_blocking::Event::TargetStopped(stop_response));
             }
@@ -206,7 +192,7 @@ impl run_blocking::BlockingEventLoop for MyGdbBlockingEventLoop {
             tid: main_core,
             signal: Signal::SIGINT,
         };
-        Ok(Some(exit_reason.into()))
+        Ok(Some(exit_reason))
     }
 }
 

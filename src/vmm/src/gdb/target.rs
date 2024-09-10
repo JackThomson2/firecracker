@@ -23,7 +23,6 @@ use gdbstub_arch::x86::reg::X86_64CoreRegs as CoreRegs;
 #[cfg(target_arch = "x86_64")]
 use gdbstub_arch::x86::X86_64_SSE as GdbArch;
 use kvm_bindings::kvm_regs;
-use libc::exit;
 use vm_memory::{Bytes, GuestAddress};
 
 use crate::logger::{error, info};
@@ -33,7 +32,6 @@ use crate::{FcExitCode, VcpuEvent, VcpuHandle, VcpuResponse, Vmm};
 struct VCpuState {
     single_step: bool,
     paused: bool,
-    pending_debug: bool
 }
 
 /// The debug target for firecracker. This is used the manage the debug
@@ -85,7 +83,6 @@ impl FirecrackerTarget {
             let new_state = VCpuState {
                 paused: false,
                 single_step: false,
-                pending_debug: false
             };
 
             vcpu_state.insert(cpuid_to_tid(cpu_id), new_state);
@@ -110,48 +107,17 @@ impl FirecrackerTarget {
 
     /// This is used to notify the target that the provided Tid
     /// is in a paused state
-    pub fn notify_paused_vcpu(&mut self, tid: Tid) -> bool {
+    pub fn notify_paused_vcpu(&mut self, tid: Tid) {
         let found = match self.vcpu_state.get_mut(&tid) {
             Some(res) => res,
             None => {
                 info!("TID {tid} was not known.");
-                return false;
+                return;
             }
         };
 
         found.paused = true;
-
-        if let Some(x) = self.paused_vcpu {
-            if x == tid {
-                info!("This was already paused...");
-                return true;
-            }
-
-            info!("We paused a vcpu while debugging another so we'll put this on the backlog");
-            found.pending_debug = true;
-            return false
-        }
         self.paused_vcpu = Some(tid);
-        
-        true
-    }
-
-    /// This is used to collect vcpu's which were paused as we were
-    /// debugging another core
-    pub fn check_for_waiting_cpus(&mut self) -> Option<Tid> {
-        if self.paused_vcpu.is_some() {
-            return None;
-        }
-
-        for (tid, info) in self.vcpu_state.iter_mut() {
-            if info.paused && info.pending_debug {
-                info.pending_debug = false;
-                info!("Picked up tid {tid} which was paused");
-                return Some(*tid);
-            }
-        }
-
-        None
     }
 
     fn resume_execution(&mut self) {
@@ -230,8 +196,7 @@ impl FirecrackerTarget {
         }
 
         if let VcpuResponse::NotAllowed(message) = response {
-            info!("Response from get regs: {message}");
-            unsafe { exit(0) }
+            error!("Response from get regs: {message}");
         }
 
         None
@@ -246,12 +211,12 @@ impl FirecrackerTarget {
             .unwrap();
         let response = cpu_handle.response_receiver().recv().unwrap();
         if let VcpuResponse::NotAllowed(message) = response {
-            info!("Response from set regs: {message}");
-            unsafe { exit(0) }
+            error!("Response from set regs: {message}");
         }
     }
 
-    /// TODO DOCS
+    /// Used to request the specified core to resume execution. The function
+    /// will return early if the vcpu is already paused and not currently running
     pub fn request_resume(&mut self, tid: Tid) {
         let vcpu_state = match self.vcpu_state.get_mut(&tid) {
             Some(res) => res,
@@ -273,7 +238,6 @@ impl FirecrackerTarget {
         let response = cpu_handle.response_receiver().recv().unwrap();
         if let VcpuResponse::NotAllowed(message) = response {
             error!("Response resume : {message}");
-            unsafe { exit(0) }
         }
 
         vcpu_state.paused = false;
@@ -300,7 +264,6 @@ impl FirecrackerTarget {
         let response = cpu_handle.response_receiver().recv().unwrap();
         if let VcpuResponse::NotAllowed(message) = response {
             error!("Response from set kvm debug: {message}");
-            unsafe { exit(0) }
         }
     }
 
@@ -316,7 +279,6 @@ impl FirecrackerTarget {
 
         if let VcpuResponse::NotAllowed(message) = response {
             error!("Response from gva: {message}");
-            unsafe { exit(0) }
         }
 
         Some(address)
@@ -332,7 +294,6 @@ impl FirecrackerTarget {
         let response = cpu_handle.response_receiver().recv().unwrap();
         if let VcpuResponse::NotAllowed(message) = response {
             error!("Response resume : {message}");
-            unsafe { exit(0) }
         }
     }
 
@@ -345,7 +306,9 @@ impl FirecrackerTarget {
             <= tid_to_cpuid(tid)
     }
 
-    /// TODO DOCS
+    /// Used to identify why the specifc core was paused to be returned to GDB
+    /// if the function returns None this means we want to handle this internally and don't want
+    /// to notify GDB as it's likely the guest self testing
     pub fn get_stop_reason(&mut self, mut tid: Tid) -> Option<BaseStopReason<Tid, u64>> {
         info!("Checking stop reason");
         if self.is_tid_out_of_range(tid) {
@@ -364,12 +327,13 @@ impl FirecrackerTarget {
         };
 
         if vcpu_state.single_step {
-            info!("Reporting single step as a sw breakpoint?");
-            return Some(MultiThreadStopReason::SignalWithThread { tid: tid, signal: Signal::SIGTRAP });
+            return Some(MultiThreadStopReason::SignalWithThread {
+                tid,
+                signal: Signal::SIGTRAP,
+            });
         }
 
         if let Some(regs) = cpu_regs {
-            info!("Stopped at {:X}", regs.rip);
             let physical_addr = {
                 let vmm = &self.vmm.lock().expect("Error unlocking vmm");
                 self.translate_gva(&vmm.vcpus_handles[tid_to_cpuid(tid)], regs.rip)
@@ -377,26 +341,22 @@ impl FirecrackerTarget {
             };
 
             if self.sw_breakpoints.contains_key(&physical_addr) {
-                info!("Our sw bp...");
                 return Some(MultiThreadStopReason::SwBreak(tid));
             }
 
             if self.hw_breakpoints.contains(&GuestAddress(regs.rip)) {
-                info!("Our bp...");
                 return Some(MultiThreadStopReason::HwBreak(tid));
             }
 
             if regs.rip == self.entry_addr.0 {
-                info!("Set entry point...");
                 return Some(MultiThreadStopReason::HwBreak(tid));
             }
 
-            info!("This is a breakpoint not set by us");
             self.inject_bp_to_guest(tid);
             return None;
         }
 
-        return Some(MultiThreadStopReason::SwBreak(tid));
+        Some(MultiThreadStopReason::SwBreak(tid))
     }
 }
 
@@ -442,7 +402,7 @@ impl MultiThreadBase for FirecrackerTarget {
             regs.regs[15] = cpu_regs.r15;
 
             regs.rip = cpu_regs.rip;
-            regs.eflags = cpu_regs.rflags as u32;
+            regs.eflags = u32::try_from(cpu_regs.rflags).expect("Error converting rflags")
         } else {
             info!("Failed to read cpu registers");
         }
@@ -451,28 +411,28 @@ impl MultiThreadBase for FirecrackerTarget {
     }
 
     fn write_registers(&mut self, regs: &CoreRegs, tid: Tid) -> TargetResult<(), Self> {
-        let mut new_regs: kvm_regs = Default::default();
+        let new_regs = kvm_regs {
+            rax: regs.regs[0],
+            rbx: regs.regs[1],
+            rcx: regs.regs[2],
+            rdx: regs.regs[3],
+            rsi: regs.regs[4],
+            rdi: regs.regs[5],
+            rbp: regs.regs[6],
+            rsp: regs.regs[7],
 
-        new_regs.rax = regs.regs[0];
-        new_regs.rbx = regs.regs[1];
-        new_regs.rcx = regs.regs[2];
-        new_regs.rdx = regs.regs[3];
-        new_regs.rsi = regs.regs[4];
-        new_regs.rdi = regs.regs[5];
-        new_regs.rbp = regs.regs[6];
-        new_regs.rsp = regs.regs[7];
+            r8: regs.regs[8],
+            r9: regs.regs[9],
+            r10: regs.regs[10],
+            r11: regs.regs[11],
+            r12: regs.regs[12],
+            r13: regs.regs[13],
+            r14: regs.regs[14],
+            r15: regs.regs[15],
 
-        new_regs.r8 = regs.regs[8];
-        new_regs.r9 = regs.regs[9];
-        new_regs.r10 = regs.regs[10];
-        new_regs.r11 = regs.regs[11];
-        new_regs.r12 = regs.regs[12];
-        new_regs.r13 = regs.regs[13];
-        new_regs.r14 = regs.regs[14];
-        new_regs.r15 = regs.regs[15];
-
-        new_regs.rip = regs.rip;
-        new_regs.rflags = regs.eflags as u64;
+            rip: regs.rip,
+            rflags: regs.eflags as u64,
+        };
 
         self.set_regs(new_regs, tid);
 
@@ -490,23 +450,25 @@ impl MultiThreadBase for FirecrackerTarget {
 
         let len = data.len();
 
-        let mut total_read = 0_u64;
+        let mut total_read = 0_usize;
+        let start_addr = usize::try_from(start_addr).expect("Unable to convert addr to usize");
 
-        while total_read < len as u64 {
+        while total_read < len {
             let gaddr = start_addr + total_read;
-            let paddr = match self.translate_gva(&vmm.vcpus_handles[tid_to_cpuid(tid)], gaddr) {
-                Some(paddr) => paddr,
-                None => {
-                    info!("Error translating gva on read address: {start_addr:X}");
-                    gaddr
-                }
-            };
+            let paddr =
+                match self.translate_gva(&vmm.vcpus_handles[tid_to_cpuid(tid)], gaddr as u64) {
+                    Some(paddr) => usize::try_from(paddr).expect("Unable to convert addr to usize"),
+                    None => {
+                        info!("Error translating gva on read address: {start_addr:X}");
+                        gaddr
+                    }
+                };
             let psize = 4096;
-            let read_len = std::cmp::min(len as u64 - total_read, psize - (paddr & (psize - 1)));
+            let read_len = std::cmp::min(len - total_read, psize - (paddr & (psize - 1)));
             if memory
                 .read(
-                    &mut data[total_read as usize..total_read as usize + read_len as usize],
-                    GuestAddress(paddr),
+                    &mut data[total_read..total_read + read_len],
+                    GuestAddress(paddr as u64),
                 )
                 .is_err()
             {
@@ -516,7 +478,7 @@ impl MultiThreadBase for FirecrackerTarget {
             total_read += read_len;
         }
 
-        Ok(total_read as usize)
+        Ok(total_read)
     }
 
     fn write_addrs(
@@ -529,25 +491,26 @@ impl MultiThreadBase for FirecrackerTarget {
         let memory = vmm.guest_memory();
         let len = data.len();
 
-        let mut total_written = 0_u64;
+        let mut total_written = 0_usize;
+        let start_addr = usize::try_from(start_addr).expect("Unable to convert addr to usize");
 
-        while total_written < len as u64 {
+        while total_written < len {
             let gaddr = start_addr + total_written;
-            let paddr = match self.translate_gva(&vmm.vcpus_handles[tid_to_cpuid(tid)], gaddr) {
-                Some(paddr) if paddr == u64::MIN => gaddr,
-                Some(paddr) => paddr,
-                None => {
-                    info!("Error translating gva");
-                    return Err(TargetError::NonFatal);
-                }
-            };
+            let paddr =
+                match self.translate_gva(&vmm.vcpus_handles[tid_to_cpuid(tid)], gaddr as u64) {
+                    Some(paddr) if paddr == <Self::Arch as Arch>::Usize::MIN => gaddr,
+                    Some(paddr) => usize::try_from(paddr).expect("Error converting addr to usize"),
+                    None => {
+                        info!("Error translating gva");
+                        return Err(TargetError::NonFatal);
+                    }
+                };
             let psize = 4096;
-            let write_len =
-                std::cmp::min(len as u64 - total_written, psize - (paddr & (psize - 1)));
+            let write_len = std::cmp::min(len - total_written, psize - (paddr & (psize - 1)));
             if memory
                 .write(
-                    &data[total_written as usize..total_written as usize + write_len as usize],
-                    GuestAddress(paddr),
+                    &data[total_written..total_written + write_len],
+                    GuestAddress(paddr as u64),
                 )
                 .is_err()
             {
@@ -715,7 +678,6 @@ impl SwBreakpoint for FirecrackerTarget {
         addr: <Self::Arch as Arch>::Usize,
         _kind: <Self::Arch as Arch>::BreakpointKind,
     ) -> TargetResult<bool, Self> {
-
         let physical_addr = {
             let vmm = &self.vmm.lock().expect("Error unlocking vmm");
             self.translate_gva(
