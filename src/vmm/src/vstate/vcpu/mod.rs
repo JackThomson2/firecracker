@@ -590,9 +590,6 @@ impl Vcpu {
                     gdb_event
                         .send(get_raw_tid(cpu_id))
                         .expect("Unable to notify gdb event");
-                    info!("Wrote update to event fd for id {cpu_id}");
-                } else {
-                    info!("No gdb event?");
                 }
 
                 Ok(VcpuEmulation::Paused)

@@ -1,15 +1,12 @@
-use gdbstub::{
-    common::{Signal, Tid},
-    conn::{Connection, ConnectionExt},
-    stub::{run_blocking, DisconnectReason, GdbStub, MultiThreadStopReason},
-    target::Target,
-};
+// Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use kvm_bindings::{
     kvm_guest_debug, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_INJECT_BP, KVM_GUESTDBG_SINGLESTEP,
     KVM_GUESTDBG_USE_HW_BP, KVM_GUESTDBG_USE_SW_BP,
 };
 use kvm_ioctls::VcpuFd;
-use std::sync::mpsc::{Receiver, TryRecvError::Empty};
+use std::sync::mpsc::Receiver;
 use vm_memory::GuestAddress;
 
 use crate::{
@@ -23,21 +20,17 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use super::target::{cpuid_to_tid, FirecrackerTarget};
+use super::event_loop::event_loop;
 
 const KVM_DEBUG_ENABLE: u64 = 0x0600;
 
 fn listen_for_connection(path: &std::path::Path) -> Result<UnixStream, Box<dyn std::error::Error>> {
-    info!("Binding gdb socket");
     let listener = UnixListener::bind(path)?;
-    info!("Waiting for connection on {}...", path.display());
-
-    let (stream, addr) = listener.accept()?;
-    info!("GDB connected from {addr:?}");
+    info!("Waiting for GDB server connection on {}...", path.display());
+    let (stream, _addr) = listener.accept()?;
 
     Ok(stream)
 }
-
 
 fn set_kvm_debug(control: u32, vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool) {
     let mut dbg = kvm_guest_debug {
@@ -63,7 +56,7 @@ fn set_kvm_debug(control: u32, vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool
     }
 }
 
-/// Configures the VCPU for 
+/// Configures the VCPU for
 pub fn kvm_debug(vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool) {
     let mut control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP | KVM_GUESTDBG_USE_SW_BP;
     if step {
@@ -105,8 +98,8 @@ pub fn gdb_thread(
     gdb_event_receiver: Receiver<usize>,
     entry_addr: GuestAddress,
 ) {
-    // We register a hw breakpoint at the entry point as GDB  expects the application 
-    // to be stopped. This also allows us to set breakpoints before kernel starts
+    // We register a hw breakpoint at the entry point as GDB expects the application
+    // to be stopped as it connects. This also allows us to set breakpoints before kernel starts
     kvm_debug(&vcpus[0].kvm_vcpu.fd, &[entry_addr], false);
 
     for vcpu in vcpus.iter().skip(1) {
@@ -114,126 +107,10 @@ pub fn gdb_thread(
     }
 
     let path = Path::new("/tmp/gdb.socket");
-    let connection = listen_for_connection(path).unwrap();
+    let connection = listen_for_connection(path).expect("Error waiting for connection");
 
     std::thread::Builder::new()
         .name("gdb".into())
         .spawn(move || event_loop(connection, vmm, gdb_event_receiver, entry_addr))
         .expect("Error spawning GDB thread");
-}
-
-fn event_loop(connection: UnixStream, vmm: Arc<Mutex<Vmm>>, gdb_event_receiver: Receiver<usize>, entry_addr: GuestAddress) {
-    let target = FirecrackerTarget::new(vmm, gdb_event_receiver, entry_addr);
-    let connection: Box<dyn ConnectionExt<Error = std::io::Error>> = { Box::new(connection) };
-    let debugger = GdbStub::new(connection);
-
-    gdb_event_loop_thread(debugger, target);
-}
-
-struct MyGdbBlockingEventLoop {}
-
-impl run_blocking::BlockingEventLoop for MyGdbBlockingEventLoop {
-    type Target = FirecrackerTarget;
-    type Connection = Box<dyn ConnectionExt<Error = std::io::Error>>;
-
-    type StopReason = MultiThreadStopReason<u64>;
-
-    fn wait_for_stop_reason(
-        target: &mut FirecrackerTarget,
-        conn: &mut Self::Connection,
-    ) -> Result<
-        run_blocking::Event<MultiThreadStopReason<u64>>,
-        run_blocking::WaitForStopReasonError<
-            <Self::Target as Target>::Error,
-            <Self::Connection as Connection>::Error,
-        >,
-    > {
-        loop {
-            let mut stopped_tid = None;
-            match target.gdb_event.try_recv() {
-                Ok(cpu_id) => {
-                    // The VCPU reports it's id from raw_id so we straight convert here
-                    let tid = Tid::new(cpu_id).expect("Error converting cpu id to Tid");
-                    // If notify paused returns false this means we were already debugging a single
-                    // core, the target will track this for us to pick up later
-                    target.notify_paused_vcpu(tid);
-
-                    stopped_tid = Some(tid);
-                }
-                Err(Empty) => (),
-                Err(e) => {
-                    info!("Error {e:?}");
-                }
-            }
-
-            if let Some(tid) = stopped_tid {
-                let stop_response = match target.get_stop_reason(tid) {
-                    Some(res) => res,
-                    None => {
-                        // If we returned None this is a break which should be handled by
-                        // the guest kernel (e.g. kernel int3 self testing) so we won't notify GDB
-                        target.request_resume(tid);
-                        continue;
-                    }
-                };
-
-                return Ok(run_blocking::Event::TargetStopped(stop_response));
-            }
-
-            if conn.peek().map(|b| b.is_some()).unwrap_or(false) {
-                let byte = conn
-                    .read()
-                    .map_err(run_blocking::WaitForStopReasonError::Connection)?;
-                return Ok(run_blocking::Event::IncomingData(byte));
-            }
-        }
-    }
-
-    // Invoked when the GDB client sends a Ctrl-C interrupt.
-    fn on_interrupt(
-        target: &mut FirecrackerTarget,
-    ) -> Result<Option<MultiThreadStopReason<u64>>, <FirecrackerTarget as Target>::Error> {
-        // notify the target that a ctrl-c interrupt has occurred.
-        let main_core = cpuid_to_tid(0);
-
-        target.request_pause(main_core);
-        target.notify_paused_vcpu(main_core);
-
-        let exit_reason = MultiThreadStopReason::SignalWithThread {
-            tid: main_core,
-            signal: Signal::SIGINT,
-        };
-        Ok(Some(exit_reason))
-    }
-}
-
-fn gdb_event_loop_thread(
-    debugger: GdbStub<FirecrackerTarget, Box<dyn ConnectionExt<Error = std::io::Error>>>,
-    mut target: FirecrackerTarget,
-) {
-    match debugger.run_blocking::<MyGdbBlockingEventLoop>(&mut target) {
-        Ok(disconnect_reason) => match disconnect_reason {
-            DisconnectReason::Disconnect => {
-                println!("Client disconnected")
-            }
-            DisconnectReason::TargetExited(code) => {
-                println!("Target exited with code {}", code)
-            }
-            DisconnectReason::TargetTerminated(sig) => {
-                println!("Target terminated with signal {}", sig)
-            }
-            DisconnectReason::Kill => println!("GDB sent a kill command"),
-        },
-        Err(e) => {
-            if e.is_target_error() {
-                println!("target encountered a fatal error:")
-            } else if e.is_connection_error() {
-                println!("connection error: ")
-            } else {
-                println!("gdbstub encountered a fatal error {e:?}")
-            }
-        }
-    }
-
-    target.shutdown();
 }
