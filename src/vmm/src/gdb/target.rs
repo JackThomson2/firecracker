@@ -26,6 +26,7 @@ use gdbstub_arch::x86::reg::X86_64CoreRegs as CoreRegs;
 #[cfg(target_arch = "x86_64")]
 use gdbstub_arch::x86::X86_64_SSE as GdbArch;
 use kvm_bindings::kvm_regs;
+use libc::wait;
 use vm_memory::{Bytes, GuestAddress};
 
 use crate::logger::{error, info};
@@ -118,7 +119,8 @@ impl FirecrackerTarget {
             vmm,
             entry_addr,
             gdb_event,
-            hw_breakpoints: Vec::new(),
+            // We only support 4 hw breakpoints on x86 this will need to be configurable on arm
+            hw_breakpoints: Vec::with_capacity(4),
             sw_breakpoints: HashMap::new(),
             vcpu_state,
 
@@ -228,7 +230,7 @@ impl FirecrackerTarget {
         }
 
         if let VcpuResponse::NotAllowed(message) = response {
-            error!("Response from get regs: {message}");
+            error!("Response from get regs: {message} for TID {tid:?}");
         }
 
         Err(Error::VCPURequestError)
@@ -243,7 +245,7 @@ impl FirecrackerTarget {
             .expect("Error sending message to vcpu");
         let response = cpu_handle.response_receiver().recv().expect("Error recieving message from vcpu");
         if let VcpuResponse::NotAllowed(message) = response {
-            error!("Response from set regs: {message}");
+            error!("Response from set regs: {message} on tid: {tid:?}");
             return Err(Error::VCPURequestError);
         }
 
@@ -671,6 +673,11 @@ impl HwBreakpoint for FirecrackerTarget {
         addr: <Self::Arch as Arch>::Usize,
         _kind: <Self::Arch as Arch>::BreakpointKind,
     ) -> TargetResult<bool, Self> {
+        // If we are at capacity we can't accept any more hw breakpoints
+        if self.hw_breakpoints.len() == self.hw_breakpoints.capacity() {
+            return Ok(false)
+        }
+
         self.hw_breakpoints.push(GuestAddress(addr));
         self.update_kvm_debug(self.get_paused_vcpu()?)?;
 

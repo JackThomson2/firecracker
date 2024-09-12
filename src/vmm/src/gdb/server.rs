@@ -32,7 +32,7 @@ fn listen_for_connection(path: &std::path::Path) -> Result<UnixStream, Box<dyn s
     Ok(stream)
 }
 
-fn set_kvm_debug(control: u32, vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool) {
+fn set_kvm_debug(control: u32, vcpu: &VcpuFd, addrs: &[GuestAddress]) {
     let mut dbg = kvm_guest_debug {
         control,
         ..Default::default()
@@ -48,11 +48,6 @@ fn set_kvm_debug(control: u32, vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool
 
     if vcpu.set_guest_debug(&dbg).is_err() {
         error!("Error setting debug");
-    } else {
-        info!(
-            "Debug setup succesfully. Single Step: {step} BP count: {}",
-            addrs.len()
-        );
     }
 }
 
@@ -63,7 +58,7 @@ pub fn kvm_debug(vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool) {
         control |= KVM_GUESTDBG_SINGLESTEP;
     }
 
-    set_kvm_debug(control, vcpu, addrs, step)
+    set_kvm_debug(control, vcpu, addrs)
 }
 
 /// Injects a BP back into the guest kernel for it to handle, this is particularly useful for the
@@ -78,7 +73,7 @@ pub fn kvm_inject_bp(vcpu: &VcpuFd, addrs: &[GuestAddress], step: bool) {
         control |= KVM_GUESTDBG_SINGLESTEP;
     }
 
-    set_kvm_debug(control, vcpu, addrs, step)
+    set_kvm_debug(control, vcpu, addrs)
 }
 
 /// This method will kickstart the GDB debugging process, it takes in the VMM object, a slice of

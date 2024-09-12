@@ -101,6 +101,7 @@ pub struct Vcpu {
     #[cfg(feature = "debug")]
     gdb_event: Option<Sender<usize>>,
     /// VCPU id this is to track the id of the vcpu
+    #[cfg(feature = "debug")]
     id: Option<usize>,
     /// The receiving end of events channel owned by the vcpu side.
     event_receiver: Receiver<VcpuEvent>,
@@ -215,6 +216,7 @@ impl Vcpu {
             response_sender,
             #[cfg(feature = "debug")]
             gdb_event: None,
+            #[cfg(feature = "debug")]
             id: None,
             kvm_vcpu,
         })
@@ -233,6 +235,7 @@ impl Vcpu {
     }
 
     /// Get a sender for vcpu events
+    #[cfg(feature = "debug")]
     pub fn get_event_sender(&self) -> Option<Sender<VcpuEvent>> {
         let sender = self.event_sender.clone()?;
         Some(sender)
@@ -299,8 +302,6 @@ impl Vcpu {
     fn running(&mut self) -> StateMachine<Self> {
         // This loop is here just for optimizing the emulation path.
         // No point in ticking the state machine if there are no external events.
-        // By default don't change state.
-        let mut state = StateMachine::next(Self::running);
 
         loop {
             match self.run_emulation() {
@@ -321,6 +322,9 @@ impl Vcpu {
                 Err(_) => return self.exit(FcExitCode::GenericError),
             }
         }
+
+        // By default don't change state.
+        let mut state = StateMachine::next(Self::running);
 
         // Break this emulation loop on any transition request/external event.
         match self.event_receiver.try_recv() {
@@ -718,7 +722,6 @@ pub enum VcpuEvent {
     SaveState,
     /// Event to dump CPU configuration of a paused Vcpu.
     DumpCpuConfig,
-    #[cfg(feature = "debug")]
     /// Set vcpu register
     #[cfg(feature = "debug")]
     GetRegisters,
@@ -861,6 +864,7 @@ pub enum VcpuEmulation {
     /// Stopped.
     Stopped,
     /// Pause request
+    #[cfg(feature = "debug")]
     Paused,
 }
 

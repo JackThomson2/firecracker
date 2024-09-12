@@ -7,7 +7,9 @@
 use std::convert::TryFrom;
 use std::fmt::Debug;
 use std::io::{self, Seek, SeekFrom};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
+#[cfg(feature = "debug")]
+use std::sync::mpsc;
 
 use event_manager::{MutEventSubscriber, SubscriberOps};
 use libc::EFD_NONBLOCK;
@@ -389,7 +391,9 @@ pub fn build_microvm_for_boot(
             .ok_or_else(|| MissingSeccompFilters("vmm".to_string()))?,
     )
     .map_err(VmmError::SeccompFilters)
-    .map_err(Internal)?;
+    .map_err(Internal)?; 
+
+    event_manager.add_subscriber(vmm.clone());
 
     Ok(vmm)
 }

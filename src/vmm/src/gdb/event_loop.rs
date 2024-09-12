@@ -20,6 +20,7 @@ use std::{
 use vm_memory::GuestAddress;
 
 use crate::Vmm;
+use crate::logger::trace;
 
 use super::target::{cpuid_to_tid, Error, FirecrackerTarget};
 
@@ -62,6 +63,7 @@ impl run_blocking::BlockingEventLoop for GdbBlockingEventLoop {
                     // If notify paused returns false this means we were already debugging a single
                     // core, the target will track this for us to pick up later
                     target.notify_paused_vcpu(tid);
+                    trace!("vcpu: {tid:?} paused from debug exit");
 
                     let stop_response = match target.get_stop_reason(tid) {
                         Some(res) => res,
@@ -72,9 +74,12 @@ impl run_blocking::BlockingEventLoop for GdbBlockingEventLoop {
                                 return Err(WaitForStopReasonError::Target(e));
                             }
 
+                            trace!("Injected BP into guest early exit");
                             continue;
                         }
                     };
+
+                    trace!("Returned stop reason to gdb: {stop_response:?}");
 
                     return Ok(run_blocking::Event::TargetStopped(stop_response));
                 }
