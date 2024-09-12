@@ -234,13 +234,6 @@ impl Vcpu {
         self.id = Some(cpu_id);
     }
 
-    /// Get a sender for vcpu events
-    #[cfg(feature = "debug")]
-    pub fn get_event_sender(&self) -> Option<Sender<VcpuEvent>> {
-        let sender = self.event_sender.clone()?;
-        Some(sender)
-    }
-
     /// Uses the kvm api to translate the virtual address
     #[cfg(feature = "debug")]
     fn translate_gva(&self, address: u64) -> u64 {
@@ -864,7 +857,6 @@ pub enum VcpuEmulation {
     /// Stopped.
     Stopped,
     /// Pause request
-    #[cfg(feature = "debug")]
     Paused,
 }
 

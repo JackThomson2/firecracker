@@ -26,7 +26,6 @@ use gdbstub_arch::x86::reg::X86_64CoreRegs as CoreRegs;
 #[cfg(target_arch = "x86_64")]
 use gdbstub_arch::x86::X86_64_SSE as GdbArch;
 use kvm_bindings::kvm_regs;
-use libc::wait;
 use vm_memory::{Bytes, GuestAddress};
 
 use crate::logger::{error, info};
@@ -423,6 +422,8 @@ impl Target for FirecrackerTarget {
         Some(self)
     }
 
+    /// We disable implicit sw breakpoints as we want to manage these internally so we can inject
+    /// breakpoints back into the guest if we didn't create them
     #[inline(always)]
     fn guard_rail_implicit_sw_breakpoints(&self) -> bool {
         false

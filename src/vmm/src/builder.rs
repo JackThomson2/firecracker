@@ -391,7 +391,7 @@ pub fn build_microvm_for_boot(
             .ok_or_else(|| MissingSeccompFilters("vmm".to_string()))?,
     )
     .map_err(VmmError::SeccompFilters)
-    .map_err(Internal)?; 
+    .map_err(Internal)?;
 
     event_manager.add_subscriber(vmm.clone());
 
