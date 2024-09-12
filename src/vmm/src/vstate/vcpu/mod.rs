@@ -6,6 +6,8 @@
 // found in the THIRD-PARTY file.
 
 use std::cell::Cell;
+#[cfg(feature = "gdb")]
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{fence, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Barrier};
@@ -20,6 +22,8 @@ use vmm_sys_util::errno;
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::cpu_config::templates::{CpuConfiguration, GuestConfigError};
+#[cfg(feature = "gdb")]
+use crate::gdb::target::{get_raw_tid, Error as GdbError};
 use crate::logger::{IncMetric, METRICS};
 use crate::utils::signal::{register_signal_handler, sigrtmin, Killable};
 use crate::utils::sm::StateMachine;
@@ -60,6 +64,9 @@ pub enum VcpuError {
     VcpuTlsInit,
     /// Vcpu not present in TLS
     VcpuTlsNotPresent,
+    /// Error with gdb request sent
+    #[cfg(feature = "gdb")]
+    GdbRequest(GdbError),
 }
 
 /// Encapsulates configuration parameters for the guest vCPUS.
@@ -89,6 +96,12 @@ pub struct Vcpu {
 
     /// File descriptor for vcpu to trigger exit event on vmm.
     exit_evt: EventFd,
+    /// Debugger emitter for gdb events
+    #[cfg(feature = "gdb")]
+    gdb_event: Option<Sender<usize>>,
+    /// VCPU id this is to track the id of the vcpu
+    #[cfg(feature = "gdb")]
+    id: usize,
     /// The receiving end of events channel owned by the vcpu side.
     event_receiver: Receiver<VcpuEvent>,
     /// The transmitting end of the events channel which will be given to the handler.
@@ -200,6 +213,10 @@ impl Vcpu {
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
             response_sender,
+            #[cfg(feature = "gdb")]
+            gdb_event: None,
+            #[cfg(feature = "gdb")]
+            id: index.into(),
             kvm_vcpu,
         })
     }
@@ -207,6 +224,18 @@ impl Vcpu {
     /// Sets a MMIO bus for this vcpu.
     pub fn set_mmio_bus(&mut self, mmio_bus: crate::devices::Bus) {
         self.kvm_vcpu.peripherals.mmio_bus = Some(mmio_bus);
+    }
+
+    /// Attaches the fields required for debugging
+    #[cfg(feature = "gdb")]
+    pub fn attach_debug_info(&mut self, gdb_event: Sender<usize>) {
+        self.gdb_event = Some(gdb_event);
+    }
+
+    /// Obtains a copy of the KVM Vcpu fd to be copied to the Debug thread
+    #[cfg(feature = "gdb")]
+    pub fn copy_kvm_vcpu_fd(&self) -> RawFd {
+        self.kvm_vcpu.fd.as_raw_fd()
     }
 
     /// Moves the vcpu to its own thread and constructs a VcpuHandle.
@@ -260,6 +289,7 @@ impl Vcpu {
     fn running(&mut self) -> StateMachine<Self> {
         // This loop is here just for optimizing the emulation path.
         // No point in ticking the state machine if there are no external events.
+
         loop {
             match self.run_emulation() {
                 // Emulation ran successfully, continue.
@@ -271,6 +301,11 @@ impl Vcpu {
                 // - the other vCPUs won't ever exit out of `KVM_RUN`, but they won't consume CPU.
                 // So we pause vCPU0 and send a signal to the emulation thread to stop the VMM.
                 Ok(VcpuEmulation::Stopped) => return self.exit(FcExitCode::Ok),
+                // If the emulation requests a pause lets do this
+                #[cfg(feature = "gdb")]
+                Ok(VcpuEmulation::Paused) => {
+                    return StateMachine::next(Self::paused);
+                }
                 // Emulation errors lead to vCPU exit.
                 Err(_) => return self.exit(FcExitCode::GenericError),
             }
@@ -447,6 +482,16 @@ impl Vcpu {
                 self.kvm_vcpu.fd.set_kvm_immediate_exit(0);
                 // Notify that this KVM_RUN was interrupted.
                 Ok(VcpuEmulation::Interrupted)
+            }
+            #[cfg(feature = "gdb")]
+            Ok(VcpuExit::Debug(_)) => {
+                if let Some(gdb_event) = &self.gdb_event {
+                    gdb_event
+                        .send(get_raw_tid(self.id))
+                        .expect("Unable to notify gdb event");
+                }
+
+                Ok(VcpuEmulation::Paused)
             }
             emulation_result => handle_kvm_exit(&mut self.kvm_vcpu.peripherals, emulation_result),
         }
@@ -688,6 +733,9 @@ pub enum VcpuEmulation {
     Interrupted,
     /// Stopped.
     Stopped,
+    /// Pause request
+    #[cfg(feature = "gdb")]
+    Paused,
 }
 
 #[cfg(test)]

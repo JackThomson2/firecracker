@@ -1245,6 +1245,30 @@
                         "index": 1,
                         "type": "dword",
                         "op": "eq",
+                        "val": 1078505115,
+                        "comment": "KVM_SET_GUEST_DEBUG"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3222843013,
+                        "comment": "KVM_TRANSLATE"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
                         "val": 1074025680,
                         "comment": "TUNSETOFFLOAD"
                     }
