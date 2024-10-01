@@ -10,7 +10,7 @@ use std::fmt::{Debug, Write};
 use kvm_bindings::{
     kvm_mp_state, kvm_vcpu_init, KVM_ARM_VCPU_POWER_OFF, KVM_ARM_VCPU_PSCI_0_2, KVM_ARM_VCPU_SVE,
 };
-use kvm_ioctls::*;
+use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
 use serde::{Deserialize, Serialize};
 
 use crate::arch::aarch64::regs::{Aarch64RegisterVec, KVM_REG_ARM64_SVE_VLS};
@@ -32,13 +32,13 @@ pub enum KvmVcpuError {
     /// Error configuring the vcpu registers: {0}
     ConfigureRegisters(ArchError),
     /// Error creating vcpu: {0}
-    CreateVcpu(kvm_ioctls::Error),
+    CreateVcpu(::kvm_ioctls::Error),
     /// Failed to dump CPU configuration: {0}
     DumpCpuConfig(ArchError),
     /// Error getting the vcpu preferred target: {0}
-    GetPreferredTarget(kvm_ioctls::Error),
+    GetPreferredTarget(::kvm_ioctls::Error),
     /// Error initializing the vcpu: {0}
-    Init(kvm_ioctls::Error),
+    Init(::kvm_ioctls::Error),
     /// Error applying template: {0}
     ApplyCpuTemplate(ArchError),
     /// Failed to restore the state of the vcpu: {0}
@@ -358,7 +358,7 @@ mod tests {
             err.unwrap_err(),
             KvmVcpuError::ConfigureRegisters(ArchError::SetOneReg(
                 0x6030000000100042,
-                kvm_ioctls::Error::new(9)
+                ::kvm_ioctls::Error::new(9)
             ))
         );
     }

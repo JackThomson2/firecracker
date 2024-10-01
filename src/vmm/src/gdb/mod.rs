@@ -8,6 +8,9 @@ pub mod target;
 /// Kvm debug implementations
 #[macro_use]
 mod kvm_debug;
+/// Kvm debug methods specific for aarch64
+#[cfg(target_arch = "aarch64")]
+mod aarch64_debug;
 
 use std::os::fd::RawFd;
 use std::os::unix::net::UnixListener;

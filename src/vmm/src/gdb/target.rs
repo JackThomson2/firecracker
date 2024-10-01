@@ -24,7 +24,13 @@ use gdbstub::target::{Target, TargetError, TargetResult};
 use gdbstub_arch::x86::reg::X86_64CoreRegs as CoreRegs;
 #[cfg(target_arch = "x86_64")]
 use gdbstub_arch::x86::X86_64_SSE as GdbArch;
+#[cfg(target_arch = "aarch64")]
+use gdbstub_arch::aarch64::reg::AArch64CoreRegs as CoreRegs;
+#[cfg(target_arch = "aarch64")]
+use gdbstub_arch::aarch64::AArch64 as GdbArch;
 use kvm_bindings::kvm_regs;
+#[cfg(target_arch = "aarch64")]
+use kvm_bindings::user_pt_regs;
 use vm_memory::{Bytes, GuestAddress};
 
 use super::kvm_debug;
@@ -35,6 +41,11 @@ use crate::{arch, FcExitCode, VcpuEvent, VcpuResponse, Vmm};
 
 #[cfg(target_arch = "x86_64")]
 const X86_SW_BP_OP: u8 = 0xCC;
+
+#[cfg(target_arch = "x86_64")]
+const SW_BP_SIZE: usize = 1;
+#[cfg(target_arch = "aarch64")]
+const SW_BP_SIZE: usize = 4;
 
 #[derive(Debug, Clone)]
 /// Stores the current state of a Vcpu with a copy of the Vcpu file descriptor
@@ -64,6 +75,17 @@ impl VcpuState {
         if !self.paused {
             info!("Attempted to update kvm debug on a non paused Vcpu");
             return Ok(());
+        }
+
+        if let Ok(mut regs) = kvm_debug::get_regs(&self.vcpu_fd) {
+            if self.single_step {
+                info!("Temporarily disabled interrupts on vcpu");
+                regs.regs.pstate |= 0x00000080 | 0x00000040;
+            } else {
+                info!("Re-enabled interrupts on vcpu");
+                regs.regs.pstate &= !(0x00000080 | 0x00000040);
+            }
+            kvm_debug::set_regs(&self.vcpu_fd, &regs)?;
         }
 
         kvm_debug::vcpu_set_debug(&self.vcpu_fd, hw_breakpoints, self.single_step)
@@ -144,7 +166,7 @@ pub struct FirecrackerTarget {
     hw_breakpoints: ArrayVec<GuestAddress, 4>,
     /// Used to track the currently configured software breakpoints and store the op-code
     /// which was swapped out
-    sw_breakpoints: HashMap<<GdbArch as Arch>::Usize, u8>,
+    sw_breakpoints: HashMap<<GdbArch as Arch>::Usize, [u8; SW_BP_SIZE]>,
 
     /// Stores the current state of each Vcpu
     vcpu_state: Vec<VcpuState>,
@@ -169,6 +191,18 @@ pub fn vcpuid_to_tid(cpu_id: usize) -> Result<Tid, Error> {
 /// the 1 indexed value for GDB
 pub fn get_raw_tid(cpu_id: usize) -> usize {
     cpu_id + 1
+}
+
+/// Helper function to get the instruction pointer abstracted across different Cpus
+#[cfg(target_arch = "x86_64")]
+fn get_instruction_pointer(regs: &kvm_regs) -> u64 {
+    regs.rip
+}
+
+/// Helper function to get the instruction pointer abstracted across different Cpus
+#[cfg(target_arch = "aarch64")]
+fn get_instruction_pointer(regs: &kvm_regs) -> u64 {
+    regs.regs.pc
 }
 
 impl FirecrackerTarget {
@@ -267,6 +301,7 @@ impl FirecrackerTarget {
     }
 
     /// A helper function to allow the event loop to inject this breakpoint back into the Vcpu
+    #[cfg(target_arch = "x86_64")]
     pub fn inject_bp_to_guest(&mut self, tid: Tid) -> Result<(), Error> {
         let vcpu_state = &mut self.vcpu_state[tid_to_vcpuid(tid)];
         kvm_debug::vcpu_inject_bp(&vcpu_state.vcpu_fd, &self.hw_breakpoints, false)
@@ -310,16 +345,19 @@ impl FirecrackerTarget {
             return Ok(Some(MultiThreadStopReason::SwBreak(tid)));
         };
 
-        let physical_addr = kvm_debug::translate_gva(&vcpu_state.vcpu_fd, regs.rip)?;
+        let pc = get_instruction_pointer(&regs);
+
+        let vmm = &self.vmm.lock()?;
+        let physical_addr = kvm_debug::translate_gva(&vcpu_state.vcpu_fd, pc, &vmm)?;
         if self.sw_breakpoints.contains_key(&physical_addr) {
             return Ok(Some(MultiThreadStopReason::SwBreak(tid)));
         }
 
-        if self.hw_breakpoints.contains(&GuestAddress(regs.rip)) {
+        if self.hw_breakpoints.contains(&GuestAddress(pc)) {
             return Ok(Some(MultiThreadStopReason::HwBreak(tid)));
         }
 
-        if regs.rip == self.entry_addr.0 {
+        if pc == self.entry_addr.0 {
             return Ok(Some(MultiThreadStopReason::HwBreak(tid)));
         }
 
@@ -351,7 +389,25 @@ impl Target for FirecrackerTarget {
 }
 
 impl MultiThreadBase for FirecrackerTarget {
+
     /// Reads the registers for the Vcpu
+    #[cfg(target_arch = "aarch64")]
+    fn read_registers(&mut self, regs: &mut CoreRegs, tid: Tid) -> TargetResult<(), Self> {
+        let vcpu_state = &self.vcpu_state[tid_to_vcpuid(tid)];
+        let cpu_regs = kvm_debug::get_regs(&vcpu_state.vcpu_fd).map_err(|e| {
+            error!("Failed to read cpu registers: {e:?}");
+            TargetError::NonFatal
+        })?;
+
+        regs.x = cpu_regs.regs.regs;
+        regs.sp = cpu_regs.regs.sp;
+        regs.pc = cpu_regs.regs.pc;
+
+        Ok(())
+    }
+
+    /// Reads the registers for the Vcpu
+    #[cfg(target_arch = "x86_64")]
     fn read_registers(&mut self, regs: &mut CoreRegs, tid: Tid) -> TargetResult<(), Self> {
         let vcpu_state = &self.vcpu_state[tid_to_vcpuid(tid)];
         let cpu_regs = kvm_debug::get_regs(&vcpu_state.vcpu_fd).map_err(|e| {
@@ -387,6 +443,27 @@ impl MultiThreadBase for FirecrackerTarget {
     }
 
     /// Writes to the registers for the Vcpu
+    #[cfg(target_arch = "aarch64")]
+    fn write_registers(&mut self, regs: &CoreRegs, tid: Tid) -> TargetResult<(), Self> {
+
+        let new_regs = kvm_regs {
+            regs: user_pt_regs {
+                regs: regs.x,
+                sp: regs.sp,
+                pc: regs.pc,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let vcpu_state = &self.vcpu_state[tid_to_vcpuid(tid)];
+        kvm_debug::set_regs(&vcpu_state.vcpu_fd, &new_regs).map_err(|e| {
+            error!("Error setting registers {e:?}");
+            TargetError::NonFatal
+        })
+    }
+
+    /// Writes to the registers for the Vcpu
+    #[cfg(target_arch = "x86_64")]
     fn write_registers(&mut self, regs: &CoreRegs, tid: Tid) -> TargetResult<(), Self> {
         let new_regs = kvm_regs {
             rax: regs.regs[0],
@@ -429,8 +506,13 @@ impl MultiThreadBase for FirecrackerTarget {
         let mut gva = start_addr;
         let vcpu_state = &self.vcpu_state[tid_to_vcpuid(tid)];
 
+        let vmm = &self.vmm.lock().map_err(|_| {
+            error!("Error locking vmm in read addr");
+            TargetError::NonFatal
+        })?;
+
         while !data.is_empty() {
-            let gpa = kvm_debug::translate_gva(&vcpu_state.vcpu_fd, gva as u64).map_err(|e| {
+            let gpa = kvm_debug::translate_gva(&vcpu_state.vcpu_fd, gva as u64, vmm).map_err(|e| {
                 error!("Error {e:?} translating gva on read address: {start_addr:X}");
                 TargetError::NonFatal
             })?;
@@ -440,10 +522,6 @@ impl MultiThreadBase for FirecrackerTarget {
             // Compute the amount space left in the page after the paddr
             let read_len = std::cmp::min(data.len(), psize - (paddr & (psize - 1)));
 
-            let vmm = &self.vmm.lock().map_err(|_| {
-                error!("Error locking vmm in read addr");
-                TargetError::NonFatal
-            })?;
             vmm.guest_memory()
                 .read(&mut data[..read_len], GuestAddress(paddr as u64))
                 .map_err(|e| {
@@ -466,10 +544,15 @@ impl MultiThreadBase for FirecrackerTarget {
         tid: Tid,
     ) -> TargetResult<(), Self> {
         let mut gva = u64_to_usize(start_addr);
-
         let vcpu_state = &self.vcpu_state[tid_to_vcpuid(tid)];
+
+        let vmm = &self.vmm.lock().map_err(|_| {
+            error!("Error locking vmm in write addr");
+            TargetError::NonFatal
+        })?;
+
         while !data.is_empty() {
-            let gpa = match kvm_debug::translate_gva(&vcpu_state.vcpu_fd, gva as u64) {
+            let gpa = match kvm_debug::translate_gva(&vcpu_state.vcpu_fd, gva as u64, &vmm) {
                 Ok(paddr) => u64_to_usize(paddr),
                 Err(e) => {
                     error!("Error {e:?} translating gva");
@@ -480,11 +563,6 @@ impl MultiThreadBase for FirecrackerTarget {
             let psize = arch::PAGE_SIZE;
             // Compute the amount space left in the page after the paddr
             let write_len = std::cmp::min(data.len(), psize - (gpa & (psize - 1)));
-
-            let vmm = &self.vmm.lock().map_err(|_| {
-                error!("Error locking vmm in write addr");
-                TargetError::NonFatal
-            })?;
 
             vmm.guest_memory()
                 .write(&data[..write_len], GuestAddress(gpa as u64))
@@ -633,7 +711,14 @@ impl SwBreakpoint for FirecrackerTarget {
         addr: <Self::Arch as Arch>::Usize,
         _kind: <Self::Arch as Arch>::BreakpointKind,
     ) -> TargetResult<bool, Self> {
-        let physical_addr = kvm_debug::translate_gva(&self.get_paused_vcpu()?.vcpu_fd, addr)?;
+        let physical_addr = {
+            let vmm = &self.vmm.lock().map_err(|_| {
+                error!("Error locking vmm in add sw breakpoint");
+                TargetError::NonFatal
+            })?;
+
+            kvm_debug::translate_gva(&self.get_paused_vcpu()?.vcpu_fd, addr, &vmm)?
+        };
 
         if self.sw_breakpoints.contains_key(&physical_addr) {
             return Ok(true);
@@ -641,11 +726,14 @@ impl SwBreakpoint for FirecrackerTarget {
 
         let paused_vcpu_id = self.get_paused_vcpu_id()?;
 
-        let mut saved_register = [0];
+        let mut saved_register = [0; SW_BP_SIZE];
         self.read_addrs(addr, &mut saved_register, paused_vcpu_id)?;
-        self.sw_breakpoints.insert(physical_addr, saved_register[0]);
+        self.sw_breakpoints.insert(physical_addr, saved_register);
 
+        #[cfg(target_arch = "x86_64")]
         let break_point = [X86_SW_BP_OP];
+        #[cfg(target_arch = "aarch64")]
+        let break_point:[u8; 4] = 0x20D4u32.to_be_bytes();
         self.write_addrs(addr, &break_point, paused_vcpu_id)?;
         Ok(true)
     }
@@ -658,10 +746,17 @@ impl SwBreakpoint for FirecrackerTarget {
         addr: <Self::Arch as Arch>::Usize,
         _kind: <Self::Arch as Arch>::BreakpointKind,
     ) -> TargetResult<bool, Self> {
-        let physical_addr = kvm_debug::translate_gva(&self.get_paused_vcpu()?.vcpu_fd, addr)?;
+        let physical_addr = {
+            let vmm = &self.vmm.lock().map_err(|_| {
+                error!("Error locking vmm in remove sw breakpoint");
+                TargetError::NonFatal
+            })?;
+
+            kvm_debug::translate_gva(&self.get_paused_vcpu()?.vcpu_fd, addr, &vmm)?
+        };
 
         if let Some(removed) = self.sw_breakpoints.remove(&physical_addr) {
-            self.write_addrs(addr, &[removed], self.get_paused_vcpu_id()?)?;
+            self.write_addrs(addr, &removed, self.get_paused_vcpu_id()?)?;
             return Ok(true);
         }
 

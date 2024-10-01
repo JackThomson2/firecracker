@@ -59,7 +59,7 @@ itertools = "0.13.0"
 proptest = { version = "1.5.0", default-features = false, features = ["std"] }
 
 [features]
-default = []
+default = ["gdb"]
 tracing = ["log-instrument"]
 gdb = ["arrayvec", "gdbstub", "gdbstub_arch"]
 

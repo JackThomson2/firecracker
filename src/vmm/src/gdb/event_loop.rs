@@ -70,6 +70,7 @@ impl run_blocking::BlockingEventLoop for GdbBlockingEventLoop {
                         // If we returned None this is a break which should be handled by
                         // the guest kernel (e.g. kernel int3 self testing) so we won't notify
                         // GDB and instead inject this back into the guest
+                        #[cfg(target_arch = "x86_64")]
                         target
                             .inject_bp_to_guest(tid)
                             .map_err(WaitForStopReasonError::Target)?;

@@ -9,9 +9,14 @@ use kvm_bindings::*;
 use kvm_ioctls::kvm_ioctls::*;
 use vm_memory::GuestAddress;
 use vmm_sys_util::errno;
-use vmm_sys_util::ioctl::{ioctl_with_mut_ref, ioctl_with_ref};
+#[cfg(target_arch = "x86_64")]
+use vmm_sys_util::ioctl::ioctl_with_mut_ref;
+use vmm_sys_util::ioctl::ioctl_with_ref;
 
 use super::target::Error;
+
+#[cfg(target_arch = "aarch64")]
+pub use super::aarch64_debug::*;
 
 /// Sets the 9th (Global Exact Breakpoint enable) and the 10th (always 1) bits for the DR7 debug
 /// control register
@@ -36,6 +41,7 @@ pub fn get_regs(vcpu_fd: &RawFd) -> Result<kvm_regs, Error> {
     }
     Ok(regs)
 }
+
 
 /// Sets the vCPU general purpose registers using the `KVM_SET_REGS` ioctl.
 ///
@@ -93,6 +99,7 @@ pub fn set_guest_debug(vcpu_fd: &RawFd, debug_struct: &kvm_guest_debug) -> Resul
 /// used as a bitfield to track which registers are enabled and setting the
 /// `X86_GLOBAL_DEBUG_ENABLE` flags. Further reading on the DR7 register can be found here:
 /// https://en.wikipedia.org/wiki/X86_debug_register#DR7_-_Debug_control
+#[cfg(target_arch = "x86_64")]
 fn set_kvm_debug(control: u32, vcpu_fd: &RawFd, addrs: &[GuestAddress]) -> Result<(), Error> {
     let mut dbg = kvm_guest_debug {
         control,
@@ -110,9 +117,33 @@ fn set_kvm_debug(control: u32, vcpu_fd: &RawFd, addrs: &[GuestAddress]) -> Resul
     set_guest_debug(vcpu_fd, &dbg)
 }
 
+#[cfg(target_arch = "aarch64")]
+fn set_kvm_debug(control: u32, vcpu_fd: &RawFd, addrs: &[GuestAddress]) -> Result<(), Error> {
+    let mut dbg = kvm_guest_debug {
+        control,
+        ..Default::default()
+    };
+    for (i, addr) in addrs.iter().enumerate() {
+        // DBGBCR_EL1 (Debug Breakpoint Control Registers, D13.3.2):
+        // bit 0: 1 (Enabled)
+        // bit 1~2: 0b11 (PMC = EL1/EL0)
+        // bit 5~8: 0b1111 (BAS = AArch64)
+        // others: 0
+        dbg.arch.dbg_bcr[i] = 0b1u64 | 0b110u64 | 0b1_1110_0000u64;
+        // DBGBVR_EL1 (Debug Breakpoint Value Registers, D13.3.3):
+        // bit 2~52: VA[2:52]
+        dbg.arch.dbg_bvr[i] = (!0u64 >> 11) & addr.0;
+    }
+
+    set_guest_debug(vcpu_fd, &dbg)
+}
+
 /// Configures the Vcpu for debugging and sets the hardware breakpoints on the Vcpu
 pub fn vcpu_set_debug(vcpu_fd: &RawFd, addrs: &[GuestAddress], step: bool) -> Result<(), Error> {
+    #[cfg(target_arch = "x86_64")]
     let mut control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP | KVM_GUESTDBG_USE_SW_BP;
+    #[cfg(target_arch = "aarch64")]
+    let mut control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW | KVM_GUESTDBG_USE_SW_BP;
     if step {
         control |= KVM_GUESTDBG_SINGLESTEP;
     }
@@ -122,6 +153,7 @@ pub fn vcpu_set_debug(vcpu_fd: &RawFd, addrs: &[GuestAddress], step: bool) -> Re
 
 /// Injects a BP back into the guest kernel for it to handle, this is particularly useful for the
 /// kernels selftesting which can happen during boot.
+#[cfg(target_arch = "x86_64")]
 pub fn vcpu_inject_bp(vcpu_fd: &RawFd, addrs: &[GuestAddress], step: bool) -> Result<(), Error> {
     let mut control = KVM_GUESTDBG_ENABLE
         | KVM_GUESTDBG_USE_HW_BP
