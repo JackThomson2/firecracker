@@ -6,7 +6,7 @@
 use std::os::fd::RawFd;
 
 use kvm_bindings::*;
-use kvm_ioctls::kvm_ioctls::*;
+use kvm_ioctls::kvm_ioctls_raw::*;
 use vm_memory::GuestAddress;
 use vmm_sys_util::errno;
 #[cfg(target_arch = "x86_64")]

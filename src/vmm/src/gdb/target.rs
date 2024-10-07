@@ -445,7 +445,6 @@ impl MultiThreadBase for FirecrackerTarget {
     /// Writes to the registers for the Vcpu
     #[cfg(target_arch = "aarch64")]
     fn write_registers(&mut self, regs: &CoreRegs, tid: Tid) -> TargetResult<(), Self> {
-
         let new_regs = kvm_regs {
             regs: user_pt_regs {
                 regs: regs.x,

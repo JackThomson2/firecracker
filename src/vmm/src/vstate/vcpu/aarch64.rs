@@ -10,7 +10,7 @@ use std::fmt::{Debug, Write};
 use kvm_bindings::{
     kvm_mp_state, kvm_vcpu_init, KVM_ARM_VCPU_POWER_OFF, KVM_ARM_VCPU_PSCI_0_2, KVM_ARM_VCPU_SVE,
 };
-use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
+use kvm_ioctls::*;
 use serde::{Deserialize, Serialize};
 
 use crate::arch::aarch64::regs::{Aarch64RegisterVec, KVM_REG_ARM64_SVE_VLS};

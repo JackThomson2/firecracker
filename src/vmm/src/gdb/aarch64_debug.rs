@@ -1,8 +1,9 @@
 use std::os::fd::RawFd;
-use std::mem;
+use std::mem::{self, offset_of};
 
 use super::target::Error;
-use crate::arch::aarch64::regs;
+use crate::arch::aarch64::regs::{self, arm64_core_reg_id, Aarch64RegisterRef, Aarch64RegisterVec};
+use crate::arch::aarch64::vcpu::{get_all_registers, get_registers};
 use crate::Vmm;
 use kvm_bindings::{
     kvm_regs, user_fpsimd_state, user_pt_regs, KVM_GUESTDBG_USE_HW, KVM_NR_SPSR, KVM_REG_ARM64,
@@ -13,7 +14,7 @@ use kvm_bindings::{
 
 use vm_memory::Bytes;
 use kvm_bindings::*;
-use kvm_ioctls::kvm_ioctls::*;
+use kvm_ioctls::{kvm_ioctls_raw::*, VcpuFd};
 use vm_memory::{guest_memory, GuestAddress, GuestMemory};
 use vmm_sys_util::ioctl::{ioctl_with_mut_ref, ioctl_with_ref};
 use vmm_sys_util::errno;
@@ -113,39 +114,6 @@ macro_rules! offset_of {
     }};
 }
 
-#[macro_export]
-/// Get the ID of a core register
-macro_rules! arm64_core_reg_id {
-    ($size: tt, $offset: tt) => {
-        // The core registers of an arm64 machine are represented
-        // in kernel by the `kvm_regs` structure. This structure is a
-        // mix of 32, 64 and 128 bit fields:
-        // struct kvm_regs {
-        //     struct user_pt_regs      regs;
-        //
-        //     __u64                    sp_el1;
-        //     __u64                    elr_el1;
-        //
-        //     __u64                    spsr[KVM_NR_SPSR];
-        //
-        //     struct user_fpsimd_state fp_regs;
-        // };
-        // struct user_pt_regs {
-        //     __u64 regs[31];
-        //     __u64 sp;
-        //     __u64 pc;
-        //     __u64 pstate;
-        // };
-        // The id of a core register can be obtained like this:
-        // offset = id & ~(KVM_REG_ARCH_MASK | KVM_REG_SIZE_MASK | KVM_REG_ARM_CORE). Thus,
-        // id = KVM_REG_ARM64 | KVM_REG_SIZE_U64/KVM_REG_SIZE_U32/KVM_REG_SIZE_U128 | KVM_REG_ARM_CORE | offset
-        KVM_REG_ARM64 as u64
-            | u64::from(KVM_REG_ARM_CORE)
-            | $size
-            | (($offset / mem::size_of::<u32>()) as u64)
-    };
-}
-
 /// Extract the specified bits of a 64-bit integer.
 /// For example, to extrace 2 bits from offset 1 (zero based) of `6u64`,
 /// following expression should return 3 (`0b11`):
@@ -183,161 +151,75 @@ fn get_sys_reg(id: u64, vcpu: &RawFd) -> Result<u64, Error> {
     Ok(u64::from_le_bytes(bytes))
 }
 
-pub fn get_regs(vcpu_fd: &RawFd) -> Result<kvm_regs, Error> {
-    let mut state: kvm_regs = kvm_regs::default();
+const CORE_REG_COUNT: usize = 34;
+const CORE_REG_IDS: [u64; CORE_REG_COUNT]  = {
+    let mut regs = [0; CORE_REG_COUNT];
+    let mut idx = 0;
+
     let mut off = offset_of!(user_pt_regs, regs);
+    while idx < 32 {
+        regs[idx] = arm64_core_reg_id!(KVM_REG_SIZE_U64, off);
+        idx += 1;
+        off += std::mem::size_of::<u64>();
+    }
+
+    regs[idx] = offset_of!(user_pt_regs, sp) as u64;
+    idx += 1;
+
+    regs[idx] = offset_of!(user_pt_regs, pc) as u64;
+
+    regs
+};
+
+pub fn get_regs(vcpu_fd: &VcpuFd) -> Result<kvm_regs, Error> {
+    let mut state: kvm_regs = kvm_regs::default();
+    let mut register_vec = Aarch64RegisterVec::default();
+    get_registers(vcpu_fd, &CORE_REG_IDS, &mut register_vec).map_err(|_| Error::VcpuKvmError)?;
+
+    let mut registers = register_vec.iter();
+
     // There are 31 user_pt_regs:
     // https://elixir.free-electrons.com/linux/v4.14.174/source/arch/arm64/include/uapi/asm/ptrace.h#L72
     // These actually are the general-purpose registers of the Armv8-a
     // architecture (i.e x0-x30 if used as a 64bit register or w0-30 when used as a 32bit register).
     for i in 0..31 {
-        let mut bytes = [0_u8; 8];
-        get_one_reg(vcpu_fd, arm64_core_reg_id!(KVM_REG_SIZE_U64, off), &mut bytes)?;
-        state.regs.regs[i] = u64::from_le_bytes(bytes);
-        off += std::mem::size_of::<u64>();
+        let reg_val = registers.next().unwrap().value();
+        state.regs.regs[i] = reg_val;
     }
-    // We are now entering the "Other register" section of the ARMv8-a architecture.
-    // First one, stack pointer.
-    let off = offset_of!(user_pt_regs, sp);
-    let mut bytes = [0_u8; 8];
-    get_one_reg(vcpu_fd, arm64_core_reg_id!(KVM_REG_SIZE_U64, off), &mut bytes)?;
-    state.regs.sp = u64::from_le_bytes(bytes);
-    // Second one, the program counter.
-    let off = offset_of!(user_pt_regs, pc);
-    let mut bytes = [0_u8; 8];
-    get_one_reg(vcpu_fd, arm64_core_reg_id!(KVM_REG_SIZE_U64, off), &mut bytes)?;
-    state.regs.pc = u64::from_le_bytes(bytes);
-    // Next is the processor state.
-    let off = offset_of!(user_pt_regs, pstate);
-    let mut bytes = [0_u8; 8];
-    get_one_reg(vcpu_fd, arm64_core_reg_id!(KVM_REG_SIZE_U64, off), &mut bytes)?;
-    state.regs.pstate = u64::from_le_bytes(bytes);
-    // The stack pointer associated with EL1
-    let off = offset_of!(kvm_regs, sp_el1);
-    let mut bytes = [0_u8; 8];
-    get_one_reg(vcpu_fd, arm64_core_reg_id!(KVM_REG_SIZE_U64, off), &mut bytes)?;
-    state.sp_el1 = u64::from_le_bytes(bytes);
-    // Exception Link Register for EL1, when taking an exception to EL1, this register
-    // holds the address to which to return afterwards.
-    let off = offset_of!(kvm_regs, elr_el1);
-    let mut bytes = [0_u8; 8];
-    get_one_reg(vcpu_fd, arm64_core_reg_id!(KVM_REG_SIZE_U64, off), &mut bytes)?;
-    state.elr_el1 = u64::from_le_bytes(bytes);
-    // Saved Program Status Registers, there are 5 of them used in the kernel.
-    let mut off = offset_of!(kvm_regs, spsr);
-    for i in 0..KVM_NR_SPSR as usize {
-        let mut bytes = [0_u8; 8];
-        get_one_reg(vcpu_fd, arm64_core_reg_id!(KVM_REG_SIZE_U64, off), &mut bytes)?;
-        state.spsr[i] = u64::from_le_bytes(bytes);
-        off += std::mem::size_of::<u64>();
-    }
-    // Now moving on to floating point registers which are stored in the user_fpsimd_state in the kernel:
-    // https://elixir.free-electrons.com/linux/v4.9.62/source/arch/arm64/include/uapi/asm/kvm.h#L53
-    let mut off = offset_of!(kvm_regs, fp_regs) + offset_of!(user_fpsimd_state, vregs);
-    for i in 0..32 {
-        let mut bytes = [0_u8; 16];
-        get_one_reg(vcpu_fd, arm64_core_reg_id!(KVM_REG_SIZE_U128, off), &mut bytes)?;
-        state.fp_regs.vregs[i] = u128::from_le_bytes(bytes);
-        off += mem::size_of::<u128>();
-    }
-    // Floating-point Status Register
-    let off = offset_of!(kvm_regs, fp_regs) + offset_of!(user_fpsimd_state, fpsr);
-    let mut bytes = [0_u8; 4];
-    get_one_reg(vcpu_fd, arm64_core_reg_id!(KVM_REG_SIZE_U32, off), &mut bytes)?;
-    state.fp_regs.fpsr = u32::from_le_bytes(bytes);
-    // Floating-point Control Register
-    let off = offset_of!(kvm_regs, fp_regs) + offset_of!(user_fpsimd_state, fpcr);
-    let mut bytes = [0_u8; 4];
-    get_one_reg(vcpu_fd, arm64_core_reg_id!(KVM_REG_SIZE_U32, off), &mut bytes)?;
-    state.fp_regs.fpcr = u32::from_le_bytes(bytes);
+
+    state.regs.sp = registers.next().unwrap().value();
+    state.regs.pc = registers.next().unwrap().value();
+
     Ok(state)
 }
 
 /// Sets the registers against the provided vcpu fd
-pub fn set_regs(vcpu_fd: &RawFd, regs: &kvm_regs) -> Result<(), Error> {
-    // The function follows the exact identical order from `state`. Look there
-    // for some additional info on registers.
+pub fn set_regs(vcpu_fd: &VcpuFd, regs: &kvm_regs) -> Result<(), Error> {
     let mut off = offset_of!(user_pt_regs, regs);
     for i in 0..31 {
-        set_one_reg(
-                vcpu_fd,
-                arm64_core_reg_id!(KVM_REG_SIZE_U64, off),
-                &regs.regs.regs[i].to_le_bytes(),
-            )?;
+        vcpu_fd.set_one_reg(
+            arm64_core_reg_id!(KVM_REG_SIZE_U64, off), 
+            &regs.regs.regs[i].to_le_bytes(),
+        );
         off += std::mem::size_of::<u64>();
     }
 
     let off = offset_of!(user_pt_regs, sp);
-    set_one_reg(
-        vcpu_fd,
+    vcpu_fd.set_one_reg(
         arm64_core_reg_id!(KVM_REG_SIZE_U64, off),
         &regs.regs.sp.to_le_bytes(),
-    )?;
+    );
 
     let off = offset_of!(user_pt_regs, pc);
-    set_one_reg(
-        vcpu_fd,
+    vcpu_fd.set_one_reg(
         arm64_core_reg_id!(KVM_REG_SIZE_U64, off),
         &regs.regs.pc.to_le_bytes(),
-    )?;
-
-    let off = offset_of!(user_pt_regs, pstate);
-    set_one_reg(
-        vcpu_fd,
-        arm64_core_reg_id!(KVM_REG_SIZE_U64, off),
-        &regs.regs.pstate.to_le_bytes(),
-    )?;
-
-    let off = offset_of!(kvm_regs, sp_el1);
-    set_one_reg(
-        vcpu_fd,
-        arm64_core_reg_id!(KVM_REG_SIZE_U64, off),
-        &regs.sp_el1.to_le_bytes(),
-    )?;
-
-    let off = offset_of!(kvm_regs, elr_el1);
-    set_one_reg(
-        vcpu_fd,
-        arm64_core_reg_id!(KVM_REG_SIZE_U64, off),
-        &regs.elr_el1.to_le_bytes(),
-    )?;
-
-    let mut off = offset_of!(kvm_regs, spsr);
-    for i in 0..KVM_NR_SPSR as usize {
-        set_one_reg(
-            vcpu_fd,
-            arm64_core_reg_id!(KVM_REG_SIZE_U64, off),
-            &regs.spsr[i].to_le_bytes(),
-        )?;
-        off += std::mem::size_of::<u64>();
-    }
-
-    let mut off = offset_of!(kvm_regs, fp_regs) + offset_of!(user_fpsimd_state, vregs);
-    for i in 0..32 {
-        set_one_reg(
-            vcpu_fd,
-            arm64_core_reg_id!(KVM_REG_SIZE_U128, off),
-            &regs.fp_regs.vregs[i].to_le_bytes(),
-        )?;
-        off += mem::size_of::<u128>();
-    }
-    let off = offset_of!(kvm_regs, fp_regs) + offset_of!(user_fpsimd_state, fpsr);
-    set_one_reg(
-        vcpu_fd,
-        arm64_core_reg_id!(KVM_REG_SIZE_U32, off),
-        &regs.fp_regs.fpsr.to_le_bytes(),
-    )?;
-    let off = offset_of!(kvm_regs, fp_regs) + offset_of!(user_fpsimd_state, fpcr);
-    set_one_reg(
-        vcpu_fd,
-        arm64_core_reg_id!(KVM_REG_SIZE_U32, off),
-        &regs.fp_regs.fpcr.to_le_bytes(),
-    )?;
+    );
 
     Ok(())
 }
 
-/// Uses the kvm api to translate the virtual address
+/// Manually translate gva on aarch64
 pub fn translate_gva(vcpu_fd: &RawFd, gva: u64, vmm: &Vmm) -> Result<u64, Error> {
     let tcr_el1: u64 = get_sys_reg(regs::TCR_EL1, vcpu_fd)?;
     let ttbr1_el1: u64 = get_sys_reg(regs::TTBR1_EL1, vcpu_fd)?;
@@ -348,25 +230,25 @@ pub fn translate_gva(vcpu_fd: &RawFd, gva: u64, vmm: &Vmm) -> Result<u64, Error>
     if high_range == 0 {
         return Ok(gva);
     }
-    // High range size offset
-    let tsz = extract_bits_64!(tcr_el1, 16, 6);
     // Granule size
     let tg = extract_bits_64!(tcr_el1, 30, 2);
-    // Indication of 48-bits (0) or 52-bits (1) for FEAT_LPA2
-    let ds = extract_bits_64!(tcr_el1, 59, 1);
+    // We only support 4kb pages
+    if tg == 1 || tg == 3 {
+        panic!("Unsupported page size");
+    }
+
+    // High range size offset
+    let tsz = extract_bits_64!(tcr_el1, 16, 6);
     if tsz == 0 {
         return Ok(gva);
     }
+
     // VA size is determined by TCR_BL1.T1SZ
     let va_size = 64 - tsz;
-    // Number of bits in VA consumed in each level of translation
-    let stride = match tg {
-        3 => 13, // 64KB granule size
-        1 => 11, // 16KB granule size
-        _ => 9,  // 4KB, default
-    };
+    let stride = 9;
+
     // Starting level of walking
-    let mut level = 4 - (va_size - 4) / stride;
+    let mut level = 4 - (va_size - 4) / 9;
     // PA or IPA size is determined
     let tcr_ips = extract_bits_64!(tcr_el1, 32, 3);
     let pa_range = extract_bits_64_without_offset!(id_aa64mmfr0_el1, 4);
@@ -388,6 +270,9 @@ pub fn translate_gva(vcpu_fd: &RawFd, gva: u64, vmm: &Vmm) -> Result<u64, Error>
     };
     let indexmask_grainsize = (!0u64) >> (64 - (stride + 3));
     let mut indexmask = (!0u64) >> (64 - (va_size - (stride * (4 - level))));
+
+    // Indication of 48-bits (0) or 52-bits (1) for FEAT_LPA2
+    let ds = extract_bits_64!(tcr_el1, 59, 1);
     // If FEAT_LPA2 is present, the translation table descriptor holds
     // 50 bits of the table address of next level.
     // Otherwise, it is 48 bits.
