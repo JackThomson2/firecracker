@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt;
+use std::io::Error;
 use std::time::Duration;
 
-use log::error;
+use log::{error, info};
 use serde::Serialize;
 use timerfd::{ClockId, SetTimeFlags, TimerFd, TimerState};
 use vmm_sys_util::eventfd::EventFd;
@@ -13,19 +14,14 @@ use super::super::device::{DeviceState, VirtioDevice};
 use super::super::queue::Queue;
 use super::super::{ActivateError, TYPE_BALLOON};
 use super::metrics::METRICS;
-use super::util::{compact_page_frame_numbers, remove_range};
+use super::util::{compact_page_frame_numbers, remove_range, notify_needed};
 use super::{
-    BALLOON_DEV_ID, BALLOON_NUM_QUEUES, BALLOON_QUEUE_SIZES, DEFLATE_INDEX, INFLATE_INDEX,
-    MAX_PAGES_IN_DESC, MAX_PAGE_COMPACT_BUFFER, MIB_TO_4K_PAGES, STATS_INDEX,
-    VIRTIO_BALLOON_F_DEFLATE_ON_OOM, VIRTIO_BALLOON_F_STATS_VQ, VIRTIO_BALLOON_PFN_SHIFT,
-    VIRTIO_BALLOON_S_AVAIL, VIRTIO_BALLOON_S_CACHES, VIRTIO_BALLOON_S_HTLB_PGALLOC,
-    VIRTIO_BALLOON_S_HTLB_PGFAIL, VIRTIO_BALLOON_S_MAJFLT, VIRTIO_BALLOON_S_MEMFREE,
-    VIRTIO_BALLOON_S_MEMTOT, VIRTIO_BALLOON_S_MINFLT, VIRTIO_BALLOON_S_SWAP_IN,
-    VIRTIO_BALLOON_S_SWAP_OUT,
+    BALLOON_DEV_ID, BALLOON_NUM_QUEUES, BALLOON_QUEUE_SIZES, DEFLATE_INDEX, INFLATE_INDEX, MAX_PAGES_IN_DESC, MAX_PAGE_COMPACT_BUFFER, MIB_TO_4K_PAGES, NOTIFY_INDEX, STATS_INDEX, VIRTIO_BALLOON_F_DEFLATE_ON_OOM, VIRTIO_BALLOON_F_REPORTING, VIRTIO_BALLOON_F_STATS_VQ, VIRTIO_BALLOON_PFN_SHIFT, VIRTIO_BALLOON_S_AVAIL, VIRTIO_BALLOON_S_CACHES, VIRTIO_BALLOON_S_HTLB_PGALLOC, VIRTIO_BALLOON_S_HTLB_PGFAIL, VIRTIO_BALLOON_S_MAJFLT, VIRTIO_BALLOON_S_MEMFREE, VIRTIO_BALLOON_S_MEMTOT, VIRTIO_BALLOON_S_MINFLT, VIRTIO_BALLOON_S_SWAP_IN, VIRTIO_BALLOON_S_SWAP_OUT
 };
 use crate::devices::virtio::balloon::BalloonError;
 use crate::devices::virtio::device::{IrqTrigger, IrqType};
 use crate::devices::virtio::gen::virtio_blk::VIRTIO_F_VERSION_1;
+use crate::devices::virtio::iovec::{IoVecBuffer, IoVecBufferMut};
 use crate::logger::IncMetric;
 use crate::utils::u64_to_usize;
 use crate::vstate::memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
@@ -48,6 +44,7 @@ fn pages_to_mib(amount_pages: u32) -> u32 {
 pub(crate) struct ConfigSpace {
     pub num_pages: u32,
     pub actual_pages: u32,
+    pub free_page_cmd_id: u32
 }
 
 // SAFETY: Safe because ConfigSpace only contains plain data.
@@ -173,6 +170,7 @@ pub struct Balloon {
     pub(crate) latest_stats: BalloonStats,
     // A buffer used as pfn accumulator during descriptor processing.
     pub(crate) pfn_buffer: [u32; MAX_PAGE_COMPACT_BUFFER],
+    pub(crate) listen_state: u8,
 }
 
 // TODO Use `#[derive(Debug)]` when a new release of
@@ -216,7 +214,10 @@ impl Balloon {
             avail_features |= 1u64 << VIRTIO_BALLOON_F_STATS_VQ;
         }
 
+        avail_features |= 1u64 << VIRTIO_BALLOON_F_REPORTING;
+
         let queue_evts = [
+            EventFd::new(libc::EFD_NONBLOCK).map_err(BalloonError::EventFd)?,
             EventFd::new(libc::EFD_NONBLOCK).map_err(BalloonError::EventFd)?,
             EventFd::new(libc::EFD_NONBLOCK).map_err(BalloonError::EventFd)?,
             EventFd::new(libc::EFD_NONBLOCK).map_err(BalloonError::EventFd)?,
@@ -239,6 +240,7 @@ impl Balloon {
             config_space: ConfigSpace {
                 num_pages: mib_to_pages(amount_mib)?,
                 actual_pages: 0,
+                free_page_cmd_id: 0,
             },
             queue_evts,
             queues,
@@ -251,6 +253,7 @@ impl Balloon {
             stats_desc_index: None,
             latest_stats: BalloonStats::default(),
             pfn_buffer: [0u32; MAX_PAGE_COMPACT_BUFFER],
+            listen_state: 0,
         })
     }
 
@@ -268,6 +271,13 @@ impl Balloon {
         self.process_deflate_queue()
     }
 
+    pub(crate) fn process_notify_queue_event(&mut self) -> Result<(), BalloonError> {
+        self.queue_evts[NOTIFY_INDEX]
+            .read()
+            .map_err(BalloonError::EventFd)?;
+        self.process_notify_queue()
+    }
+
     pub(crate) fn process_stats_queue_event(&mut self) -> Result<(), BalloonError> {
         self.queue_evts[STATS_INDEX]
             .read()
@@ -282,10 +292,15 @@ impl Balloon {
 
     pub(crate) fn process_inflate(&mut self) -> Result<(), BalloonError> {
         // This is safe since we checked in the event handler that the device is activated.
-        let mem = self.device_state.mem().unwrap();
         METRICS.inflate_count.inc();
+        // info!("Recieved inflate notification");
 
-        let queue = &mut self.queues[INFLATE_INDEX];
+        self.process_chain(INFLATE_INDEX)
+    }
+
+    fn process_chain(&mut self, queue_idx: usize) -> Result<(), BalloonError> {
+        let queue = &mut self.queues[queue_idx];
+        let mem = self.device_state.mem().unwrap();
         // The pfn buffer index used during descriptor processing.
         let mut pfn_buffer_idx = 0;
         let mut needs_interrupt = false;
@@ -346,6 +361,10 @@ impl Balloon {
             // Compact pages into ranges.
             let page_ranges = compact_page_frame_numbers(&mut self.pfn_buffer[..pfn_buffer_idx]);
             pfn_buffer_idx = 0;
+           
+            if !page_ranges.is_empty() {
+                // info!("Freeing {}", page_ranges.len());
+            }
 
             // Remove the page ranges.
             for (page_frame_number, range_len) in page_ranges {
@@ -373,9 +392,36 @@ impl Balloon {
         METRICS.deflate_count.inc();
 
         let queue = &mut self.queues[DEFLATE_INDEX];
+        let mem = self.device_state.mem().unwrap();
         let mut needs_interrupt = false;
 
         while let Some(head) = queue.pop() {
+            let len = head.len as usize;
+            // info!("Looking at descriptor now.. Descriptor length is: {}", (head.len as usize) / SIZE_OF_U32);
+
+            for index in (0..len).step_by(SIZE_OF_U32) {
+                let addr = head
+                    .addr
+                    .checked_add(index as u64)
+                    .ok_or(BalloonError::MalformedDescriptor)?;
+
+                let page_frame_number = mem
+                    .read_obj::<u32>(addr)
+                    .map_err(|_| BalloonError::MalformedDescriptor)?;
+
+                let guest_addr =
+                    GuestAddress(u64::from(page_frame_number) << VIRTIO_BALLOON_PFN_SHIFT);
+
+                // info!("Notifying guest of needed memory {guest_addr:?}");
+                if let Err(err) = notify_needed(
+                    mem,
+                    (guest_addr, 4096)
+                ) {
+                    error!("Error removing memory range: {:?}", err);
+                }
+            }
+
+
             queue.add_used(head.index, 0).map_err(BalloonError::Queue)?;
             needs_interrupt = true;
         }
@@ -385,6 +431,110 @@ impl Balloon {
         } else {
             Ok(())
         }
+    }
+
+    pub(crate) fn process_notify_queue(&mut self) -> Result<(), BalloonError> {
+        let queue = &mut self.queues[NOTIFY_INDEX];
+        let mem = self.device_state.mem().unwrap();
+        // The pfn buffer index used during descriptor processing.
+        let mut needs_interrupt = false;
+
+        while let Some(desc_chain) = queue.pop() {
+            let mut count = 0;
+            
+            if desc_chain.len == 4 {
+                count += 1;
+                info!("Chain {desc_chain:?}");
+                let hint = mem
+                    .read_obj::<u32>(desc_chain.addr)
+                    .map_err(|_| BalloonError::MalformedDescriptor)?;
+
+                let Ok(mut iovec) = (unsafe { IoVecBuffer::from_descriptor_chain(mem, desc_chain) }) else {
+                    info!("Error with iovec");
+                    break;
+                };
+                info!("Got my new commands commands! {hint}");
+                if hint == 0 {
+                    info!("We should stop updates...");
+                    self.config_space.free_page_cmd_id = 0;
+                    self.irq_trigger
+                        .trigger_irq(IrqType::Config)
+                        .map_err(BalloonError::InterruptError)?;
+                }
+                let mut buffer: [u8; 1024] = [0; 1024];
+                let read = iovec.read_volatile_at(&mut buffer.as_mut_slice(), 0, iovec.len() as usize);
+                info!("Read {read:?} bytes from device");
+
+                let address_bytes = [buffer[0], buffer[1], buffer[2], buffer[3]];
+                let addres = u32::from_ne_bytes(address_bytes);
+                info!("Address value is {addres:?}");
+            } else {
+                let Ok(mut iovec) = (unsafe { IoVecBuffer::from_descriptor_chain(mem, desc_chain) } ) else {
+                    continue;
+                };
+
+                info!("Vec item is {iovec:?}");
+                let mut buffer: [u8; 1024] = [0; 1024];
+
+                let read = iovec.read_volatile_at(&mut buffer.as_mut_slice(), 0, iovec.len() as usize);
+
+                info!("Read {read:?} bytes from device");
+
+                    // if let Err(err) = remove_range(
+                    //     mem,
+                    //     (GuestAddress(vec.iov_base as u64), vec.iov_len as u64),
+                    //     self.restored,
+                    // ) {
+                    //     error!("Error removing memory range: {:?}", err);
+                    // } else {
+                    //     info!("Got the address here");
+                    // }
+                // info!("We got the iovec {iovec:?}");
+
+                // let hint_count = desc_chain.len as usize / (SIZE_OF_U32 * 2);
+                // for i in 0..hint_count {
+                //     count += 1;
+                //     let addr = desc_chain
+                //         .addr
+                //         .checked_add((i * (SIZE_OF_U32 * 2)) as u64)
+                //         .ok_or(BalloonError::MalformedDescriptor)?;
+                //
+                //     let hint = addr;
+                //
+                //     if hint.0 == 0 {
+                //         info!("We should stop updates...");
+                //         self.config_space.free_page_cmd_id = 0;
+                //         self.irq_trigger
+                //             .trigger_irq(IrqType::Config)
+                //             .map_err(BalloonError::InterruptError)?;
+                //         break;
+                //     }
+                //
+                //     if let Err(err) = remove_range(
+                //         mem,
+                //         (hint, 1 << VIRTIO_BALLOON_PFN_SHIFT),
+                //         self.restored,
+                //     ) {
+                //         // error!("Error removing memory range: {:?}", err);
+                //     } else {
+                //         // info!("Got the address here: {hint:?}")
+                //     }
+                // }
+            }
+            queue.add_used(desc_chain.index, 0).map_err(BalloonError::Queue)?;
+            needs_interrupt = true;
+        }
+
+        // if found > 0 {
+        //     info!("We got {found} items from the queue. Free bytes: {free_amount}");
+        // }
+
+        // Loop until there are no more valid DescriptorChains.
+        if needs_interrupt {
+            self.signal_used_queue()?;
+        }
+
+        Ok(())
     }
 
     pub(crate) fn process_stats_queue(&mut self) -> Result<(), BalloonError> {
@@ -436,6 +586,7 @@ impl Balloon {
     pub fn process_virtio_queues(&mut self) {
         let _ = self.process_inflate();
         let _ = self.process_deflate_queue();
+        let _ = self.process_notify_queue();
     }
 
     /// Provides the ID of this balloon device.
@@ -460,7 +611,12 @@ impl Balloon {
     /// Update the target size of the balloon.
     pub fn update_size(&mut self, amount_mib: u32) -> Result<(), BalloonError> {
         if self.is_activated() {
-            self.config_space.num_pages = mib_to_pages(amount_mib)?;
+            if amount_mib == 22 {
+                info!("Bodge triggering request free pages?");
+                self.config_space.free_page_cmd_id = 3;
+            } else {
+                self.config_space.num_pages = mib_to_pages(amount_mib)?;
+            }
             self.irq_trigger
                 .trigger_irq(IrqType::Config)
                 .map_err(BalloonError::InterruptError)

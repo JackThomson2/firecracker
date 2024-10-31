@@ -23,12 +23,13 @@ use crate::logger::IncMetric;
 /// Because Balloon is unique per-vm, this ID can be hardcoded.
 pub const BALLOON_DEV_ID: &str = "balloon";
 /// The size of the config space.
-pub const BALLOON_CONFIG_SPACE_SIZE: usize = 8;
+pub const BALLOON_CONFIG_SPACE_SIZE: usize = 12;
 /// Number of virtio queues.
-pub const BALLOON_NUM_QUEUES: usize = 3;
+pub const BALLOON_NUM_QUEUES: usize = 4;
 /// Virtio queue sizes, in number of descriptor chain heads.
 //  There are 3 queues for a virtio device (in this order): RX, TX, Event
 pub const BALLOON_QUEUE_SIZES: [u16; BALLOON_NUM_QUEUES] = [
+    FIRECRACKER_MAX_QUEUE_SIZE,
     FIRECRACKER_MAX_QUEUE_SIZE,
     FIRECRACKER_MAX_QUEUE_SIZE,
     FIRECRACKER_MAX_QUEUE_SIZE,
@@ -48,10 +49,13 @@ pub const INFLATE_INDEX: usize = 0;
 pub const DEFLATE_INDEX: usize = 1;
 /// The index of the deflate queue from Balloon device queues/queues_evts vector.
 pub const STATS_INDEX: usize = 2;
+/// The index of the notify queue from Balloon device queues/queues_evts vector.
+pub const NOTIFY_INDEX: usize = 3;
 
 // The feature bitmap for virtio balloon.
 const VIRTIO_BALLOON_F_STATS_VQ: u32 = 1; // Enable statistics.
 const VIRTIO_BALLOON_F_DEFLATE_ON_OOM: u32 = 2; // Deflate balloon on OOM.
+const VIRTIO_BALLOON_F_REPORTING: u32 = 3; // Enable free page notifier
 
 // The statistics tags.
 const VIRTIO_BALLOON_S_SWAP_IN: u16 = 0;

@@ -25,6 +25,7 @@ use crate::vstate::memory::GuestMemoryMmap;
 pub struct BalloonConfigSpaceState {
     num_pages: u32,
     actual_pages: u32,
+    free_page_cmd_id: u32,
 }
 
 /// Information about the balloon stats that are saved
@@ -110,6 +111,7 @@ impl Persist<'_> for Balloon {
             config_space: BalloonConfigSpaceState {
                 num_pages: self.config_space.num_pages,
                 actual_pages: self.config_space.actual_pages,
+                free_page_cmd_id: self.config_space.free_page_cmd_id,
             },
             virtio_state: VirtioDeviceState::from_device(self),
         }
@@ -146,6 +148,7 @@ impl Persist<'_> for Balloon {
         balloon.config_space = ConfigSpace {
             num_pages: state.config_space.num_pages,
             actual_pages: state.config_space.actual_pages,
+            free_page_cmd_id: state.config_space.free_page_cmd_id
         };
 
         if state.virtio_state.activated {

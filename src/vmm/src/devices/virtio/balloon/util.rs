@@ -4,7 +4,7 @@
 use std::io;
 
 use super::{RemoveRegionError, MAX_PAGE_COMPACT_BUFFER};
-use crate::logger::error;
+use crate::logger::{error, info};
 use crate::utils::u64_to_usize;
 use crate::vstate::memory::{GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 
@@ -65,6 +65,36 @@ pub(crate) fn compact_page_frame_numbers(v: &mut [u32]) -> Vec<(u32, u32)> {
     result
 }
 
+pub(crate) fn notify_needed(
+    guest_memory: &GuestMemoryMmap,
+    range: (GuestAddress, u64),
+) -> Result<(), RemoveRegionError> {
+    let (guest_address, range_len) = range;
+
+    if let Some(region) = guest_memory.find_region(guest_address) {
+        if guest_address.0 + range_len > region.start_addr().0 + region.len() {
+            return Err(RemoveRegionError::MalformedRange);
+        }
+        let phys_address = guest_memory
+            .get_host_address(guest_address)
+            .map_err(|_| RemoveRegionError::AddressTranslation)?;
+
+        // Madvise the region in order to mark it as not used.
+        // SAFETY: The address and length are known to be valid.
+        let ret = unsafe {
+            let range_len = u64_to_usize(range_len);
+            libc::madvise(phys_address.cast(), range_len, libc::MADV_WILLNEED)
+        };
+        if ret < 0 {
+            return Err(RemoveRegionError::MadviseFail(io::Error::last_os_error()));
+        }
+
+        Ok(())
+    } else {
+        Err(RemoveRegionError::RegionNotFound)
+    }
+}
+
 pub(crate) fn remove_range(
     guest_memory: &GuestMemoryMmap,
     range: (GuestAddress, u64),
@@ -79,6 +109,7 @@ pub(crate) fn remove_range(
         let phys_address = guest_memory
             .get_host_address(guest_address)
             .map_err(|_| RemoveRegionError::AddressTranslation)?;
+
 
         // Mmap a new anonymous region over the present one in order to create a hole.
         // This workaround is (only) needed after resuming from a snapshot because the guest memory

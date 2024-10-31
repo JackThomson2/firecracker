@@ -4,7 +4,7 @@
 use event_manager::{EventOps, Events, MutEventSubscriber};
 use vmm_sys_util::epoll::EventSet;
 
-use super::{report_balloon_event_fail, DEFLATE_INDEX, INFLATE_INDEX, STATS_INDEX};
+use super::{report_balloon_event_fail, DEFLATE_INDEX, INFLATE_INDEX, NOTIFY_INDEX, STATS_INDEX};
 use crate::devices::virtio::balloon::device::Balloon;
 use crate::devices::virtio::device::VirtioDevice;
 use crate::logger::{error, warn};
@@ -15,6 +15,7 @@ impl Balloon {
     const PROCESS_VIRTQ_DEFLATE: u32 = 2;
     const PROCESS_VIRTQ_STATS: u32 = 3;
     const PROCESS_STATS_TIMER: u32 = 4;
+    const PROCESS_VIRTQ_NOTIFY: u32 = 5;
 
     fn register_runtime_events(&self, ops: &mut EventOps) {
         if let Err(err) = ops.add(Events::with_data(
@@ -30,6 +31,13 @@ impl Balloon {
             EventSet::IN,
         )) {
             error!("Failed to register deflate queue event: {}", err);
+        }
+        if let Err(err) = ops.add(Events::with_data(
+            &self.queue_evts[NOTIFY_INDEX],
+            Self::PROCESS_VIRTQ_NOTIFY,
+            EventSet::IN,
+        )) {
+            error!("Failed to register notify queue event: {}", err);
         }
         if self.stats_enabled() {
             if let Err(err) = ops.add(Events::with_data(
@@ -102,6 +110,9 @@ impl MutEventSubscriber for Balloon {
                     .unwrap_or_else(report_balloon_event_fail),
                 Self::PROCESS_STATS_TIMER => self
                     .process_stats_timer_event()
+                    .unwrap_or_else(report_balloon_event_fail),
+                Self::PROCESS_VIRTQ_NOTIFY => self
+                    .process_notify_queue_event()
                     .unwrap_or_else(report_balloon_event_fail),
                 _ => {
                     warn!("Balloon: Spurious event received: {:?}", source);

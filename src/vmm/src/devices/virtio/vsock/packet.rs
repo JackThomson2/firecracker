@@ -325,7 +325,7 @@ impl VsockPacketRx {
     ///
     /// ## Errors
     /// The function returns [`VsockError::UnwritableDescriptor`] if this [`VsockPacket`]
-    /// contains a guest-to-host (TX) packet. It returned [`VsockError::InvalidPktLen`] if the
+    /// contains a guest-to-host (TX)packet. It returned [`VsockError::InvalidPktLen`] if the
     /// packet's payload as described by this [`VsockPacket`] would exceed
     /// [`defs::MAX_PKT_BUF_SIZE`].
     pub fn commit_hdr(&mut self) -> Result<(), VsockError> {
