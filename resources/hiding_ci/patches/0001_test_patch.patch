@@ -1,0 +1,12 @@
+diff --git a/init/main.c b/init/main.c
+index 2a1757826..0598f31d5 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -1098,6 +1098,7 @@ void start_kernel(void)
+ 	/* Do the rest non-__init'ed, we're now alive */
+ 	rest_init();
+ 
++	pr_alert("Applied patches...");
+ 	/*
+ 	 * Avoid stack canaries in callers of boot_init_stack_canary for gcc-10
+ 	 * and older.
