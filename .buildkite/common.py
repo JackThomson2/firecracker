@@ -256,7 +256,7 @@ class BKPipeline:
         }
         self.per_instance = overlay_dict(per_instance, args.step_param)
         self.per_arch = self.per_instance.copy()
-        self.per_arch["instances"] = ["m6i.metal", "m7g.metal"]
+        self.per_arch["instances"] = ["m7a.metal-48xl", "m7g.metal"]
         self.per_arch["platforms"] = [("al2023", "linux_6.1")]
         self.binary_dir = args.binary_dir
         # Build sharing
