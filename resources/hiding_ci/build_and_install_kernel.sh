@@ -122,7 +122,7 @@ al2023_update_boot() {
   dracut --kver $KERNEL_VERSION -f -v
 
   # This varies from x86 and ARM so capture what was generated
-  VM_LINUX_LOCATION=$(ls /boot/vmlinu{x,z}-$KERNEL_VERSION 2>/dev/null | head -n1)
+  VM_LINUX_LOCATION=$(ls /boot/vmlinu{x,z}-$KERNEL_VERSION 2>/dev/null | head -n1 || echo "")
 
   echo "Updating GRUB..."
   grubby --grub2 --add-kernel $VM_LINUX_LOCATION \
