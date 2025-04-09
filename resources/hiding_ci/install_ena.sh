@@ -17,8 +17,12 @@ mv amzn-drivers /usr/src/amzn-drivers-${AMZN_DRIVER_VERSION}
 
 cp $DKMS_CONF_LOCATION /usr/src/amzn-drivers-${AMZN_DRIVER_VERSION}
 
+echo "Running DKMS add"
 dkms add -m amzn-drivers -v ${AMZN_DRIVER_VERSION}
+echo "Running DKMS build"
 dkms build -k ${KERNEL_VERSION} -m amzn-drivers -v ${AMZN_DRIVER_VERSION}
+echo "Running DKMS install"
 dkms install -k ${KERNEL_VERSION} -m amzn-drivers -v ${AMZN_DRIVER_VERSION}
 
+echo "Completed DKMS install"
 cd $START_DIR

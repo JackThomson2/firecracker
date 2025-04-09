@@ -121,6 +121,7 @@ al2023_update_boot() {
   echo "Creating the new ram disk"
   dracut --kver $KERNEL_VERSION -f -v
 
+  echo "Created the new ram disk"
   # This varies from x86 and ARM so capture what was generated
   VM_LINUX_LOCATION=$(ls /boot/vmlinu{x,z}-$KERNEL_VERSION 2>/dev/null | head -n1)
 
