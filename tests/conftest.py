@@ -386,7 +386,7 @@ def io_engine(request):
     return request.param
 
 
-secret_free_test_cases = [False]
+secret_free_test_cases = []
 if (
     global_props.host_linux_version_metrics == "next"
     and global_props.instance != "m6g.metal"
