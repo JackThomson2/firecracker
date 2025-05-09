@@ -263,8 +263,10 @@ pub fn build_microvm_for_boot(
         .register_memory_regions(guest_memory)
         .map_err(VmmError::Vm)?;
 
+    debug!("event_start: setting memory attributes");
     #[cfg(target_arch = "x86_64")]
     vmm.vm.set_memory_private().map_err(VmmError::Vm)?;
+    debug!("event_end: setting memory attributes");
 
     let entry_point = load_kernel(
         MaybeBounce::<_, 4096>::new_persistent(
