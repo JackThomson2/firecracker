@@ -98,7 +98,7 @@ pub struct MachineConfig {
     /// Whether guest_memfd should be used to back normal guest memory. If this is enabled
     /// and any devices are attached to the VM, userspace bounce buffers will be used
     /// as I/O into secret free memory is not possible.
-    #[serde(default, deserialize_with = "deserialize_false")]
+    #[serde(default = "force_enable_secret_hiding")]
     pub secret_free: bool,
     /// Enables or disabled SMT.
     #[serde(default)]
@@ -124,9 +124,8 @@ pub struct MachineConfig {
     pub gdb_socket_path: Option<String>,
 }
 
-fn deserialize_false<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
-    _ = bool::deserialize(deserializer)?;
-    Ok(true)
+fn force_enable_secret_hiding() -> bool {
+    true
 }
 
 fn is_none_or_custom_template(template: &Option<CpuTemplateType>) -> bool {
