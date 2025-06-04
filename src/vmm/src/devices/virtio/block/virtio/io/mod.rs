@@ -57,12 +57,12 @@ pub enum FileEngine {
 }
 
 impl FileEngine {
-    pub fn from_file(file: File, engine_type: FileEngineType) -> Result<FileEngine, BlockIoError> {
+    pub fn from_file(file: File, engine_type: FileEngineType, is_disk_read_only: bool) -> Result<FileEngine, BlockIoError> {
         match engine_type {
             FileEngineType::Async => Ok(FileEngine::Async(
                 AsyncFileEngine::from_file(file).map_err(BlockIoError::Async)?,
             )),
-            FileEngineType::Sync => Ok(FileEngine::Sync(SyncFileEngine::from_file(file))),
+            FileEngineType::Sync => Ok(FileEngine::Sync(SyncFileEngine::from_file(file, is_disk_read_only))),
         }
     }
 
@@ -251,7 +251,7 @@ pub mod tests {
         let mem = create_mem();
         // Create backing file.
         let file = TempFile::new().unwrap().into_file();
-        let mut engine = FileEngine::from_file(file, FileEngineType::Sync).unwrap();
+        let mut engine = FileEngine::from_file(file, FileEngineType::Sync, false).unwrap();
 
         let data = vmm_sys_util::rand::rand_alphanumerics(FILE_LEN as usize)
             .as_bytes()
@@ -335,7 +335,7 @@ pub mod tests {
     fn test_async() {
         // Create backing file.
         let file = TempFile::new().unwrap().into_file();
-        let mut engine = FileEngine::from_file(file, FileEngineType::Async).unwrap();
+        let mut engine = FileEngine::from_file(file, FileEngineType::Async, false).unwrap();
 
         let data = vmm_sys_util::rand::rand_alphanumerics(FILE_LEN as usize)
             .as_bytes()

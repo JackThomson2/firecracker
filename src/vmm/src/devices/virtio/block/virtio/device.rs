@@ -98,7 +98,7 @@ impl DiskProperties {
 
         Ok(Self {
             file_path: disk_image_path,
-            file_engine: FileEngine::from_file(disk_image, file_engine_type)
+            file_engine: FileEngine::from_file(disk_image, file_engine_type, is_disk_read_only)
                 .map_err(VirtioBlockError::FileEngine)?,
             nsectors: disk_size >> SECTOR_SHIFT,
             image_id,
