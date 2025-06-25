@@ -56,8 +56,10 @@ def network_microvm(request, microvm_factory, guest_kernel_acpi, rootfs):
 
 
 @pytest.mark.nonci
+@pytest.mark.parametrize("n", range(100))
+@pytest.mark.parametrize("wait", [True, False])
 @pytest.mark.parametrize("network_microvm", [1], indirect=True)
-def test_network_latency(network_microvm, metrics):
+def test_network_latency(network_microvm, metrics, n, wait):
     """
     Test network latency by sending pings from the guest to the host.
     """
@@ -76,9 +78,13 @@ def test_network_latency(network_microvm, metrics):
     samples = []
     host_ip = network_microvm.iface["eth0"]["iface"].host_ip
 
+    suffix = ""
+    if wait:
+        suffix = "-W 1"
+
     for _ in range(rounds):
         _, ping_output, _ = network_microvm.ssh.check_output(
-            f"ping -c {request_per_round} -i {delay} {host_ip}"
+            f"ping -c {request_per_round} -i {delay} {host_ip} {suffix}"
         )
 
         samples.extend(consume_ping_output(ping_output, request_per_round))
