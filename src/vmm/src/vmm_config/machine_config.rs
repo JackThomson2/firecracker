@@ -125,7 +125,7 @@ pub struct MachineConfig {
 }
 
 fn always_sh() -> bool {
-    true
+    false
 }
 
 fn is_none_or_custom_template(template: &Option<CpuTemplateType>) -> bool {
@@ -160,7 +160,7 @@ impl Default for MachineConfig {
         Self {
             vcpu_count: 1,
             mem_size_mib: DEFAULT_MEM_SIZE_MIB,
-            secret_free: false,
+            secret_free: always_sh(),
             smt: false,
             cpu_template: None,
             track_dirty_pages: false,
