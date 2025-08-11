@@ -258,7 +258,7 @@ pub fn build_microvm_for_boot(
             vmm.vm
                 .create_guest_memfd(
                     vm_resources.memory_size(),
-                    GUEST_MEMFD_FLAG_SUPPORT_SHARED | GUEST_MEMFD_FLAG_NO_DIRECT_MAP,
+                    GUEST_MEMFD_FLAG_SUPPORT_SHARED,
                 )
                 .map_err(VmmError::Vm)?,
         ),
@@ -562,7 +562,7 @@ pub fn build_microvm_from_snapshot(
             vmm.vm
                 .create_guest_memfd(
                     vm_resources.memory_size(),
-                    GUEST_MEMFD_FLAG_SUPPORT_SHARED | GUEST_MEMFD_FLAG_NO_DIRECT_MAP,
+                    GUEST_MEMFD_FLAG_SUPPORT_SHARED,
                 )
                 .map_err(VmmError::Vm)?,
         ),
