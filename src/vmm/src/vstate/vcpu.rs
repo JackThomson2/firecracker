@@ -6,6 +6,7 @@
 // found in the THIRD-PARTY file.
 
 use std::cell::RefCell;
+use std::fs::File;
 #[cfg(feature = "gdb")]
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{Ordering, fence};
@@ -107,6 +108,8 @@ pub struct Vcpu {
     /// Debugger emitter for gdb events
     #[cfg(feature = "gdb")]
     gdb_event: Option<Sender<usize>>,
+    /// Pipe for Async Page Faults
+    writer: File,
     /// The receiving end of events channel owned by the vcpu side.
     event_receiver: Receiver<VcpuEvent>,
     /// The transmitting end of the events channel which will be given to the handler.
@@ -171,6 +174,7 @@ impl Vcpu {
         vm: &Vm,
         exit_evt: EventFd,
         userfault_resolved: Option<UserfaultResolved>,
+        writer: File,
     ) -> Result<Self, VcpuError> {
         let (event_sender, event_receiver) = channel();
         let (response_sender, response_receiver) = channel();
@@ -184,6 +188,7 @@ impl Vcpu {
             response_sender,
             #[cfg(feature = "gdb")]
             gdb_event: None,
+            writer,
             kvm_vcpu,
             userfault_resolved,
         })
@@ -465,7 +470,13 @@ impl Vcpu {
         self.response_sender
             .send(VcpuResponse::Userfault(userfaultfd_data))
             .expect("Failed to send userfault data");
+
         self.exit_evt.write(1).expect("Failed to write exit event");
+
+        let async_pf = (userfaultfd_data.flags & (1 << 5)) != 0;
+        if async_pf {
+            return Ok(VcpuEmulation::Handled)
+        }
 
         let (lock, cvar) = self
             .userfault_resolved

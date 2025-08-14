@@ -11,6 +11,8 @@ use std::os::fd::AsRawFd;
 use std::ptr::null_mut;
 use std::sync::Arc;
 
+use kvm_bindings::KVMIO;
+use log::info;
 use serde::{Deserialize, Serialize};
 pub use vm_memory::bitmap::{AtomicBitmap, BS, Bitmap, BitmapSlice};
 pub use vm_memory::mmap::MmapRegionBuilder;
@@ -23,7 +25,7 @@ use vm_memory::{
     Error as VmMemoryError, GuestMemoryError, ReadVolatile, VolatileMemoryError, VolatileSlice,
     WriteVolatile,
 };
-use vmm_sys_util::errno;
+use vmm_sys_util::{errno, ioctl_iow_nr};
 
 use crate::DirtyBitmap;
 use crate::utils::{get_page_size, u64_to_usize};
@@ -41,6 +43,10 @@ pub type GuestMmapRegion = vm_memory::MmapRegion<Option<AtomicBitmap>>;
 pub enum MemoryError {
     /// Cannot fetch system's page size: {0}
     PageSize(errno::Error),
+    /// Failed to create guest_memfd: {0:?}
+    GuestMemfd(std::io::Error),
+    /// Failed to set memory attributes to private: {0:?}.
+    SetMemoryAttributes(std::io::Error),
     /// Cannot dump memory: {0}
     WriteMemory(GuestMemoryError),
     /// Cannot create mmap region: {0}
@@ -56,6 +62,17 @@ pub enum MemoryError {
     /// Error calling mmap: {0}
     Mmap(std::io::Error),
 }
+
+#[allow(non_camel_case_types)]
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug)]
+pub struct kvm_async_pf_ready {
+    pub gpa: u64,
+    pub token: u32,
+    pub notpresent_injected: u32,
+}
+
+ioctl_iow_nr!(KVM_ASYNC_PF_READY, KVMIO, 0xd6, kvm_async_pf_ready);
 
 /// Newtype that implements [`ReadVolatile`] and [`WriteVolatile`] if `T` implements `Read` or
 /// `Write` respectively, by reading/writing using a bounce buffer, and memcpy-ing into the
@@ -221,6 +238,8 @@ pub fn create(
                 (-1, 0)
             };
 
+            info!("MMAP on file now.. FD {fd} offset {fd_off}");
+
             // SAFETY: the arguments to mmap cannot cause any memory unsafety in the rust sense
             let ptr = unsafe {
                 libc::mmap(
@@ -326,7 +345,6 @@ where
 
     /// Convert guest physical address to file offset
     fn gpa_to_offset(&self, gpa: GuestAddress) -> Option<u64>;
-
     /// Convert file offset to guest physical address
     fn offset_to_gpa(&self, offset: u64) -> Option<GuestAddress>;
 }

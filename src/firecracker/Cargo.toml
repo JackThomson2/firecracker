@@ -20,6 +20,7 @@ tracing = ["log-instrument", "utils/tracing", "vmm/tracing"]
 gdb = ["vmm/gdb"]
 
 [dependencies]
+bitcode = "0.6.7"
 displaydoc = "0.2.5"
 event-manager = "0.4.1"
 libc = "0.2.174"

@@ -32,7 +32,7 @@ error_impl_error = "warn"
 needless-update = "allow"
 
 [profile.dev]
-panic = "abort"
+panic = "unwind"
 
 [profile.release]
 panic = "abort"

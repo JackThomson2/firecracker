@@ -3,6 +3,7 @@
 
 use kvm_bindings::KVM_API_VERSION;
 use kvm_ioctls::Kvm as KvmFd;
+use log::error;
 use serde::{Deserialize, Serialize};
 
 pub use crate::arch::{Kvm, KvmArchError};
@@ -66,6 +67,7 @@ impl Kvm {
         for cap in capabilities {
             // If capability is not supported kernel will return 0.
             if kvm_fd.check_extension_raw(u64::from(*cap)) == 0 {
+                error!("Extension {cap} ({cap:0b}) is not supported...");
                 return Err(*cap);
             }
         }

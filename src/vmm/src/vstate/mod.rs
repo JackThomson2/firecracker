@@ -9,3 +9,5 @@ pub mod memory;
 pub mod vcpu;
 /// Module with Vm implementation.
 pub mod vm;
+/// Module for guest memfd
+pub mod guest_memfd;

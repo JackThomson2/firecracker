@@ -169,6 +169,7 @@ impl Vm {
         &mut self,
         vcpu_count: u8,
         secret_free: bool,
+        writer: &File,
     ) -> Result<(Vec<Vcpu>, EventFd), VmError> {
         self.arch_pre_create_vcpus(vcpu_count)?;
 
@@ -177,13 +178,14 @@ impl Vm {
         let mut vcpus = Vec::with_capacity(vcpu_count as usize);
         for cpu_idx in 0..vcpu_count {
             let exit_evt = exit_evt.try_clone().map_err(VmError::EventFd)?;
+            let vcpu_writer = writer.try_clone().map_err(VmError::EventFd)?;
             let userfault_resolved = if secret_free {
                 Some(Arc::new((Mutex::new(false), Condvar::new())))
             } else {
                 None
             };
 
-            let vcpu = Vcpu::new(cpu_idx, self, exit_evt, userfault_resolved)
+            let vcpu = Vcpu::new(cpu_idx, self, exit_evt, userfault_resolved, vcpu_writer)
                 .map_err(VmError::CreateVcpu)?;
             vcpus.push(vcpu);
         }
@@ -309,6 +311,8 @@ impl Vm {
             None => 0,
         };
 
+        info!("Memory flags set: {flags:0b}");
+
         let memory_region = kvm_userspace_memory_region2 {
             slot: next_slot,
             guest_phys_addr: region.start_addr().raw_value(),
@@ -324,8 +328,10 @@ impl Vm {
         let new_guest_memory = self.common.guest_memory.insert_region(Arc::new(region))?;
 
         if self.fd().check_extension(Cap::UserMemory2) {
+            info!("Using usermemory 2");
             self.set_user_memory_region2(memory_region)?;
         } else {
+            info!("Using normal usermemory");
             // Something is seriously wrong if we manage to set these fields on a host that doesn't
             // even allow creation of guest_memfds!
             assert_eq!(memory_region.guest_memfd, 0);

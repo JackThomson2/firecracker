@@ -115,6 +115,7 @@ pub mod vstate;
 pub mod initrd;
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::RawFd;
 use std::os::unix::io::AsRawFd;
@@ -128,12 +129,16 @@ use device_manager::resources::ResourceAllocator;
 use devices::acpi::vmgenid::VmGenIdError;
 use event_manager::{EventManager as BaseEventManager, EventOps, Events, MutEventSubscriber};
 use seccomp::BpfProgram;
+use semver::Op;
 use userfaultfd::Uffd;
 use vm_memory::GuestAddress;
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::eventfd::EventFd;
+use vmm_sys_util::ioctl::ioctl_with_ref;
+use vmm_sys_util::syscall::SyscallReturnCode;
 use vmm_sys_util::terminal::Terminal;
 use vstate::kvm::Kvm;
+use vstate::memory::{kvm_async_pf_ready, KVM_ASYNC_PF_READY};
 use vstate::vcpu::{self, StartThreadedError, VcpuSendEventError};
 
 use crate::arch::DeviceType;
@@ -319,8 +324,12 @@ pub struct Vmm {
     // Used for userfault communication with the UFFD handler when secret freedom is enabled
     uffd_socket: Option<UnixStream>,
     vcpus_handles: Vec<VcpuHandle>,
+    // vCPU fds
+    vcpu_fds: Vec<RawFd>,
     // Used by Vcpus and devices to initiate teardown; Vmm should never write here.
     vcpus_exit_evt: EventFd,
+    // Reader for APF
+    reader: File,
 
     // Allocator for guest resources
     resource_allocator: ResourceAllocator,
@@ -329,6 +338,13 @@ pub struct Vmm {
     #[cfg(target_arch = "x86_64")]
     pio_device_manager: PortIODeviceManager,
     acpi_device_manager: ACPIDeviceManager,
+
+    pub guest_memfd: Option<File>,
+
+    pub eventfd: Option<i32>,
+
+    /// APF
+    apf_stream: Option<UnixStream>,
 }
 
 impl Vmm {
@@ -374,12 +390,12 @@ impl Vmm {
         if let Some(stdin) = self.events_observer.as_mut() {
             // Set raw mode for stdin.
             stdin.lock().set_raw_mode().inspect_err(|&err| {
-                warn!("Cannot set raw mode for the terminal. {:?}", err);
+                warn!("Cannot set raw mode for the terminal. {err:?}");
             })?;
 
             // Set non blocking stdin.
             stdin.lock().set_non_block(true).inspect_err(|&err| {
-                warn!("Cannot set non block for the terminal. {:?}", err);
+                warn!("Cannot set non block for the terminal. {err:?}");
             })?;
         }
 
@@ -390,6 +406,8 @@ impl Vmm {
             #[cfg(target_arch = "x86_64")]
             vcpu.kvm_vcpu
                 .set_pio_bus(self.pio_device_manager.io_bus.clone());
+
+            self.vcpu_fds.push(vcpu.kvm_vcpu.fd.as_raw_fd());
 
             self.vcpus_handles
                 .push(vcpu.start_threaded(vcpu_seccomp_filter.clone(), barrier.clone())?);
@@ -804,6 +822,42 @@ impl Vmm {
     }
 
     fn process_vcpu_userfault(&mut self, vcpu: u32, userfault_data: UserfaultData) {
+        let async_pf = (userfault_data.flags & (1 << 5)) != 0;
+        if async_pf {
+            let Some(stream) = &mut self.apf_stream else {
+                error!("No apf stream...");
+                return;
+            };
+            info!("We received an async page fault message");
+
+            let offset = self
+                .vm
+                .guest_memory()
+                .gpa_to_offset(GuestAddress(userfault_data.gpa))
+                .expect("Failed to convert GPA to offset");
+
+            info!(
+                "APF: flags 0x{:x} size/token 0x{:x} gpa {:x}. Offset {offset:x}",
+                userfault_data.flags, userfault_data.size, userfault_data.gpa
+            );
+
+            // Async PF handling begin
+            let fault_request = FaultRequest {
+                vcpu,
+                offset,
+                flags: userfault_data.flags,
+                token: Some(userfault_data.size as u32),
+            };
+
+            info!("Send request: {fault_request:?}");
+
+            let fault_request_json = bitcode::encode(&fault_request);
+
+            stream.write_all(&[fault_request_json.len() as u8]).expect("Error writing length");
+            stream.write_all(&fault_request_json).expect("Error writing apf message");
+            return;
+        }
+
         let offset = self
             .vm
             .guest_memory()
@@ -816,19 +870,24 @@ impl Vmm {
             flags: userfault_data.flags,
             token: None,
         };
-        let fault_request_json =
-            serde_json::to_string(&fault_request).expect("Failed to serialize fault request");
+        let fault_request_json = bitcode::encode(&fault_request);
 
         self.uffd_socket
             .as_ref()
             .expect("Uffd socket is not set")
-            .write_all(fault_request_json.as_bytes())
+            .write(&[fault_request_json.len() as u8])
+            .expect("Failed to write to uffd socket");
+
+        self.uffd_socket
+            .as_ref()
+            .expect("Uffd socket is not set")
+            .write_all(&fault_request_json)
             .expect("Failed to write to uffd socket");
     }
 
-    fn active_event_in_uffd_socket(&self, source: RawFd, event_set: EventSet) -> bool {
-        if let Some(uffd_socket) = &self.uffd_socket {
-            uffd_socket.as_raw_fd() == source && event_set == EventSet::IN
+    fn active_event_in_uffd_socket(&self, socket: &Option<UnixStream>, source: RawFd, event_set: EventSet) -> bool {
+        if let Some(stream) = &socket {
+            stream.as_raw_fd() == source && event_set == EventSet::IN
         } else {
             false
         }
@@ -841,11 +900,70 @@ impl Vmm {
 
         let mut buffer = [0u8; BUFFER_SIZE];
         let mut current_pos = 0;
+        let mut current_size = None;
 
         loop {
+            info!("Checking uffd socket message..");
             if current_pos < BUFFER_SIZE {
                 match stream.read(&mut buffer[current_pos..]) {
-                    Ok(0) => break,
+                    Ok(n) => current_pos += n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => panic!("Read error: {e}"),
+                }
+            }
+
+            if current_pos == 0 {
+                return;
+            }
+
+            if current_size.is_none() {
+                let size = buffer[0];
+                current_size = Some(size);
+            }
+
+            let size = current_size.unwrap() as usize;
+            
+            if current_pos < size + 1 {
+                continue;
+            }
+
+            let parser = bitcode::decode::<FaultReply>(&buffer[1..1 + size]);
+
+            match parser {
+                Ok(fault_reply) => {
+                    let vcpu = fault_reply.vcpu.expect("vCPU must be set");
+                    self.vcpus_handles[vcpu as usize].send_userfault_resolved();
+                    current_pos -= 1 + size;
+                    buffer.copy_within(..1 + size, 0);
+                    current_size = None;
+                    info!("Got uffd message!");
+                }
+                Err(e) => {
+                    println!(
+                        "Buffer content: {:?}",
+                        std::str::from_utf8(&buffer[..current_pos])
+                    );
+                    panic!("Invalid JSON: {e}");
+                }
+            }
+        }
+    }
+
+    fn process_apf_socket(&mut self) {
+        const BUFFER_SIZE: usize = 4096;
+
+        let stream = self.apf_stream.as_mut().expect("Uffd socket is not set");
+
+        let mut buffer = [0u8; BUFFER_SIZE];
+        let mut current_pos = 0;
+        let mut current_size = None;
+
+        loop {
+            info!("Checking apf socket message..");
+            if current_pos < BUFFER_SIZE {
+                match stream.read(&mut buffer[current_pos..]) {
                     Ok(n) => current_pos += n,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         if current_pos == 0 {
@@ -853,44 +971,62 @@ impl Vmm {
                         }
                     }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => panic!("Read error: {}", e),
+                    Err(e) => panic!("Read error: {e}"),
                 }
             }
 
-            let mut parser = serde_json::Deserializer::from_slice(&buffer[..current_pos])
-                .into_iter::<FaultReply>();
-            let mut total_consumed = 0;
-            let mut needs_more = false;
-
-            while let Some(result) = parser.next() {
-                match result {
-                    Ok(fault_reply) => {
-                        let vcpu = fault_reply.vcpu.expect("vCPU must be set");
-                        self.vcpus_handles[vcpu as usize].send_userfault_resolved();
-
-                        total_consumed = parser.byte_offset();
-                    }
-                    Err(e) if e.is_eof() => {
-                        needs_more = true;
-                        break;
-                    }
-                    Err(e) => {
-                        println!(
-                            "Buffer content: {:?}",
-                            std::str::from_utf8(&buffer[..current_pos])
-                        );
-                        panic!("Invalid JSON: {}", e);
-                    }
-                }
+            if current_pos == 0 {
+                return;
             }
 
-            if total_consumed > 0 {
-                buffer.copy_within(total_consumed..current_pos, 0);
-                current_pos -= total_consumed;
+            if current_size.is_none() {
+                let size = buffer[0];
+                current_size = Some(size);
+                info!("Decoded apf message size as: {size}");
             }
 
-            if needs_more {
+            let size = current_size.unwrap() as usize;
+            
+            if current_pos < size + 1 {
                 continue;
+            }
+
+            let parser = bitcode::decode::<FaultReply>(&buffer[1..1 + size]);
+
+            match parser {
+                Ok(fault_reply) => {
+                    current_pos -= 1 + size;
+                    buffer.copy_within(..1 + size, 0);
+                    current_size = None;
+
+                    let vcpu = fault_reply.vcpu.expect("vCPU must be set");
+                    let notpresent_injected = ((fault_reply.flags & (1 << 6)) != 0) as u32;
+                    let ready = kvm_async_pf_ready {
+                        gpa: fault_reply.token.unwrap() as u64,
+                        token: fault_reply.token.unwrap(),
+                        notpresent_injected,
+                    };
+
+                    info!("Sending APF ready message..");
+                    
+                    // SAFETY: Safe for now
+                    unsafe {
+                        SyscallReturnCode(ioctl_with_ref(
+                            &self.vcpu_fds[vcpu as usize],
+                            KVM_ASYNC_PF_READY(),
+                            &ready,
+                        ))
+                        .into_empty_result()
+                        .unwrap()
+                    }
+                }
+                Err(e) => {
+                    println!(
+                        "Buffer content: {:?}",
+                        std::str::from_utf8(&buffer[..current_pos])
+                    );
+                    panic!("Invalid JSON: {e}");
+                }
             }
         }
     }
@@ -1012,8 +1148,12 @@ impl MutEventSubscriber for Vmm {
             }
         }
 
-        if self.active_event_in_uffd_socket(source, event_set) {
+        if self.active_event_in_uffd_socket(&self.uffd_socket, source, event_set) {
             self.process_uffd_socket();
+        }
+
+        if self.active_event_in_uffd_socket(&self.apf_stream, source, event_set) {
+            self.process_apf_socket();
         }
     }
 
@@ -1025,6 +1165,12 @@ impl MutEventSubscriber for Vmm {
         if let Some(uffd_socket) = self.uffd_socket.as_ref() {
             if let Err(err) = ops.add(Events::new(uffd_socket, EventSet::IN)) {
                 error!("Failed to register UFFD socket: {}", err);
+            }
+        }
+
+        if let Some(apf_stream) = self.apf_stream.as_ref() {
+            if let Err(err) = ops.add(Events::new(apf_stream, EventSet::IN)) {
+                error!("Failed to register apf stream socket: {err}");
             }
         }
     }

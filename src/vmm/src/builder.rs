@@ -6,16 +6,19 @@
 use std::fmt::Debug;
 use std::fs::File;
 use std::io::{self};
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::net::UnixStream;
 #[cfg(feature = "gdb")]
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use event_manager::{MutEventSubscriber, SubscriberOps};
+use kvm_bindings::kvm_enable_cap;
 use kvm_ioctls::Cap;
 use libc::EFD_NONBLOCK;
 use linux_loader::cmdline::Cmdline as LoaderKernelCmdline;
+use log::info;
 use utils::time::TimestampUs;
 #[cfg(target_arch = "aarch64")]
 use vm_memory::GuestAddress;
@@ -143,6 +146,17 @@ impl std::convert::From<linux_loader::cmdline::Error> for StartMicrovmError {
     }
 }
 
+fn pipe2(flags: libc::c_int) -> io::Result<(RawFd, RawFd)> {
+    let mut fds = [0, 0];
+    // SAFETY: Safe as we know flags are good
+    let res = unsafe { libc::pipe2(fds.as_mut_ptr(), flags) };
+    if res == 0 {
+        Ok((fds[0], fds[1]))
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 #[cfg_attr(target_arch = "aarch64", allow(unused))]
 fn create_vmm_and_vcpus(
     instance_info: &InstanceInfo,
@@ -150,6 +164,7 @@ fn create_vmm_and_vcpus(
     vcpu_count: u8,
     mut kvm_capabilities: Vec<KvmCapability>,
     secret_free: bool,
+    apf_stream: Option<UnixStream>,
 ) -> Result<(Vmm, Vec<Vcpu>), VmmError> {
     if secret_free {
         kvm_capabilities.push(KvmCapability::Add(Cap::GuestMemfd as u32));
@@ -162,6 +177,14 @@ fn create_vmm_and_vcpus(
     // Build custom CPU config if a custom template is provided.
     let mut vm = Vm::new(&kvm, secret_free)?;
 
+    let (reader_fd, writer_fd) = pipe2(libc::O_NONBLOCK).unwrap();
+
+    // Convert the file descriptors to UnixStream instances
+    // SAFETY: We know these files are good as we check the result
+    let reader = unsafe { File::from_raw_fd(reader_fd) };
+    // SAFETY: We know these files are good as we check the result
+    let writer = unsafe { File::from_raw_fd(writer_fd) };
+
     let resource_allocator = ResourceAllocator::new()?;
 
     // Instantiate the MMIO device manager.
@@ -170,7 +193,7 @@ fn create_vmm_and_vcpus(
     // Instantiate ACPI device manager.
     let acpi_device_manager = ACPIDeviceManager::new();
 
-    let (vcpus, vcpus_exit_evt) = vm.create_vcpus(vcpu_count, secret_free)?;
+    let (vcpus, vcpus_exit_evt) = vm.create_vcpus(vcpu_count, secret_free, &writer)?;
 
     #[cfg(target_arch = "x86_64")]
     let pio_device_manager = {
@@ -201,12 +224,17 @@ fn create_vmm_and_vcpus(
         uffd: None,
         uffd_socket: None,
         vcpus_handles: Vec::new(),
+        vcpu_fds: Vec::new(),
         vcpus_exit_evt,
+        reader,
         resource_allocator,
         mmio_device_manager,
         #[cfg(target_arch = "x86_64")]
         pio_device_manager,
         acpi_device_manager,
+        guest_memfd: None,
+        eventfd: None,
+        apf_stream,
     };
 
     Ok((vmm, vcpus))
@@ -251,6 +279,7 @@ pub fn build_microvm_for_boot(
         vm_resources.machine_config.vcpu_count,
         cpu_template.kvm_capabilities.clone(),
         secret_free,
+        None,
     )?;
 
     let guest_memfd = match secret_free {
@@ -361,6 +390,8 @@ pub fn build_microvm_for_boot(
         &initrd,
         boot_cmdline,
     )?;
+    
+    vmm.set_guest_memory_private(true)?;
 
     let vmm = Arc::new(Mutex::new(vmm));
 
@@ -486,6 +517,7 @@ pub enum BuildMicrovmFromSnapshotError {
 }
 
 fn memfd_to_slice(memfd: &Option<File>) -> Result<Option<&mut [u8]>, MemoryError> {
+    info!("Memfd to slice now...");
     if let Some(bitmap_file) = memfd {
         let len = u64_to_usize(
             bitmap_file
@@ -539,7 +571,7 @@ pub fn build_microvm_from_snapshot(
     // Build Vmm.
     debug!("event_start: build microvm from snapshot");
 
-    let secret_free = vm_resources.machine_config.secret_free;
+    let secret_free = true;
 
     let mut kvm_capabilities = microvm_state.kvm_state.kvm_cap_modifiers.clone();
 
@@ -547,12 +579,23 @@ pub fn build_microvm_from_snapshot(
         kvm_capabilities.push(KvmCapability::Add(KVM_CAP_USERFAULT));
     }
 
+    // FIXME: Hardcoding the APF socket path as it's awkward to bring it here.
+    let apf_sock = "/tmp/apf.socket";
+    let apf_stream = UnixStream::connect(apf_sock)
+        .inspect(|stream| {
+            stream
+                .set_nonblocking(true)
+                .expect("Failed to set non-blocking mode");
+        })
+        .expect("Could not find the {apf_sock} file.");
+
     let (mut vmm, mut vcpus) = create_vmm_and_vcpus(
         instance_info,
         event_manager,
         vm_resources.machine_config.vcpu_count,
         kvm_capabilities,
         secret_free,
+        Some(apf_stream),
     )
     .map_err(StartMicrovmError::Internal)?;
 
@@ -708,6 +751,7 @@ pub fn build_microvm_from_snapshot(
             .map_err(BuildMicrovmFromSnapshotError::VMGenIDUpdate)?;
     }
 
+    // vmm.set_guest_memory_private(false)?;
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
     vmm.start_vcpus(
         vcpus,

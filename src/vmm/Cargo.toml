@@ -20,6 +20,7 @@ arrayvec = { version = "0.7.6", optional = true }
 aws-lc-rs = { version = "1.13.3", features = ["bindgen"] }
 base64 = "0.22.1"
 bincode = { version = "2.0.1", features = ["serde"] }
+bitcode = "0.6.7"
 bitflags = "2.9.1"
 crc64 = "2.0.0"
 derive_more = { version = "2.0.1", default-features = false, features = ["from", "display"] }
@@ -35,9 +36,11 @@ log = { version = "0.4.27", features = ["std", "serde"] }
 log-instrument = { path = "../log-instrument", optional = true }
 memfd = "0.6.3"
 micro_http = { git = "https://github.com/firecracker-microvm/micro-http" }
+os_pipe = "1.2.2"
 semver = { version = "1.0.26", features = ["serde"] }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = "1.0.141"
+simd-json = { version = "0.15.1", features = ["known-key"] }
 slab = "0.4.10"
 thiserror = "2.0.12"
 timerfd = "1.5.0"
