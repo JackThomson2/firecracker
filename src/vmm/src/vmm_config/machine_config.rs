@@ -125,7 +125,7 @@ pub struct MachineConfig {
 }
 
 fn always_sh() -> bool {
-    true
+    false
 }
 
 fn is_none_or_custom_template(template: &Option<CpuTemplateType>) -> bool {
