@@ -127,6 +127,8 @@ impl Persist<'_> for Balloon {
             false,
             state.stats_polling_interval_s,
             constructor_args.restored_from_file,
+            false,
+            false
         )?;
 
         let mut num_queues = BALLOON_NUM_QUEUES;
@@ -135,15 +137,17 @@ impl Persist<'_> for Balloon {
         if state.stats_polling_interval_s == 0 {
             num_queues -= 1;
         }
-        balloon.queues = state
-            .virtio_state
-            .build_queues_checked(
-                &constructor_args.mem,
-                VIRTIO_ID_BALLOON,
-                num_queues,
-                FIRECRACKER_MAX_QUEUE_SIZE,
-            )
-            .map_err(|_| Self::Error::QueueRestoreError)?;
+        // Todo fix
+        // balloon.queues = state
+        //     .virtio_state
+        //     .build_queues_checked(
+        //         &constructor_args.mem,
+        //         VIRTIO_ID_BALLOON,
+        //         num_queues,
+        //         FIRECRACKER_MAX_QUEUE_SIZE,
+        //     )
+        //     .map_err(|_| Self::Error::QueueRestoreError)?
+        //     .iter().map(f)
         balloon.avail_features = state.virtio_state.avail_features;
         balloon.acked_features = state.virtio_state.acked_features;
         balloon.latest_stats = state.latest_stats.create_stats();
@@ -184,7 +188,7 @@ mod tests {
         let mut mem = vec![0; 4096];
 
         // Create and save the balloon device.
-        let balloon = Balloon::new(0x42, false, 2, false).unwrap();
+        let balloon = Balloon::new(0x42, false, 2, false, false, false).unwrap();
 
         Snapshot::new(balloon.save())
             .save(&mut mem.as_mut_slice())

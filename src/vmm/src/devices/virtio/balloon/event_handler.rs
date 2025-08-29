@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use event_manager::{EventOps, Events, MutEventSubscriber};
+use log::debug;
 use vmm_sys_util::epoll::EventSet;
 
 use super::{DEFLATE_INDEX, INFLATE_INDEX, STATS_INDEX, report_balloon_event_fail};
@@ -15,6 +16,7 @@ impl Balloon {
     const PROCESS_VIRTQ_DEFLATE: u32 = 2;
     const PROCESS_VIRTQ_STATS: u32 = 3;
     const PROCESS_STATS_TIMER: u32 = 4;
+    const PROCESS_VIRTQ_FREE_PAGE_REPORTING: u32 = 5;
 
     fn register_runtime_events(&self, ops: &mut EventOps) {
         if let Err(err) = ops.add(Events::with_data(
@@ -46,6 +48,16 @@ impl Balloon {
             )) {
                 error!("Failed to register stats timerfd event: {}", err);
             }
+        }
+        if self.free_page_reporting() && let Err(err) = ops.add(Events::with_data(
+            &self.queue_evts[self.free_page_reporting_idx()],
+            Self::PROCESS_VIRTQ_FREE_PAGE_REPORTING,
+            EventSet::IN,
+        )) {
+            error!(
+                "Failed to register free page reporting queue event: {}",
+                err
+            );
         }
     }
 
@@ -103,6 +115,9 @@ impl MutEventSubscriber for Balloon {
                 Self::PROCESS_STATS_TIMER => self
                     .process_stats_timer_event()
                     .unwrap_or_else(report_balloon_event_fail),
+                Self::PROCESS_VIRTQ_FREE_PAGE_REPORTING => self
+                    .process_free_page_reporting_queue_event()
+                    .unwrap_or_else(report_balloon_event_fail),
                 _ => {
                     warn!("Balloon: Spurious event received: {:?}", source);
                 }
@@ -142,7 +157,7 @@ pub mod tests {
     #[test]
     fn test_event_handler() {
         let mut event_manager = EventManager::new().unwrap();
-        let mut balloon = Balloon::new(0, true, 10, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 10, false, false, false).unwrap();
         let mem = default_mem();
         let interrupt = default_interrupt();
         let infq = VirtQueue::new(GuestAddress(0), &mem, 16);

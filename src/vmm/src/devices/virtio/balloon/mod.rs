@@ -24,10 +24,11 @@ pub const BALLOON_DEV_ID: &str = "balloon";
 /// The size of the config space.
 pub const BALLOON_CONFIG_SPACE_SIZE: usize = 8;
 /// Number of virtio queues.
-pub const BALLOON_NUM_QUEUES: usize = 3;
+pub const BALLOON_NUM_QUEUES: usize = 4;
 /// Virtio queue sizes, in number of descriptor chain heads.
 //  There are 3 queues for a virtio device (in this order): RX, TX, Event
 pub const BALLOON_QUEUE_SIZES: [u16; BALLOON_NUM_QUEUES] = [
+    FIRECRACKER_MAX_QUEUE_SIZE,
     FIRECRACKER_MAX_QUEUE_SIZE,
     FIRECRACKER_MAX_QUEUE_SIZE,
     FIRECRACKER_MAX_QUEUE_SIZE,
@@ -41,16 +42,18 @@ pub const MAX_PAGES_IN_DESC: usize = 256;
 pub const MAX_PAGE_COMPACT_BUFFER: usize = 2048;
 /// The addresses given by the driver are divided by 4096.
 pub const VIRTIO_BALLOON_PFN_SHIFT: u32 = 12;
-/// The index of the deflate queue from Balloon device queues/queues_evts vector.
+/// The index of the inflate queue from Balloon device queues/queues_evts vector.
 pub const INFLATE_INDEX: usize = 0;
 /// The index of the deflate queue from Balloon device queues/queues_evts vector.
 pub const DEFLATE_INDEX: usize = 1;
-/// The index of the deflate queue from Balloon device queues/queues_evts vector.
+/// The index of the status queue from Balloon device queues/queues_evts vector.
 pub const STATS_INDEX: usize = 2;
 
 // The feature bitmap for virtio balloon.
 const VIRTIO_BALLOON_F_STATS_VQ: u32 = 1; // Enable statistics.
 const VIRTIO_BALLOON_F_DEFLATE_ON_OOM: u32 = 2; // Deflate balloon on OOM.
+const VIRTIO_BALLOON_F_FREE_PAGE_HINTING: u32 = 3; // Enable free page hinting
+const VIRTIO_BALLOON_F_FREE_PAGE_REPORTING: u32 = 5; // Enable free page reporting
 
 // The statistics tags.
 const VIRTIO_BALLOON_S_SWAP_IN: u16 = 0;
