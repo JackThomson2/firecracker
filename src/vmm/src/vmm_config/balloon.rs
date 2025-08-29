@@ -62,7 +62,11 @@ impl From<BalloonConfig> for BalloonDeviceConfig {
 #[serde(deny_unknown_fields)]
 pub struct BalloonUpdateConfig {
     /// Target balloon size in MiB.
-    pub amount_mib: u32,
+    #[serde(default)]
+    pub amount_mib: Option<u32>,
+    /// Free page hinting cmd
+    #[serde(default)]
+    pub free_page_hint_cmd: Option<u32>,
 }
 
 /// The data fed into a balloon statistics interval update request.

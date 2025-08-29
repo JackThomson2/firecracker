@@ -24,15 +24,10 @@ pub const BALLOON_DEV_ID: &str = "balloon";
 /// The size of the config space.
 pub const BALLOON_CONFIG_SPACE_SIZE: usize = 8;
 /// Number of virtio queues.
-pub const BALLOON_NUM_QUEUES: usize = 4;
+pub const BALLOON_NUM_QUEUES: usize = 5;
 /// Virtio queue sizes, in number of descriptor chain heads.
 //  There are 3 queues for a virtio device (in this order): RX, TX, Event
-pub const BALLOON_QUEUE_SIZES: [u16; BALLOON_NUM_QUEUES] = [
-    FIRECRACKER_MAX_QUEUE_SIZE,
-    FIRECRACKER_MAX_QUEUE_SIZE,
-    FIRECRACKER_MAX_QUEUE_SIZE,
-    FIRECRACKER_MAX_QUEUE_SIZE,
-];
+pub const BALLOON_QUEUE_SIZES: [u16; BALLOON_NUM_QUEUES] = [FIRECRACKER_MAX_QUEUE_SIZE; BALLOON_NUM_QUEUES];
 // Number of 4K pages in a MiB.
 pub const MIB_TO_4K_PAGES: u32 = 256;
 /// The maximum number of pages that can be received in a single descriptor.

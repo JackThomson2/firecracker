@@ -140,6 +140,7 @@ use crate::devices::virtio::net::Net;
 use crate::logger::{METRICS, MetricsError, error, info, warn};
 use crate::persist::{MicrovmState, MicrovmStateError, VmInfo};
 use crate::rate_limiter::BucketUpdate;
+use crate::vmm_config::balloon::BalloonUpdateConfig;
 use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vstate::memory::{GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 use crate::vstate::vcpu::VcpuState;
@@ -570,11 +571,11 @@ impl Vmm {
             .map_err(VmmError::FindDeviceError)
     }
 
-    /// Updates configuration for the balloon device target size.
-    pub fn update_balloon_config(&mut self, amount_mib: u32) -> Result<(), VmmError> {
+    /// Updates configuration for the balloon device.
+    pub fn update_balloon_config(&mut self, balloon_update: &BalloonUpdateConfig) -> Result<(), VmmError> {
         self.device_manager
             .try_with_virtio_device_with_id(BALLOON_DEV_ID, |dev: &mut Balloon| {
-                dev.update_size(amount_mib)
+                dev.update_config(balloon_update)
             })
             .map_err(VmmError::FindDeviceError)
     }

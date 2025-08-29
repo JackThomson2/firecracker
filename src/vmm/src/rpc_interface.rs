@@ -668,7 +668,7 @@ impl RuntimeApiController {
                 .vmm
                 .lock()
                 .expect("Poisoned lock")
-                .update_balloon_config(balloon_update.amount_mib)
+                .update_balloon_config(&balloon_update)
                 .map(|_| VmmData::Empty)
                 .map_err(VmmActionError::BalloonUpdate),
             UpdateBalloonStatistics(balloon_stats_update) => self
