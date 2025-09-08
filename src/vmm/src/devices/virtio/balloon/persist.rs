@@ -124,13 +124,20 @@ impl Persist<'_> for Balloon {
     ) -> Result<Self, Self::Error> {
         // We can safely create the balloon with arbitrary flags and
         // num_pages because we will overwrite them after.
+        
+        let free_page_hinting = 
+            state.virtio_state.avail_features & (1u64 << VIRTIO_BALLOON_F_FREE_PAGE_HINTING) != 0;
+
+        let free_page_reporting = 
+            state.virtio_state.avail_features & (1u64 << VIRTIO_BALLOON_F_FREE_PAGE_REPORTING) != 0;
+
         let mut balloon = Balloon::new(
             0,
             false,
             state.stats_polling_interval_s,
             constructor_args.restored_from_file,
-            false,
-            false
+            free_page_hinting,
+            free_page_reporting 
         )?;
 
         let mut num_queues = BALLOON_NUM_QUEUES;
@@ -139,17 +146,24 @@ impl Persist<'_> for Balloon {
         if state.stats_polling_interval_s == 0 {
             num_queues -= 1;
         }
-        // Todo fix
-        // balloon.queues = state
-        //     .virtio_state
-        //     .build_queues_checked(
-        //         &constructor_args.mem,
-        //         VIRTIO_ID_BALLOON,
-        //         num_queues,
-        //         FIRECRACKER_MAX_QUEUE_SIZE,
-        //     )
-        //     .map_err(|_| Self::Error::QueueRestoreError)?
-        //     .iter().map(f)
+
+        if !free_page_hinting {
+            num_queues -= 1;
+        }
+
+        if !free_page_reporting {
+            num_queues -= 1;
+        }
+
+        balloon.queues = state
+            .virtio_state
+            .build_queues_checked(
+                &constructor_args.mem,
+                VIRTIO_ID_BALLOON,
+                num_queues,
+                FIRECRACKER_MAX_QUEUE_SIZE,
+            )
+            .map_err(|_| Self::Error::QueueRestoreError)?;
         balloon.avail_features = state.virtio_state.avail_features;
         balloon.acked_features = state.virtio_state.acked_features;
         balloon.latest_stats = state.latest_stats.create_stats();
