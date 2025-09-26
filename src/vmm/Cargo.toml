@@ -22,7 +22,7 @@ arrayvec = { version = "0.7.6", optional = true }
 aws-lc-rs = { version = "1.13.3", features = ["bindgen"] }
 base64 = "0.22.1"
 bincode = { version = "2.0.1", features = ["serde"] }
-bitflags = "=2.9.3"
+bitflags = "=2.9.4"
 byteorder = "1.5.0"
 crc64 = "2.0.0"
 derive_more = { version = "2.0.1", default-features = false, features = [
@@ -37,9 +37,9 @@ kvm-bindings = { version = "0.13.0", features = ["fam-wrappers", "serde"] }
 kvm-ioctls = "0.23.0"
 libc = "0.2.175"
 linux-loader = "0.13.0"
-log = { version = "=0.4.27", features = ["std", "serde"] }
+log = { version = "=0.4.28", features = ["std", "serde"] }
 log-instrument = { path = "../log-instrument", optional = true }
-memfd = "=0.6.3"
+memfd = "=0.6.5"
 micro_http = { git = "https://github.com/firecracker-microvm/micro-http" }
 pci = { path = "../pci" }
 semver = { version = "1.0.26", features = ["serde"] }
