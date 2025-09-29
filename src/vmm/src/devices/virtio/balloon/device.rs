@@ -41,6 +41,9 @@ use crate::{impl_device_type, mem_size_mib};
 const SIZE_OF_U32: usize = std::mem::size_of::<u32>();
 const SIZE_OF_STAT: usize = std::mem::size_of::<BalloonStat>();
 
+const FREE_PAGE_HINT_STOP: u32 = 0;
+const FREE_PAGE_HINT_DONE: u32 = 1;
+
 fn mib_to_pages(amount_mib: u32) -> Result<u32, BalloonError> {
     amount_mib
         .checked_mul(MIB_TO_4K_PAGES)
@@ -297,7 +300,13 @@ impl Balloon {
         self.queue_evts[idx]
             .read()
             .map_err(BalloonError::EventFd)?;
-        self.process_free_page_hinting_queue()
+        let complete = self.process_free_page_hinting_queue()?;
+
+        if complete {
+            self.update_free_page_hint_cmd(FREE_PAGE_HINT_DONE)
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn process_free_page_reporting_queue_event(&mut self) -> Result<(), BalloonError> {
@@ -462,13 +471,14 @@ impl Balloon {
 
     pub(crate) fn process_free_page_hinting_queue(
         &mut self,
-    ) -> std::result::Result<(), BalloonError> {
+    ) -> Result<bool, BalloonError> {
         let mem = &self.device_state.active_state().unwrap().mem;
         METRICS.free_page_hint_count.inc();
 
         let idx = self.free_page_hinting_idx();
         let queue = &mut self.queues[idx];
         let mut needs_interrupt = false;
+        let mut complete = false;
 
         while let Some(head) = queue.pop()? {
             let head_index = head.index;
@@ -485,6 +495,7 @@ impl Balloon {
                     if self.free_page_cmd.is_none() {
                         debug!("balloon: Command completed. Total removed: {}MiB", self.free_page_total_freed >> 20);
                         self.free_page_total_freed = 0;
+                        complete = true;
                     }
                     last_desc = desc.next_descriptor();
                     continue;
@@ -519,12 +530,12 @@ impl Balloon {
             self.signal_used_queue(idx)?;
         }
 
-        Ok(())
+        Ok(complete)
     }
 
     pub(crate) fn process_free_page_reporting_queue(
         &mut self,
-    ) -> std::result::Result<(), BalloonError> {
+    ) -> Result<(), BalloonError> {
         let mem = &self.device_state.active_state().unwrap().mem;
 
         let idx = self.free_page_reporting_idx();
@@ -551,7 +562,6 @@ impl Balloon {
         }
 
         queue.advance_used_ring_idx();
-        debug!("balloon: total removed: {}MiB", total_removed >> 20);
 
         if needs_interrupt {
             self.signal_used_queue(idx)?;
@@ -580,7 +590,12 @@ impl Balloon {
         if let Err(BalloonError::InvalidAvailIdx(err)) = self.process_deflate_queue() {
             return Err(err);
         }
+
         if self.free_page_reporting() && let Err(BalloonError::InvalidAvailIdx(err)) = self.process_free_page_reporting_queue() {
+            return Err(err);
+        }
+
+        if self.free_page_hinting() && let Err(BalloonError::InvalidAvailIdx(err)) = self.process_free_page_hinting_queue() {
             return Err(err);
         }
 
