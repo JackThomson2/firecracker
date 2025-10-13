@@ -4,6 +4,7 @@
 use std::io;
 
 use super::{MAX_PAGE_COMPACT_BUFFER, RemoveRegionError};
+use crate::arch::host_page_size;
 use crate::logger::error;
 use crate::utils::u64_to_usize;
 use crate::vstate::memory::{GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};

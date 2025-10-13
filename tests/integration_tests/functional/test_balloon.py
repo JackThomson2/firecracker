@@ -2,19 +2,36 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for guest-side operations on /balloon resources."""
 
+import concurrent
 import logging
 import time
+import signal
 from subprocess import TimeoutExpired
 
 import pytest
 import requests
+import psutil
 
-from framework.utils import check_output, get_free_mem_ssh
+from pathlib import Path
+
+from framework.microvm import HugePagesConfig
+
+from framework.utils import get_free_mem_ssh, track_cpu_utilization
 
 STATS_POLLING_INTERVAL_S = 1
 
+def uvm_memory_usage(uvm, huge, pid):
+    """Returns RSS or HugetlbFS usage for the given uVM"""
+    if huge:
+        proc_status = Path("/proc", str(pid or uvm.firecracker_pid), "status").read_text("utf-8")
+        for line in proc_status.splitlines():
+            if line.startswith("HugetlbPages:"):
+                return int(line.split()[1])*1024 # bytes
+        assert False, "HugetlbPages not found in /proc/status"
+    else:
+        return psutil.Process(pid or uvm.firecracker_pid).memory_info().rss
 
-def get_stable_rss_mem_by_pid(pid, percentage_delta=1):
+def get_stable_rss_mem_by_pid(pid, percentage_delta=1, huge_pages=False):
     """
     Get the RSS memory that a guest uses, given the pid of the guest.
 
@@ -24,16 +41,12 @@ def get_stable_rss_mem_by_pid(pid, percentage_delta=1):
 
     # All values are reported as KiB
 
-    def get_rss_from_pmap():
-        _, output, _ = check_output("pmap -X {}".format(pid))
-        return int(output.split("\n")[-2].split()[1], 10)
-
     first_rss = 0
     second_rss = 0
     for _ in range(5):
-        first_rss = get_rss_from_pmap()
+        first_rss = uvm_memory_usage(None, huge_pages, pid)
         time.sleep(1)
-        second_rss = get_rss_from_pmap()
+        second_rss = uvm_memory_usage(None, huge_pages, pid)
         abs_diff = abs(first_rss - second_rss)
         abs_delta = abs_diff / first_rss * 100
         print(
@@ -67,6 +80,17 @@ def lower_ssh_oom_chance(ssh_connection):
             logger.error("while running: %s", cmd)
             logger.error("stdout: %s", stdout)
             logger.error("stderr: %s", stderr)
+
+def trigger_page_fault_run(vm):
+    vm.ssh.check_output(
+        "rm -f /tmp/fast_page_fault_helper.out && /usr/local/bin/fast_page_fault_helper -s"
+    )
+
+def get_page_fault_duration(vm):
+    _, duration, _ = vm.ssh.check_output(
+        "while [ ! -f /tmp/fast_page_fault_helper.out ]; do sleep 1; done; cat /tmp/fast_page_fault_helper.out"
+    )
+    return duration
 
 
 def make_guest_dirty_memory(ssh_connection, amount_mib=32):
@@ -167,7 +191,10 @@ def test_inflate_reduces_free(uvm_plain_any):
 
 
 # pylint: disable=C0103
-@pytest.mark.parametrize("deflate_on_oom", [True, False])
+@pytest.mark.parametrize("deflate_on_oom", [
+    pytest.param(True, id="DEFLATE_ON_OOM"), 
+    pytest.param(False, id="NO_DEFLATE_ON_OOM")
+])
 def test_deflate_on_oom(uvm_plain_any, deflate_on_oom):
     """
     Verify that setting the `deflate_on_oom` option works correctly.
@@ -229,6 +256,219 @@ def test_deflate_on_oom(uvm_plain_any, deflate_on_oom):
         else:
             assert balloon_size_after >= balloon_size_before, "Balloon deflated"
 
+USEC_IN_MSEC = 1000
+NS_IN_MSEC = 1_000_000
+TEST_ITER = 100
+
+@pytest.mark.parametrize("method", ["hinting", "reporting"])
+def test_hinting_reporting_rss(
+    microvm_factory,
+    guest_kernel_linux_6_1,
+    rootfs,
+    huge_pages,
+    method
+):
+    test_microvm = microvm_factory.build(
+        guest_kernel_linux_6_1, rootfs, pci=True, monitor_memory=False
+    )
+    test_microvm.spawn(emit_metrics=False)
+    test_microvm.basic_config(vcpu_count=2, mem_size_mib=1024, huge_pages=huge_pages)
+    test_microvm.add_net_iface()
+
+    free_page_reporting = method == "reporting"
+    free_page_hinting = method == "hinting"
+    # Add a deflated memory balloon.
+    test_microvm.api.balloon.put(
+        amount_mib=0, deflate_on_oom=False, stats_polling_interval_s=0, 
+        free_page_reporting=free_page_reporting, free_page_hinting=free_page_hinting
+    )
+    test_microvm.start()
+
+    test_microvm.ssh.check_output(
+        "nohup /usr/local/bin/fast_page_fault_helper >/dev/null 2>&1 </dev/null &"
+    )
+
+    # Give helper time to initialize
+    time.sleep(5)
+    mem_usage_before = uvm_memory_usage(test_microvm, HugePagesConfig.NONE != huge_pages)
+    _, pid, _ = test_microvm.ssh.check_output("pidof fast_page_fault_helper")
+    test_microvm.ssh.check_output(f"kill -s {signal.SIGUSR1} {pid}")
+
+    # Give reporting time to run
+    if free_page_reporting:
+        time.sleep(10)
+    else:
+        test_microvm.ssh.check_output(
+            "while [ ! -f /tmp/fast_page_fault_helper.out ]; do sleep 1; done;"
+        )
+        test_microvm.api.balloon_hinting_start.patch()
+        time.sleep(1)
+
+    mem_usage_after = uvm_memory_usage(test_microvm, HugePagesConfig.NONE != huge_pages)
+
+    assert(mem_usage_after < mem_usage_before)
+
+
+
+@pytest.mark.parametrize("method", ["reporting", "hinting"])
+def test_hinting_reporting_cpu(
+    microvm_factory,
+    guest_kernel_linux_6_1,
+    rootfs,
+    huge_pages,
+    method
+):
+    test_microvm = microvm_factory.build(
+        guest_kernel_linux_6_1, rootfs, pci=True, monitor_memory=False
+    )
+    test_microvm.spawn(emit_metrics=False)
+    test_microvm.basic_config(vcpu_count=2, mem_size_mib=1024, huge_pages=huge_pages)
+    test_microvm.add_net_iface()
+
+    free_page_reporting = method == "reporting"
+    free_page_hinting = method == "hinting"
+    # Add a deflated memory balloon.
+    test_microvm.api.balloon.put(
+        amount_mib=0, deflate_on_oom=False, stats_polling_interval_s=0, 
+        free_page_reporting=free_page_reporting, free_page_hinting=free_page_hinting
+    )
+    test_microvm.start()
+
+    test_microvm.ssh.check_output(
+        "nohup /usr/local/bin/fast_page_fault_helper >/dev/null 2>&1 </dev/null &"
+    )
+
+    # Give helper time to initialize
+    time.sleep(5)
+    _, pid, _ = test_microvm.ssh.check_output("pidof fast_page_fault_helper")
+    test_microvm.ssh.check_output(f"kill -s {signal.SIGUSR1} {pid}")
+
+    # Give reporting time to run
+    if free_page_reporting:
+        cpu_usage = track_cpu_utilization(test_microvm.firecracker_pid, 5, 0)
+        print(cpu_usage)
+        time.sleep(10)
+    else:
+        test_microvm.ssh.check_output(
+            "while [ ! -f /tmp/fast_page_fault_helper.out ]; do sleep 1; done;"
+        )
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            cpu_load_future = executor.submit(
+                track_cpu_utilization,
+                test_microvm.firecracker_pid,
+                5,
+                omit=0,
+            )
+            test_microvm.api.balloon_hinting_start.patch()
+            print(cpu_load_future.result())
+
+@pytest.mark.nonci
+@pytest.mark.parametrize("sleep_duration", [0, 1, 30])
+def test_hinting_fault_latency(
+    microvm_factory,
+    guest_kernel_linux_6_1,
+    rootfs,
+    metrics,
+    huge_pages,
+    sleep_duration
+):
+    runs = 5
+    test_microvm = microvm_factory.build(
+        guest_kernel_linux_6_1, rootfs, pci=True, monitor_memory=False
+    )
+    test_microvm.spawn(emit_metrics=False)
+    test_microvm.basic_config(vcpu_count=2, mem_size_mib=1024, huge_pages=huge_pages)
+    test_microvm.add_net_iface()
+
+    # Add a deflated memory balloon.
+    test_microvm.api.balloon.put(
+        amount_mib=0, deflate_on_oom=False, stats_polling_interval_s=0, free_page_reporting=True
+    )
+    test_microvm.start()
+
+    metrics.set_dimensions({
+        "performance_test": "test_hinting_fault_latency",
+        "huge_pages": str(huge_pages),
+        "sleep_duration": str(sleep_duration)
+    })
+
+    avg_time = 0
+    for i in range(runs):
+        trigger_page_fault_run(test_microvm)
+        reporting_duration = int(get_page_fault_duration(test_microvm)) / NS_IN_MSEC
+        avg_time += reporting_duration
+
+        if sleep_duration > 0 and (i + 1 < runs):
+            time.sleep(sleep_duration)
+
+    avg_time /= runs
+    metrics.put_metric("latency", avg_time, "Milliseconds")
+
+def test_free_page_hinting_fast_page(
+    microvm_factory,
+    guest_kernel_linux_6_1,
+    rootfs,
+):
+    runs = 20
+    sleep_duration = 0.5
+    test_microvm = microvm_factory.build(
+        guest_kernel_linux_6_1, rootfs, pci=True, monitor_memory=False
+    )
+    test_microvm.spawn(emit_metrics=False)
+    test_microvm.basic_config(vcpu_count=2, mem_size_mib=1024, huge_pages=HugePagesConfig.HUGETLBFS_2MB)
+    test_microvm.add_net_iface()
+
+    # Add a deflated memory balloon.
+    test_microvm.api.balloon.put(
+        amount_mib=0, deflate_on_oom=False, stats_polling_interval_s=0, free_page_reporting=True
+    )
+    test_microvm.start()
+
+    test_microvm_2 = microvm_factory.build(
+        guest_kernel_linux_6_1, rootfs, pci=True, monitor_memory=False
+    )
+    test_microvm_2.spawn(emit_metrics=False)
+    test_microvm_2.basic_config(vcpu_count=2, mem_size_mib=1024, huge_pages=HugePagesConfig.HUGETLBFS_2MB)
+    test_microvm_2.add_net_iface()
+
+    # Add a deflated memory balloon.
+    test_microvm_2.api.balloon.put(
+        amount_mib=0, deflate_on_oom=False, stats_polling_interval_s=0, free_page_reporting=False
+    )
+    test_microvm_2.start()
+
+
+    avg_time = 0
+    avg_mem = 0
+    print("Starting tests..")
+    for i in range(runs):
+        mem_reporting = uvm_memory_usage(test_microvm, True) // 2**20
+        mem_non_reporting = uvm_memory_usage(test_microvm_2, True) // 2**20
+
+        avg_mem += (mem_reporting - mem_non_reporting)
+
+        print("==========================")
+        print(f"Memory before: Reporting {mem_reporting}MB, non reporting {mem_non_reporting}MB")
+
+        trigger_page_fault_run(test_microvm)
+        trigger_page_fault_run(test_microvm_2)
+        
+        reporting_duration = int(get_page_fault_duration(test_microvm)) / NS_IN_MSEC
+        no_reporting_duration = int(get_page_fault_duration(test_microvm_2)) / NS_IN_MSEC
+
+        mem_reporting = uvm_memory_usage(test_microvm, True) // 2**20
+        mem_non_reporting = uvm_memory_usage(test_microvm_2, True) // 2**20
+        print(f"Memory after: Reporting {mem_reporting}MB, non reporting {mem_non_reporting}MB")
+        print(f"Run {i}: Reporting duration: {reporting_duration}, No reporting duration {no_reporting_duration}. Difference {reporting_duration - no_reporting_duration}")
+
+        avg_time += reporting_duration - no_reporting_duration
+
+        if sleep_duration > 0 and (i + 1 < runs):
+            time.sleep(sleep_duration)
+    print("==========================")
+
+    print(f"Average memory delta: {avg_mem / runs}MB. Average Time Delta {avg_time / runs}ms")
 
 # pylint: disable=C0103
 def test_reinflate_balloon(uvm_plain_any):
@@ -531,7 +771,8 @@ def test_balloon_snapshot(uvm_plain_any, microvm_factory):
     assert stats_after_snap["available_memory"] > latest_stats["available_memory"]
 
 
-def test_memory_scrub(uvm_plain_any):
+@pytest.mark.parametrize("method", ["none", "hinting", "reporting"])
+def test_memory_scrub(uvm_plain_any, method):
     """
     Test that the memory is zeroed after deflate.
     """
@@ -540,9 +781,13 @@ def test_memory_scrub(uvm_plain_any):
     microvm.basic_config(vcpu_count=2, mem_size_mib=256)
     microvm.add_net_iface()
 
+    free_page_reporting = method == "reporting"
+    free_page_hinting = method == "hinting"
+
     # Add a memory balloon with stats enabled.
     microvm.api.balloon.put(
-        amount_mib=0, deflate_on_oom=True, stats_polling_interval_s=1
+        amount_mib=0, deflate_on_oom=True, stats_polling_interval_s=1,
+        free_page_reporting=free_page_reporting, free_page_hinting=free_page_hinting
     )
 
     microvm.start()
@@ -550,8 +795,14 @@ def test_memory_scrub(uvm_plain_any):
     # Dirty 60MB of pages.
     make_guest_dirty_memory(microvm.ssh, amount_mib=60)
 
-    # Now inflate the balloon with 60MB of pages.
-    microvm.api.balloon.patch(amount_mib=60)
+    if method == "none":
+            # Now inflate the balloon with 60MB of pages.
+            microvm.api.balloon.patch(amount_mib=60)
+    elif method == "hinting":
+            time.sleep(1)
+            microvm.api.balloon_hinting_start.patch()
+    elif method == "reporting":
+            time.sleep(2)
 
     # Get the firecracker pid, and open an ssh connection.
     firecracker_pid = microvm.firecracker_pid
@@ -559,10 +810,10 @@ def test_memory_scrub(uvm_plain_any):
     # Wait for the inflate to complete.
     _ = get_stable_rss_mem_by_pid(firecracker_pid)
 
-    # Deflate the balloon completely.
-    microvm.api.balloon.patch(amount_mib=0)
-
-    # Wait for the deflate to complete.
-    _ = get_stable_rss_mem_by_pid(firecracker_pid)
+    if method == "none":
+        # Deflate the balloon completely.
+        microvm.api.balloon.patch(amount_mib=0)
+        # Wait for the deflate to complete.
+        _ = get_stable_rss_mem_by_pid(firecracker_pid)
 
     microvm.ssh.check_output("/usr/local/bin/readmem {} {}".format(60, 1))

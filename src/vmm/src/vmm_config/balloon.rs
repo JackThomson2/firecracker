@@ -20,8 +20,6 @@ pub enum BalloonConfigError {
     TooManyPagesRequested,
     /// Error creating the balloon device: {0}
     CreateFailure(crate::devices::virtio::balloon::BalloonError),
-    /// Firecracker's huge pages support is incompatible with memory ballooning.
-    HugePages,
 }
 
 /// This struct represents the strongly typed equivalent of the json body
@@ -170,7 +168,7 @@ pub(crate) mod tests {
         assert_eq!(builder.get().unwrap().lock().unwrap().num_pages(), 0);
         assert_eq!(builder.get_config().unwrap(), default_balloon_config);
 
-        let _update_config = BalloonUpdateConfig { amount_mib: 5 };
+        let _update_config = BalloonUpdateConfig { amount_mib: Some(5), free_page_hint_cmd: None };
         let _stats_update_config = BalloonUpdateStatsConfig {
             stats_polling_interval_s: 5,
         };

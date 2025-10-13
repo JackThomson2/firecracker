@@ -134,6 +134,7 @@ use vstate::kvm::Kvm;
 use vstate::vcpu::{self, StartThreadedError, VcpuSendEventError};
 
 use crate::cpu_config::templates::CpuConfiguration;
+use crate::devices::virtio::balloon::device::{HintingStatus, StartHintingCmd};
 use crate::devices::virtio::balloon::{BALLOON_DEV_ID, Balloon, BalloonConfig, BalloonStats};
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::net::Net;
@@ -588,6 +589,40 @@ impl Vmm {
         self.device_manager
             .try_with_virtio_device_with_id(BALLOON_DEV_ID, |dev: &mut Balloon| {
                 dev.update_stats_polling_interval(stats_polling_interval_s)
+            })
+            .map_err(VmmError::FindDeviceError)
+    }
+
+    /// Updates configuration for the balloon device as described in `balloon_stats_update`.
+    pub fn start_balloon_hinting(
+        &mut self,
+        cmd: StartHintingCmd,
+    ) -> Result<(), VmmError> {
+        self.device_manager
+            .try_with_virtio_device_with_id(BALLOON_DEV_ID, |dev: &mut Balloon| {
+                dev.start_hinting(cmd)
+            })
+            .map_err(VmmError::FindDeviceError)
+    }
+
+    /// Updates configuration for the balloon device as described in `balloon_stats_update`.
+    pub fn get_balloon_hinting_status(
+        &mut self,
+    ) -> Result<HintingStatus, VmmError> {
+        self.device_manager
+            .try_with_virtio_device_with_id(BALLOON_DEV_ID, |dev: &mut Balloon| {
+                dev.get_hinting_status()
+            })
+            .map_err(VmmError::FindDeviceError)
+    }
+
+    /// Updates configuration for the balloon device as described in `balloon_stats_update`.
+    pub fn stop_balloon_hinting(
+        &mut self,
+    ) -> Result<(), VmmError> {
+        self.device_manager
+            .try_with_virtio_device_with_id(BALLOON_DEV_ID, |dev: &mut Balloon| {
+                dev.stop_hinting()
             })
             .map_err(VmmError::FindDeviceError)
     }

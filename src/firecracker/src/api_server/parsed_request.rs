@@ -77,7 +77,7 @@ impl TryFrom<&Request> for ParsedRequest {
 
         match (request.method(), path, request.body.as_ref()) {
             (Method::Get, "", None) => parse_get_instance_info(),
-            (Method::Get, "balloon", None) => parse_get_balloon(path_tokens.next()),
+            (Method::Get, "balloon", None) => parse_get_balloon(path_tokens.collect()),
             (Method::Get, "version", None) => parse_get_version(),
             (Method::Get, "vm", None) if path_tokens.next() == Some("config") => {
                 Ok(ParsedRequest::new_sync(VmmAction::GetFullVmConfig))
@@ -102,7 +102,7 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Put, "vsock", Some(body)) => parse_put_vsock(body),
             (Method::Put, "entropy", Some(body)) => parse_put_entropy(body),
             (Method::Put, _, None) => method_to_error(Method::Put),
-            (Method::Patch, "balloon", Some(body)) => parse_patch_balloon(body, path_tokens.next()),
+            (Method::Patch, "balloon", Some(body)) => parse_patch_balloon(body, path_tokens.collect()),
             (Method::Patch, "drives", Some(body)) => parse_patch_drive(body, path_tokens.next()),
             (Method::Patch, "machine-config", Some(body)) => parse_patch_machine_config(body),
             (Method::Patch, "mmds", Some(body)) => parse_patch_mmds(body),
@@ -171,6 +171,9 @@ impl ParsedRequest {
                 VmmData::MmdsValue(value) => Self::success_response_with_mmds_value(value),
                 VmmData::BalloonConfig(balloon_config) => {
                     Self::success_response_with_data(balloon_config)
+                }
+                VmmData::HintingStatus(hinting_status) => {
+                    Self::success_response_with_data(hinting_status)
                 }
                 VmmData::BalloonStats(stats) => Self::success_response_with_data(stats),
                 VmmData::InstanceInformation(info) => Self::success_response_with_data(info),
@@ -574,6 +577,9 @@ pub mod tests {
                     &serde_json::json!({ "firecracker_version": version.as_str() }).to_string(),
                     200,
                 ),
+                VmmData::HintingStatus(status) => {
+                    http_response(&serde_json::to_string(status).unwrap(), 200)
+                }
             };
             let response = ParsedRequest::convert_to_response(&data);
             response.write_all(&mut buf).unwrap();

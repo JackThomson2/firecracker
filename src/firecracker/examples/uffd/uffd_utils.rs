@@ -55,6 +55,8 @@ pub struct UffdHandler {
     backing_buffer: *const u8,
     uffd: Uffd,
     removed_pages: HashSet<u64>,
+    removed_length: usize,
+    size: usize
 }
 
 impl UffdHandler {
@@ -126,6 +128,8 @@ impl UffdHandler {
             backing_buffer,
             uffd,
             removed_pages: HashSet::new(),
+            removed_length: 0,
+            size
         }
     }
 
@@ -134,12 +138,8 @@ impl UffdHandler {
     }
 
     pub fn mark_range_removed(&mut self, start: u64, end: u64) {
-        let pfn_start = start / self.page_size as u64;
-        let pfn_end = end / self.page_size as u64;
-
-        for pfn in pfn_start..pfn_end {
-            self.removed_pages.insert(pfn);
-        }
+        let length = (end - start) as usize;
+        let _ = self.uffd.unregister(start as *mut _, length);
     }
 
     pub fn serve_pf(&mut self, addr: *mut u8, len: usize) -> bool {

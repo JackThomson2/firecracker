@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use timerfd::{SetTimeFlags, TimerState};
 
 use super::*;
-use crate::devices::virtio::balloon::device::{BalloonStats, ConfigSpace};
+use crate::devices::virtio::balloon::device::{BalloonStats, ConfigSpace, HintingState};
 use crate::devices::virtio::device::{ActiveState, DeviceState};
 use crate::devices::virtio::generated::virtio_ids::VIRTIO_ID_BALLOON;
 use crate::devices::virtio::persist::VirtioDeviceState;
@@ -88,6 +88,7 @@ pub struct BalloonState {
     stats_desc_index: Option<u16>,
     latest_stats: BalloonStatsState,
     config_space: BalloonConfigSpaceState,
+    hinting_state: HintingState,
     pub virtio_state: VirtioDeviceState,
 }
 
@@ -114,6 +115,7 @@ impl Persist<'_> for Balloon {
                 actual_pages: self.config_space.actual_pages,
                 free_page_hint_cmd_id: self.config_space.free_page_hint_cmd_id,
             },
+            hinting_state: self.hinting_state,
             virtio_state: VirtioDeviceState::from_device(self),
         }
     }
@@ -124,7 +126,6 @@ impl Persist<'_> for Balloon {
     ) -> Result<Self, Self::Error> {
         // We can safely create the balloon with arbitrary flags and
         // num_pages because we will overwrite them after.
-        
         let free_page_hinting = 
             state.virtio_state.avail_features & (1u64 << VIRTIO_BALLOON_F_FREE_PAGE_HINTING) != 0;
 
@@ -139,6 +140,8 @@ impl Persist<'_> for Balloon {
             free_page_hinting,
             free_page_reporting 
         )?;
+
+        balloon.hinting_state = state.hinting_state;
 
         let mut num_queues = BALLOON_NUM_QUEUES;
         // As per the virtio 1.1 specification, the statistics queue

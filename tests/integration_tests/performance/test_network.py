@@ -140,3 +140,4 @@ def test_network_tcp_throughput(
         )
 
     emit_iperf3_metrics(metrics, data, warmup_sec)
+

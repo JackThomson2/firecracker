@@ -22,7 +22,7 @@ use crate::logger::IncMetric;
 /// Because Balloon is unique per-vm, this ID can be hardcoded.
 pub const BALLOON_DEV_ID: &str = "balloon";
 /// The size of the config space.
-pub const BALLOON_CONFIG_SPACE_SIZE: usize = 8;
+pub const BALLOON_CONFIG_SPACE_SIZE: usize = 12;
 /// Number of virtio queues.
 pub const BALLOON_NUM_QUEUES: usize = 5;
 /// Virtio queue sizes, in number of descriptor chain heads.

@@ -263,13 +263,16 @@ impl Serialize for SharedIncMetric {
     /// flushing of metrics.
     /// !!! Any print of the metrics will also reset them. Use with caution !!!
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let snapshot = self.0.load(Ordering::Relaxed);
-        let res = serializer.serialize_u64(snapshot - self.1.load(Ordering::Relaxed));
+        loop {
+            let prev_snap = self.1.load(Ordering::Relaxed);
+            let snapshot = self.0.load(Ordering::Relaxed);
 
-        if res.is_ok() {
-            self.1.store(snapshot, Ordering::Relaxed);
+            if self.1.compare_exchange_weak(prev_snap, snapshot, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+                continue;
+            }
+
+            return serializer.serialize_u64(snapshot - prev_snap);
         }
-        res
     }
 }
 

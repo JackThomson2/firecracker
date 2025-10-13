@@ -23,7 +23,7 @@ use crate::vmm_config::drive::*;
 use crate::vmm_config::entropy::*;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{
-    HugePageConfig, MachineConfig, MachineConfigError, MachineConfigUpdate,
+    MachineConfig, MachineConfigError, MachineConfigUpdate,
 };
 use crate::vmm_config::metrics::{MetricsConfig, MetricsConfigError, init_metrics};
 use crate::vmm_config::mmds::{MmdsConfig, MmdsConfigError};
@@ -236,9 +236,9 @@ impl VmResources {
             SharedDeviceType::Balloon(balloon) => {
                 self.balloon.set_device(balloon);
 
-                if self.machine_config.huge_pages != HugePageConfig::None {
-                    return Err(ResourcesError::BalloonDevice(BalloonConfigError::HugePages));
-                }
+                // if self.machine_config.huge_pages != HugePageConfig::None {
+                //     return Err(ResourcesError::BalloonDevice(BalloonConfigError::HugePages));
+                // }
             }
 
             SharedDeviceType::Vsock(vsock) => {
@@ -278,9 +278,6 @@ impl VmResources {
             return Err(MachineConfigError::IncompatibleBalloonSize);
         }
 
-        if self.balloon.get().is_some() && updated.huge_pages != HugePageConfig::None {
-            return Err(MachineConfigError::BalloonAndHugePages);
-        }
         self.machine_config = updated;
 
         Ok(())
@@ -335,10 +332,6 @@ impl VmResources {
         // the guest memory.
         if config.amount_mib as usize > self.machine_config.mem_size_mib {
             return Err(BalloonConfigError::TooManyPagesRequested);
-        }
-
-        if self.machine_config.huge_pages != HugePageConfig::None {
-            return Err(BalloonConfigError::HugePages);
         }
 
         self.balloon.set(config)
@@ -535,7 +528,6 @@ mod tests {
     use crate::HTTP_MAX_PAYLOAD_SIZE;
     use crate::cpu_config::templates::test_utils::TEST_TEMPLATE_JSON;
     use crate::cpu_config::templates::{CpuTemplateType, StaticCpuTemplate};
-    use crate::devices::virtio::balloon::Balloon;
     use crate::devices::virtio::block::virtio::VirtioBlockError;
     use crate::devices::virtio::block::{BlockError, CacheType};
     use crate::devices::virtio::vsock::VSOCK_DEV_ID;
@@ -1436,6 +1428,8 @@ mod tests {
                 amount_mib: 100,
                 deflate_on_oom: false,
                 stats_polling_interval_s: 0,
+                free_page_hinting: false,
+                free_page_reporting: false,
             })
             .unwrap();
         aux_vm_config.mem_size_mib = Some(90);
@@ -1474,6 +1468,8 @@ mod tests {
             amount_mib: 100,
             deflate_on_oom: false,
             stats_polling_interval_s: 0,
+            free_page_hinting: false,
+            free_page_reporting: false,
         };
         assert!(vm_resources.balloon.get().is_none());
         vm_resources
@@ -1497,31 +1493,6 @@ mod tests {
         vm_resources
             .set_balloon_device(new_balloon_cfg)
             .unwrap_err();
-    }
-
-    #[test]
-    fn test_negative_restore_balloon_device_with_huge_pages() {
-        let mut vm_resources = default_vm_resources();
-        vm_resources.balloon = BalloonBuilder::new();
-        vm_resources
-            .update_machine_config(&MachineConfigUpdate {
-                huge_pages: Some(HugePageConfig::Hugetlbfs2M),
-                ..Default::default()
-            })
-            .unwrap();
-        let err = vm_resources
-            .update_from_restored_device(SharedDeviceType::Balloon(Arc::new(Mutex::new(
-                Balloon::new(128, false, 0, true).unwrap(),
-            ))))
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ResourcesError::BalloonDevice(BalloonConfigError::HugePages)
-            ),
-            "{:?}",
-            err
-        );
     }
 
     #[test]
