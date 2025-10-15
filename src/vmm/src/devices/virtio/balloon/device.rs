@@ -422,6 +422,7 @@ impl Balloon {
                     mem,
                     (guest_addr, u64::from(range_len) << VIRTIO_BALLOON_PFN_SHIFT),
                     self.restored_from_file,
+                    false
                 ) {
                     error!("Error removing memory range: {:?}", err);
                 }
@@ -547,7 +548,7 @@ impl Balloon {
 
                 METRICS.free_page_hint_count.inc();
                 if let Err(err) =
-                    remove_range(mem, (desc.addr, desc.len as u64), self.restored_from_file)
+                    remove_range(mem, (desc.addr, desc.len as u64), self.restored_from_file, true)
                 {
                     METRICS.free_page_hint_fails.inc();
                     error!("balloon: failed to remove range: {err:?}");
@@ -585,7 +586,7 @@ impl Balloon {
             while let Some(desc) = last_desc {
                 METRICS.free_page_report_count.inc();
                 if let Err(err) =
-                    remove_range(mem, (desc.addr, desc.len as u64), self.restored_from_file)
+                    remove_range(mem, (desc.addr, desc.len as u64), self.restored_from_file, true)
                 {
                     METRICS.free_page_report_fails.inc();
                     error!("balloon: failed to remove range: {err:?}");

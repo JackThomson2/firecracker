@@ -851,6 +851,7 @@ class Microvm:
 
         if add_root_device and self.rootfs_file is not None:
             read_only = self.rootfs_file.suffix == ".squashfs"
+            print(f"Is Read only: {read_only}")
 
             # Add the root file system
             self.add_drive(

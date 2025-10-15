@@ -16,8 +16,10 @@
 #include <sys/mman.h> // mmap
 #include <time.h>     // clock_gettime
 #include <fcntl.h>    // open
+#include <getopt.h>   // getopt
+#include <stdlib.h>   // Add this for rand() and srand()
 
-#define MEM_SIZE_MIB (128 * 1024 * 1024)
+#define MEM_SIZE_MIB (512 * 1024 * 1024)
 #define NANOS_PER_SEC 1000000000
 #define PAGE_SIZE 4096
 
@@ -28,22 +30,57 @@ void touch_memory(void *mem, size_t size, char val) {
     }
 }
 
-int main() {
+void touch_memory_random(void *mem, size_t size, char val) {
+    size_t num_pages = size / PAGE_SIZE;
+    char *base = (char *)mem;
+
+    for (size_t i = 0; i < num_pages; i++) {
+        size_t random_page = rand() % num_pages;
+        size_t offset = random_page * PAGE_SIZE;
+
+        *(base + offset) = val;
+    }
+}
+
+int main(int argc, char *const argv[]) {
     sigset_t set;
-    int signal;
+    int signal, character;
     void *ptr;
     struct timespec start, end;
     long duration_nanos;
     FILE *out_file;
 
-    sigemptyset(&set);
-    if (sigaddset(&set, SIGUSR1) == -1) {
-        perror("sigaddset");
-        return 1;
+    char *options = 0;
+    int longindex = 0;
+    int signal_wait = 1;
+    int random_access = 0;
+
+    struct option longopts[] = {
+      {"nosignal", no_argument, NULL, 's'},
+      {"random", no_argument, NULL, 'r'},
+      {NULL, 0, NULL, 0}
+    };
+
+    while((character = getopt_long(argc, argv, "sr", longopts, &longindex)) != -1) {
+      switch (character) {
+        case 's':
+          signal_wait = 0;
+          break;
+        case 'r':
+          random_access = 1;
+      }
     }
-    if (sigprocmask(SIG_BLOCK, &set, NULL) == -1)  {
-        perror("sigprocmask");
-        return 1;
+
+    if (signal_wait) {
+      sigemptyset(&set);
+      if (sigaddset(&set, SIGUSR1) == -1) {
+          perror("sigaddset");
+          return 1;
+      }
+      if (sigprocmask(SIG_BLOCK, &set, NULL) == -1)  {
+          perror("sigprocmask");
+          return 1;
+      }
     }
 
     ptr = mmap(NULL, MEM_SIZE_MIB, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
@@ -53,12 +90,18 @@ int main() {
         return 1;
     }
 
-    touch_memory(ptr, MEM_SIZE_MIB, 1);
+    if (signal_wait) {
+      touch_memory(ptr, MEM_SIZE_MIB, 1);
 
-    sigwait(&set, &signal);
+      sigwait(&set, &signal);
+    }
 
     clock_gettime(CLOCK_BOOTTIME, &start);
-    touch_memory(ptr, MEM_SIZE_MIB, 2);
+    if (random_access) {
+      touch_memory_random(ptr, MEM_SIZE_MIB, 2);
+    } else {
+      touch_memory(ptr, MEM_SIZE_MIB, 2);
+    }
     clock_gettime(CLOCK_BOOTTIME, &end);
 
     duration_nanos = (end.tv_sec - start.tv_sec) * NANOS_PER_SEC + end.tv_nsec - start.tv_nsec;

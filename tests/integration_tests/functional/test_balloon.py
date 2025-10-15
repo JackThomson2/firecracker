@@ -11,12 +11,13 @@ from subprocess import TimeoutExpired
 import pytest
 import requests
 import psutil
+import os
 
 from pathlib import Path
 
-from framework.microvm import HugePagesConfig
+from framework.microvm import HugePagesConfig, SnapshotType
 
-from framework.utils import get_free_mem_ssh, track_cpu_utilization
+from framework.utils import get_free_mem_ssh, track_cpu_utilization, run_cmd
 
 STATS_POLLING_INTERVAL_S = 1
 
@@ -308,6 +309,96 @@ def test_hinting_reporting_rss(
 
     assert(mem_usage_after < mem_usage_before)
 
+def bytes2human(n):
+    # http://code.activestate.com/recipes/578019
+    # >>> bytes2human(10000)
+    # '9.8K'
+    # >>> bytes2human(100001221)
+    # '95.4M'
+    symbols = ('K', 'M', 'G', 'T', 'P', 'E', 'Z', 'Y')
+    prefix = {}
+    for i, s in enumerate(symbols):
+        prefix[s] = 1 << (i + 1) * 10
+    for s in reversed(symbols):
+        if abs(n) >= prefix[s]:
+            value = float(n) / prefix[s]
+            return '%.1f%s' % (value, s)
+    return "%sB" % n
+
+@pytest.mark.parametrize("allocate", ["None", "500mb", "drop_caches"])
+@pytest.mark.parametrize("granularity", ["4mb", "4kb"])
+@pytest.mark.parametrize("method", ["reporting", "none"])
+def test_hinting_mincore(
+    microvm_factory,
+    guest_kernel_linux_6_1,
+    rootfs,
+    method,
+    granularity,
+    allocate,
+):
+    test_microvm = microvm_factory.build(
+        guest_kernel_linux_6_1, rootfs, pci=True, monitor_memory=False
+    )
+    test_microvm.spawn(emit_metrics=False)
+    test_microvm.basic_config(vcpu_count=2, mem_size_mib=1024, huge_pages=HugePagesConfig.NONE)
+    test_microvm.add_net_iface()
+
+    free_page_reporting = method == "reporting"
+    free_page_hinting = method == "hinting"
+    granular = granularity != "4mb"
+    
+    if granular and not free_page_reporting:
+        pytest.skip("Only relevant for hinting")
+
+    # Add a deflated memory balloon.
+    test_microvm.api.balloon.put(
+        amount_mib=0, deflate_on_oom=False, stats_polling_interval_s=0, 
+        free_page_reporting=free_page_reporting, free_page_hinting=free_page_hinting
+    )
+    test_microvm.start()
+
+    if allocate == "500mb":
+        test_microvm.ssh.check_output(
+            "nohup /usr/local/bin/fast_page_fault_helper >/dev/null 2>&1 </dev/null &"
+        )
+
+    if granular and free_page_reporting:
+        test_microvm.ssh.check_output("echo -n 1 > /sys/module/page_reporting/parameters/page_reporting_order")
+
+    # Give helper time to initialize
+    time.sleep(5)
+
+    if allocate == "drop_caches":
+        test_microvm.ssh.check_output("sysctl -w vm.drop_caches=1")
+
+    if allocate == "500mb":
+        _, pid, _ = test_microvm.ssh.check_output("pidof fast_page_fault_helper")
+        test_microvm.ssh.check_output(f"kill -s {signal.SIGUSR1} {pid}")
+
+        # Give reporting time to run
+        if free_page_reporting:
+            time.sleep(10)
+        else:
+            test_microvm.ssh.check_output(
+                "while [ ! -f /tmp/fast_page_fault_helper.out ]; do sleep 1; done;"
+            )
+
+    test_microvm.pause()
+    snapshot = test_microvm.make_snapshot(SnapshotType.DIFF_MINCORE)
+    test_microvm.kill()
+
+
+    print(f"\nMethod: {method}. Granularity: {granularity}. 500MB allocation: {allocate}")
+    print(f"os_stat st_size: {bytes2human(os.stat(snapshot.mem).st_size)}")
+
+    print(f"os_stat st_blocks: {os.stat(snapshot.mem).st_blocks}")
+    print(f"Estimated size (512 byte blocks): {bytes2human(os.stat(snapshot.mem).st_blocks * 512)}")
+
+    print("After Dig Holes:")
+    run_cmd(f"fallocate --dig-holes {snapshot.mem}")
+
+    print(f"os_stat st_blocks: {os.stat(snapshot.mem).st_blocks}")
+    print(f"Estimated size (512 byte blocks): {bytes2human(os.stat(snapshot.mem).st_blocks * 512)}")
 
 
 @pytest.mark.parametrize("method", ["reporting", "hinting"])
