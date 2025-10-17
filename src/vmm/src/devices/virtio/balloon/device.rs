@@ -84,6 +84,8 @@ unsafe impl ByteValued for BalloonStat {}
 pub (crate) struct HintingState {
     /// The command requested by us. Set to STOP by default.
     pub host_cmd: u32,
+    /// The last command supplied by guest.
+    pub run_cmd_tracker: u32,
     /// The command supplied by guest.
     pub guest_cmd: Option<u32>,
     /// Whether or not to automatically ack on STOP.
@@ -795,12 +797,13 @@ impl Balloon {
     }
 
     pub (crate) fn start_hinting(&mut self, cmd: StartHintingCmd) -> Result<(), BalloonError> {
-        let mut cmd_id = self.hinting_state.host_cmd.wrapping_add(1);
+        let mut cmd_id = self.hinting_state.run_cmd_tracker.wrapping_add(1);
         // 0 and 1 are reserved and cannot be used to start a hinting run
         if cmd_id <= 1 {
             cmd_id = 2;
         }
-        
+
+        self.hinting_state.run_cmd_tracker = cmd_id;
         self.update_free_page_hint_cmd(cmd_id)
     }
 
