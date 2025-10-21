@@ -606,6 +606,8 @@ mod tests {
     use super::*;
     use crate::Vmm;
     #[cfg(target_arch = "x86_64")]
+    use crate::builder::tests::insert_vmclock_device;
+    #[cfg(target_arch = "x86_64")]
     use crate::builder::tests::insert_vmgenid_device;
     use crate::builder::tests::{
         CustomBlockConfig, default_kernel_cmdline, default_vmm, insert_balloon_device,
@@ -668,6 +670,8 @@ mod tests {
 
         #[cfg(target_arch = "x86_64")]
         insert_vmgenid_device(&mut vmm);
+        #[cfg(target_arch = "x86_64")]
+        insert_vmclock_device(&mut vmm);
 
         vmm
     }
