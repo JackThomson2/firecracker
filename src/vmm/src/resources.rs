@@ -1476,6 +1476,7 @@ mod tests {
                 amount_mib: 100,
                 deflate_on_oom: false,
                 stats_polling_interval_s: 0,
+                free_page_reporting: false,
             })
             .unwrap();
         aux_vm_config.mem_size_mib = Some(90);
@@ -1514,6 +1515,7 @@ mod tests {
             amount_mib: 100,
             deflate_on_oom: false,
             stats_polling_interval_s: 0,
+            free_page_reporting: false,
         };
         assert!(vm_resources.balloon.get().is_none());
         vm_resources
@@ -1551,7 +1553,7 @@ mod tests {
             .unwrap();
         let err = vm_resources
             .update_from_restored_device(SharedDeviceType::Balloon(Arc::new(Mutex::new(
-                Balloon::new(128, false, 0).unwrap(),
+                Balloon::new(128, false, 0, false).unwrap(),
             ))))
             .unwrap_err();
         assert!(
