@@ -669,6 +669,7 @@ mod tests {
                 amount_mib: 123,
                 deflate_on_oom: false,
                 stats_polling_interval_s: 1,
+                free_page_reporting: false,
             };
             insert_balloon_device(&mut vmm, &mut cmdline, &mut event_manager, balloon_cfg);
             // Add a block device.
@@ -748,7 +749,8 @@ mod tests {
   "balloon": {{
     "amount_mib": 123,
     "deflate_on_oom": false,
-    "stats_polling_interval_s": 1
+    "stats_polling_interval_s": 1,
+    "free_page_reporting": false
   }},
   "drives": [
     {{
