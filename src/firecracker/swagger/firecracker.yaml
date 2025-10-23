@@ -169,6 +169,62 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /balloon/hinting/start:
+    patch:
+      summary: Starts a free page hinting run only if enabled pre-boot.
+      operationId: startBalloonHinting
+      parameters:
+        - name: acknowledge_on_stop
+          in: acknowledge_on_stop
+          description: When the device completes the hinting whether we shoud automatically ack this.
+          required: false
+          type: boolean
+      responses:
+        200:
+          description: Free page hinting run started.
+        400:
+          description: The balloon free hinting was not enabled when the device was configured.
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal Server Error
+          schema:
+            $ref: "#/definitions/Error"
+
+  /balloon/hinting/status:
+    get:
+      summary: Returns the balloon hinting statistics, only if enabled pre-boot.
+      operationId: describeBalloonHinting
+      responses:
+        200:
+          description: The balloon free page hinting statistics
+          schema:
+            $ref: "#/definitions/BalloonHintingStatus"
+        400:
+          description: The balloon free hinting was not enabled when the device was configured.
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal Server Error
+          schema:
+            $ref: "#/definitions/Error"
+
+  /balloon/hinting/stop:
+    patch:
+      summary: Stops a free page hinting run only if enabled pre-boot.
+      operationId: stopBalloonHinting
+      responses:
+        200:
+          description: Free page hinting run stopped.
+        400:
+          description: The balloon free hinting was not enabled when the device was configured.
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal Server Error
+          schema:
+            $ref: "#/definitions/Error"
+
   /boot-source:
     put:
       summary: Creates or updates the boot source. Pre-boot only.
@@ -846,6 +902,20 @@ definitions:
         description: The number of failed hugetlb page allocations in the guest.
         type: integer
         format: int64
+
+  BalloonHintingStatus:
+    type: object
+    description:
+      Describes the free page hinting status.
+    required:
+      - host_cmd
+    properties:
+      host_cmd:
+        description: The last command issued by the host.
+        type: integer
+      guest_cmd:
+        description: The last command provided by the guest.
+        type: integer
 
   BalloonStatsUpdate:
     type: object
