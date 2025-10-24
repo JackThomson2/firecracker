@@ -113,4 +113,4 @@ pub mod tests {
         balloon_metrics.inflate_count.inc();
         assert_eq!(balloon_metrics.inflate_count.count(), 1);
     }
-
+}
