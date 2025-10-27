@@ -16,6 +16,7 @@ use utils::time::TimestampUs;
 #[cfg(target_arch = "aarch64")]
 use vm_memory::GuestAddress;
 
+use crate::vmm_config::balloon::{BalloonBuilder, BalloonDeviceConfig};
 #[cfg(target_arch = "aarch64")]
 use crate::Vcpu;
 use crate::arch::{ConfigurationError, configure_system_for_boot, load_kernel};
@@ -198,15 +199,24 @@ pub fn build_microvm_for_boot(
         device_manager.attach_boot_timer_device(&vm, request_ts)?;
     }
 
-    if let Some(balloon) = vm_resources.balloon.get() {
+        let mut balloon_builder = BalloonBuilder::new();
+        balloon_builder.set(
+            BalloonDeviceConfig { 
+                amount_mib: 0,
+                deflate_on_oom: false,
+                stats_polling_interval_s: 0,
+                free_page_hinting: false,
+                free_page_reporting: true 
+            }
+        ).unwrap();
+
         attach_balloon_device(
             &mut device_manager,
             &vm,
             &mut boot_cmdline,
-            balloon,
+            balloon_builder.get().unwrap(),
             event_manager,
         )?;
-    }
 
     attach_block_devices(
         &mut device_manager,

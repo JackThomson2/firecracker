@@ -21,8 +21,7 @@ use crate::persist::{CreateSnapshotError, RestoreFromSnapshotError, VmInfo};
 use crate::resources::VmmConfig;
 use crate::seccomp::BpfThreadMap;
 use crate::vmm_config::balloon::{
-    BalloonConfigError, BalloonDeviceConfig, BalloonStats, BalloonUpdateConfig,
-    BalloonUpdateStatsConfig,
+    BalloonBuilder, BalloonConfigError, BalloonDeviceConfig, BalloonStats, BalloonUpdateConfig, BalloonUpdateStatsConfig
 };
 use crate::vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
 use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, DriveError};
@@ -354,10 +353,21 @@ impl<'a> PrebootApiController<'a> {
         mmds_size_limit: usize,
         metadata_json: Option<&str>,
     ) -> Result<(VmResources, Arc<Mutex<Vmm>>), BuildMicrovmFromRequestsError> {
+        let mut balloon_builder = BalloonBuilder::new();
+        balloon_builder.set(
+            BalloonDeviceConfig { 
+                amount_mib: 0,
+                deflate_on_oom: false,
+                stats_polling_interval_s: 0,
+                free_page_hinting: false,
+                free_page_reporting: true 
+            }
+        ).unwrap();
         let mut vm_resources = VmResources {
             boot_timer: boot_timer_enabled,
             mmds_size_limit,
             pci_enabled,
+            balloon: balloon_builder,
             ..Default::default()
         };
 

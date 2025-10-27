@@ -287,6 +287,8 @@ impl Balloon {
             dropped_queue_count += 1;
         }
 
+        info!("Reporting enabled {free_page_reporting}");
+
         queues.truncate(queues.len() - dropped_queue_count);
 
         let stats_timer =
