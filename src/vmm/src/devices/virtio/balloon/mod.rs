@@ -56,6 +56,7 @@ const VIRTIO_BALLOON_F_STATS_VQ: u32 = 1; // Enable statistics.
 const VIRTIO_BALLOON_F_DEFLATE_ON_OOM: u32 = 2; // Deflate balloon on OOM.
 const VIRTIO_BALLOON_F_FREE_PAGE_HINTING: u32 = 3; // Enable free page hinting
 const VIRTIO_BALLOON_F_FREE_PAGE_REPORTING: u32 = 5; // Enable free page reporting
+const VIRTIO_BALLOON_F_HINT_WAIT_ON_ACK: u32 = 6; // Wait on ACK for hinting
 
 // The statistics tags.
 const VIRTIO_BALLOON_S_SWAP_IN: u16 = 0;
@@ -76,6 +77,8 @@ pub enum BalloonError {
     DeviceNotActive,
     /// Attempting to use hinting when not enabled
     HintingNotEnabled,
+    /// Attempting to use hinting when guest does not support wait on ack
+    HintingNoWaitOnAck,
     /// EventFd error: {0}
     EventFd(std::io::Error),
     /// Received error while sending an interrupt: {0}

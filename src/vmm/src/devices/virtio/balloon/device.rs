@@ -26,7 +26,7 @@ use super::{
 };
 use crate::devices::virtio::balloon::{
     BalloonError, FREE_PAGE_HINT_DONE, FREE_PAGE_HINT_STOP, VIRTIO_BALLOON_F_FREE_PAGE_HINTING,
-    VIRTIO_BALLOON_F_FREE_PAGE_REPORTING,
+    VIRTIO_BALLOON_F_FREE_PAGE_REPORTING, VIRTIO_BALLOON_F_HINT_WAIT_ON_ACK,
 };
 use crate::devices::virtio::device::ActiveState;
 use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
@@ -267,6 +267,7 @@ impl Balloon {
 
         if free_page_hinting {
             avail_features |= 1u64 << VIRTIO_BALLOON_F_FREE_PAGE_HINTING;
+            avail_features |= 1u64 << VIRTIO_BALLOON_F_HINT_WAIT_ON_ACK;
         } else {
             queue_count -= 1;
         }
@@ -798,6 +799,11 @@ impl Balloon {
             return Err(BalloonError::HintingNotEnabled);
         }
 
+        if (self.free_page_hinting() &&
+            self.acked_features & 1u64 << VIRTIO_BALLOON_F_HINT_WAIT_ON_ACK == 0) {
+            return Err(BalloonError::HintingNoWaitOnAck);
+        }
+
         let mut cmd_id = self.hinting_state.last_cmd_id.wrapping_add(1);
         // 0 and 1 are reserved and cannot be used to start a hinting run
         if cmd_id <= 1 {
@@ -918,6 +924,11 @@ impl VirtioDevice for Balloon {
         for q in self.queues.iter_mut() {
             q.initialize(&mem)
                 .map_err(ActivateError::QueueMemoryError)?;
+        }
+
+        if (self.free_page_hinting() &&
+            self.acked_features & 1u64 << VIRTIO_BALLOON_F_HINT_WAIT_ON_ACK == 0) {
+            warn!("Using free page hinting and guest kernel doesn't support WAIT_ON_ACK feature.")
         }
 
         self.device_state = DeviceState::Activated(ActiveState { mem, interrupt });
