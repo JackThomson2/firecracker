@@ -14,6 +14,11 @@ and this project adheres to
   support for `virtio-pmem` devices. See [documentation](docs/pmem.md) for more
   information.
 
+- [#5491](https://github.com/firecracker-microvm/firecracker/pull/5491): Added
+  support for `virtio-balloon` free page reporting and hinting. Free page
+  reporting is a developer preview not for production feature. See
+  [documentation](docs/ballooning.md) for more information.
+
 ### Changed
 
 - [#4028](https://github.com/firecracker-microvm/firecracker/pull/4028):
