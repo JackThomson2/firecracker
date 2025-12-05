@@ -120,7 +120,7 @@ pub struct GuestRegionUffdMapping {
 }
 
 /// FaultRequest
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Encode, Decode, bincode::Encode)]
 pub struct FaultRequest {
     /// vCPU that encountered the fault
     pub vcpu: u32,
@@ -133,7 +133,7 @@ pub struct FaultRequest {
 }
 
 /// FaultReply
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Encode, Decode, bincode::Decode)]
 pub struct FaultReply {
     /// vCPU that encountered the fault, from `FaultRequest` (if present, otherwise 0)
     pub vcpu: Option<u32>,

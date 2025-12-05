@@ -100,6 +100,7 @@ def test_valid_handler(uvm_plain, snapshot):
     vm = uvm_plain
     vm.memory_monitor = None
     vm.spawn()
+    check_output("touch {}".format("/tmp/apf.sock"))
     vm.restore_from_snapshot(snapshot, resume=True, uffd_handler_name="on_demand")
 
     # Secret Free VMs do not support ballooning so the balloon device is not added to them.

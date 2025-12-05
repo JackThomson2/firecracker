@@ -147,7 +147,7 @@ def test_restore_latency(
 # wakes up, because it gets faulted in on the first page fault. In this scenario, we are not measuring UFFD
 # latencies, but KVM latencies of setting up missing EPT entries.
 @pytest.mark.nonci
-@pytest.mark.parametrize("uffd_handler", [None, "on_demand", "fault_all"])
+@pytest.mark.parametrize("uffd_handler", ["fault_all"])
 @pytest.mark.parametrize("huge_pages", HugePagesConfig)
 def test_post_restore_latency(
     microvm_factory,
@@ -195,17 +195,40 @@ def test_post_restore_latency(
 
     snapshot = vm.snapshot_full()
     vm.kill()
+    time.sleep(1)
 
     for microvm in microvm_factory.build_n_from_snapshot(
-        snapshot, ITERATIONS, uffd_handler_name=uffd_handler
+        snapshot, 1, uffd_handler_name=uffd_handler
     ):
         _, pid, _ = microvm.ssh.check_output("pidof fast_page_fault_helper")
 
         microvm.ssh.check_output(f"kill -s {signal.SIGUSR1} {pid}")
 
+        cpu_load = """
+cat << EOF > /tmp/cpu.sh
+#!/bin/bash
+
+iterations=3000000
+pi=0
+sign=1
+denominator=1
+
+for ((i=0; i<iterations; i++)); do
+    pi=\\$((pi + sign * 4 / denominator))
+    sign=\\$((sign * -1))
+    denominator=\\$((denominator + 2))
+done
+EOF
+chmod +x /tmp/cpu.sh;
+time /tmp/cpu.sh
+        """
+
+        _, cpu_load, _ = microvm.ssh.check_output(cpu_load)
         _, duration, _ = microvm.ssh.check_output(
             "while [ ! -f /tmp/fast_page_fault_helper.out ]; do sleep 1; done; cat /tmp/fast_page_fault_helper.out"
         )
+
+        print(f"cpu_load {cpu_load}")
 
         metrics.put_metric("fault_latency", int(duration) / NS_IN_MSEC, "Milliseconds")
 

@@ -473,9 +473,17 @@ impl Vcpu {
 
         self.exit_evt.write(1).expect("Failed to write exit event");
 
-        let async_pf = (userfaultfd_data.flags & (1 << 5)) != 0;
+        let apf_flag = userfaultfd_data.flags & (1 << 5);
+        let async_pf = apf_flag != 0;
         if async_pf {
-            return Ok(VcpuEmulation::Handled)
+            // let reject_apf_flag = 1 << 7;
+            // // SAFETY: Run in the context of a vm exit for memory fault
+            // unsafe {
+            //     self.kvm_vcpu.fd.get_kvm_run().__bindgen_anon_1.memory_fault.flags |= reject_apf_flag;
+            // }
+            //
+            // info!("We marked the apf as rejected!");
+            return Ok(VcpuEmulation::Handled);
         }
 
         let (lock, cvar) = self
@@ -506,6 +514,7 @@ impl Vcpu {
             self.kvm_vcpu.fd.set_kvm_immediate_exit(0);
             return Ok(VcpuEmulation::Interrupted);
         }
+
 
         match self.kvm_vcpu.fd.run() {
             Err(ref err) if err.errno() == libc::EINTR => {

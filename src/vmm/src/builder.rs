@@ -73,7 +73,7 @@ use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{MaybeBounce, MemoryError, create_memfd};
 use crate::vstate::vcpu::{Vcpu, VcpuError};
 use crate::vstate::vm::{GUEST_MEMFD_FLAG_NO_DIRECT_MAP, GUEST_MEMFD_FLAG_SUPPORT_SHARED, Vm};
-use crate::{EventManager, Vmm, VmmError, device_manager};
+use crate::{device_manager, EventManager, UffdMessageBroker, Vmm, VmmError};
 
 /// Errors associated with starting the instance.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -164,7 +164,7 @@ fn create_vmm_and_vcpus(
     vcpu_count: u8,
     mut kvm_capabilities: Vec<KvmCapability>,
     secret_free: bool,
-    apf_stream: Option<UnixStream>,
+    apf_stream: Option<UffdMessageBroker>,
 ) -> Result<(Vmm, Vec<Vcpu>), VmmError> {
     if secret_free {
         kvm_capabilities.push(KvmCapability::Add(Cap::GuestMemfd as u32));
@@ -287,7 +287,7 @@ pub fn build_microvm_for_boot(
             vmm.vm
                 .create_guest_memfd(
                     vm_resources.memory_size(),
-                    GUEST_MEMFD_FLAG_SUPPORT_SHARED | GUEST_MEMFD_FLAG_NO_DIRECT_MAP,
+                    GUEST_MEMFD_FLAG_SUPPORT_SHARED, // | GUEST_MEMFD_FLAG_NO_DIRECT_MAP,
                 )
                 .map_err(VmmError::Vm)?,
         ),
@@ -580,14 +580,13 @@ pub fn build_microvm_from_snapshot(
     }
 
     // FIXME: Hardcoding the APF socket path as it's awkward to bring it here.
-    let apf_sock = "/tmp/apf.socket";
+    let apf_sock = "/apf.socket";
     let apf_stream = UnixStream::connect(apf_sock)
         .inspect(|stream| {
             stream
                 .set_nonblocking(true)
                 .expect("Failed to set non-blocking mode");
-        })
-        .expect("Could not find the {apf_sock} file.");
+        }).map(UffdMessageBroker::new).ok();
 
     let (mut vmm, mut vcpus) = create_vmm_and_vcpus(
         instance_info,
@@ -595,7 +594,7 @@ pub fn build_microvm_from_snapshot(
         vm_resources.machine_config.vcpu_count,
         kvm_capabilities,
         secret_free,
-        Some(apf_stream),
+        apf_stream,
     )
     .map_err(StartMicrovmError::Internal)?;
 
@@ -604,7 +603,7 @@ pub fn build_microvm_from_snapshot(
             vmm.vm
                 .create_guest_memfd(
                     vm_resources.memory_size(),
-                    GUEST_MEMFD_FLAG_SUPPORT_SHARED | GUEST_MEMFD_FLAG_NO_DIRECT_MAP,
+                    GUEST_MEMFD_FLAG_SUPPORT_SHARED, // | GUEST_MEMFD_FLAG_NO_DIRECT_MAP,
                 )
                 .map_err(VmmError::Vm)?,
         ),
@@ -669,7 +668,10 @@ pub fn build_microvm_from_snapshot(
         .map_err(VmmError::Vm)
         .map_err(StartMicrovmError::Internal)?;
     vmm.uffd = uffd;
-    vmm.uffd_socket = socket;
+
+    if let Some(uff_socket) = socket {
+        vmm.uffd_socket = Some(UffdMessageBroker::new(uff_socket));
+    };
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -711,6 +713,7 @@ pub fn build_microvm_from_snapshot(
     }
 
     // Restore kvm vm state.
+    debug!("Resorting state..");
     #[cfg(target_arch = "x86_64")]
     vmm.vm.restore_state(&microvm_state.vm_state)?;
 
@@ -750,6 +753,8 @@ pub fn build_microvm_from_snapshot(
             .notify_vmgenid()
             .map_err(BuildMicrovmFromSnapshotError::VMGenIDUpdate)?;
     }
+
+    debug!("Starting vcpus");
 
     // vmm.set_guest_memory_private(false)?;
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.

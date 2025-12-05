@@ -23,11 +23,14 @@ use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::net::UnixStream;
 use std::ptr;
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
+use std::thread::{sleep, spawn};
 use std::time::Duration;
 
-use bitcode::{Decode, Encode};
+use async_channel::{unbounded, Sender};
 use serde::{Deserialize, Serialize};
 use serde_json::{Deserializer, StreamDeserializer};
+use smol::Timer;
 use userfaultfd::{Error, Event, Uffd};
 use vmm_sys_util::ioctl::ioctl_with_mut_ref;
 use vmm_sys_util::ioctl_iowr_nr;
@@ -90,7 +93,7 @@ pub struct GuestRegionUffdMapping {
     pub page_size: usize,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, bincode::Decode)]
 pub struct FaultRequest {
     /// vCPU that encountered the fault
     pub vcpu: u32,
@@ -116,7 +119,7 @@ impl FaultRequest {
 }
 
 /// FaultReply
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, bincode::Encode)]
 pub struct FaultReply {
     /// vCPU that encountered the fault, from `FaultRequest` (if present, otherwise 0)
     pub vcpu: Option<u32>,
@@ -143,7 +146,7 @@ pub enum UffdMsgFromFirecracker {
 }
 
 /// UffdMsgToFirecracker
-#[derive(Serialize, Deserialize, Debug, Encode, Decode)]
+#[derive(Serialize, Deserialize, Debug, bincode::Encode)]
 #[serde(untagged)]
 pub enum UffdMsgToFirecracker {
     /// FaultRep
@@ -164,6 +167,7 @@ pub struct UffdHandler {
     backing_buffer: *const u8,
     pub uffd: Uffd,
     removed_pages: HashSet<u64>,
+    pub faulted_pages: HashSet<usize>,
     pub guest_memfd: Option<File>,
     pub guest_memfd_addr: Option<*mut u8>,
     pub userfault_bitmap: Option<UserfaultBitmap>,
@@ -271,6 +275,7 @@ impl UffdHandler {
                     backing_buffer,
                     uffd,
                     removed_pages: HashSet::new(),
+                    faulted_pages: HashSet::new(),
                     guest_memfd,
                     guest_memfd_addr,
                     userfault_bitmap,
@@ -282,6 +287,7 @@ impl UffdHandler {
                 backing_buffer,
                 uffd,
                 removed_pages: HashSet::new(),
+                faulted_pages: HashSet::new(),
                 guest_memfd: None,
                 guest_memfd_addr: None,
                 userfault_bitmap: None,
@@ -471,54 +477,122 @@ impl UffdHandler {
     }
 }
 
+struct UffdMsgIterBincode {
+    stream: Arc<Mutex<UnixStream>>,
+    buffer: Vec<u8>,
+    current_pos: usize,
+}
+
+const BINCODE_CONFIG:bincode::config::Configuration = bincode::config::standard();
+
+impl UffdMsgIterBincode {
+    fn new(stream: Arc<Mutex<UnixStream>>) -> Self {
+        Self {
+            stream,
+            buffer: vec![0u8; 4096],
+            current_pos: 0,
+        }
+    }
+
+    fn expected_size(&self) -> Option<u32> {
+        if self.current_pos < 4 {
+            return None
+        }
+
+        Some(u32::from_le_bytes(self.buffer[..4].try_into().unwrap()))
+    }
+
+    fn can_decode(&self) -> bool {
+        let Some(expeced_size) = self.expected_size() else {
+            return false;
+        };
+
+        self.current_pos - 4 >= expeced_size as usize
+    }
+}
+
+impl Iterator for UffdMsgIterBincode {
+    type Item = FaultRequest;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.stream.lock().unwrap().read(&mut self.buffer[self.current_pos..]) {
+            Ok(bytes_read) => self.current_pos += bytes_read,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Continue with existing buffer data
+            }
+            Err(e) => panic!("Failed to read from stream: {e}"),
+        }
+
+        if !self.can_decode() {
+            return None
+        }
+
+        let size = self.expected_size().unwrap() as usize;
+        let (found, _)  = bincode::decode_from_slice(&self.buffer[4..4 + size], BINCODE_CONFIG).unwrap();
+
+        self.buffer.copy_within(4+size..self.current_pos, 0);
+        self.current_pos -= 4 + size;
+
+        Some(found)
+    }
+}
+
+struct UffdMsgIteratorLocked {
+    stream: Arc<Mutex<UnixStream>>,
+    buffer: Vec<u8>,
+    current_pos: usize,
+}
+
+impl UffdMsgIteratorLocked {
+    fn new(stream: Arc<Mutex<UnixStream>>) -> Self {
+        Self {
+            stream,
+            buffer: vec![0u8; 4096],
+            current_pos: 0,
+        }
+    }
+}
+
+impl Iterator for UffdMsgIteratorLocked {
+    type Item = FaultRequest;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.stream.lock().unwrap().read(&mut self.buffer[self.current_pos..]) {
+            Ok(bytes_read) => self.current_pos += bytes_read,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Continue with existing buffer data
+            }
+            Err(e) => panic!("Failed to read from stream: {}", e,),
+        }
+
+        if self.current_pos == 0 {
+            return None;
+        }
+
+        let str_slice = std::str::from_utf8(&self.buffer[..self.current_pos]).unwrap();
+        let mut stream: StreamDeserializer<_, Self::Item> =
+            Deserializer::from_str(str_slice).into_iter();
+
+        match stream.next()? {
+            Ok(value) => {
+                let consumed = stream.byte_offset();
+                self.buffer.copy_within(consumed..self.current_pos, 0);
+                self.current_pos -= consumed;
+                Some(value)
+            }
+            Err(e) => panic!(
+                "Failed to deserialize JSON message: {}. Error: {}",
+                String::from_utf8_lossy(&self.buffer[..self.current_pos]),
+                e
+            ),
+        }
+    }
+}
+
 struct UffdMsgIterator {
     stream: UnixStream,
     buffer: Vec<u8>,
     current_pos: usize,
-    current_size: Option<u8>,
-}
-
-impl Iterator for UffdMsgIterator {
-    type Item = FaultRequest;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            match self.stream.read(&mut self.buffer[self.current_pos..]) {
-                Ok(bytes_read) => self.current_pos += bytes_read,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Continue with existing buffer data
-                }
-                Err(e) => panic!("Failed to read from stream: {}", e,),
-            }
-
-            if self.current_pos == 0 {
-                return None;
-            }
-
-            if self.current_size.is_none() {
-                let size = self.buffer[0];
-                self.current_size = Some(size);
-            }
-
-            let size = self.current_size.unwrap() as usize;
-            
-            if self.current_pos < size + 1 {
-                continue;
-            }
-
-            let message = bitcode::decode::<Self::Item>(&self.buffer[1..1 + size]);
-            if let Ok(value) = message {
-                self.current_pos -= 1 + size;
-                self.buffer.copy_within(..1 + size, 0);
-                self.current_size = None;
-                return Some(value);
-            }
-
-            println!("Error is {:?}", message.unwrap_err());
-
-            return None
-        }
-    }
 }
 
 impl UffdMsgIterator {
@@ -527,19 +601,55 @@ impl UffdMsgIterator {
             stream,
             buffer: vec![0u8; 4096],
             current_pos: 0,
-            current_size: None,
+        }
+    }
+}
+
+impl Iterator for UffdMsgIterator {
+    type Item = FaultRequest;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.stream.read(&mut self.buffer[self.current_pos..]) {
+            Ok(bytes_read) => self.current_pos += bytes_read,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Continue with existing buffer data
+            }
+            Err(e) => panic!("Failed to read from stream: {}", e,),
+        }
+
+        if self.current_pos == 0 {
+            return None;
+        }
+
+        let str_slice = std::str::from_utf8(&self.buffer[..self.current_pos]).unwrap();
+        let mut stream: StreamDeserializer<_, Self::Item> =
+            Deserializer::from_str(str_slice).into_iter();
+
+        match stream.next()? {
+            Ok(value) => {
+                let consumed = stream.byte_offset();
+                self.buffer.copy_within(consumed..self.current_pos, 0);
+                self.current_pos -= consumed;
+                Some(value)
+            }
+            Err(e) => panic!(
+                "Failed to deserialize JSON message: {}. Error: {}",
+                String::from_utf8_lossy(&self.buffer[..self.current_pos]),
+                e
+            ),
         }
     }
 }
 
 #[derive(Debug)]
 pub struct Runtime {
-    stream: UnixStream,
-    apf_stream: UnixStream,
+    stream: Arc<Mutex<UnixStream>>,
+    apf_stream: Arc<Mutex<UnixStream>>,
     backing_file: File,
     backing_memory: *mut u8,
     backing_memory_size: usize,
     handler: UffdHandler,
+    message_buffer: [u8; 4096]
 }
 
 impl Runtime {
@@ -564,15 +674,19 @@ impl Runtime {
             panic!("mmap on backing file failed");
         }
 
-        let handler = Runtime::construct_handler(&stream, ret.cast(), backing_memory_size);
+        let stream = Arc::new(Mutex::new(stream));
+        let apf_stream = Arc::new(Mutex::new(apf_stream));
+
+        let handler = Runtime::construct_handler(stream.clone(), ret.cast(), backing_memory_size);
 
         Self {
             stream,
-            apf_stream,
+            apf_stream, //Arc::new(Mutex::new(apf_stream)),
             backing_file,
             backing_memory: ret.cast(),
             backing_memory_size,
             handler,
+            message_buffer: [0; 4096],
         }
     }
 
@@ -585,7 +699,7 @@ impl Runtime {
         let mut creds_size = size_of::<libc::ucred>() as u32;
         let ret = unsafe {
             libc::getsockopt(
-                self.stream.as_raw_fd(),
+                self.stream.lock().unwrap().as_raw_fd(),
                 libc::SOL_SOCKET,
                 libc::SO_PEERCRED,
                 (&raw mut creds).cast::<c_void>(),
@@ -613,20 +727,41 @@ impl Runtime {
         }));
     }
 
-    pub fn send_fault_reply(&mut self, fault_reply: FaultReply) {
-        let reply_json = bitcode::encode(&fault_reply);
-        self.stream.write_all(&[reply_json.len() as u8]).unwrap();
-        self.stream.write_all(&reply_json).unwrap();
+    pub fn send_fault_reply(&mut self, fault_reply: FaultReply, sender: &Sender<Vec<u8>>) {
+        let size = bincode::encode_into_slice(fault_reply, &mut self.message_buffer[4..], BINCODE_CONFIG).unwrap() as u32;
+        self.message_buffer[..4].copy_from_slice(&size.to_le_bytes());
+
+        // self.stream.lock().unwrap().write_all(&self.message_buffer[..4 + (size as usize)]).unwrap();
+        let data = Vec::from(&self.message_buffer[..4 + (size as usize)]);
+        sender.send_blocking(data).unwrap();
     }
 
-    pub fn send_apf_reply(&mut self, fault_reply: FaultReply) {
-        let reply_json = bitcode::encode(&fault_reply);
-        self.apf_stream.write_all(&[reply_json.len() as u8]).unwrap();
-        self.apf_stream.write_all(&reply_json).unwrap();
+    pub fn send_apf_reply(&mut self, fault_reply: FaultReply, sender: &Sender<Vec<u8>>) {
+        let size = bincode::encode_into_slice(fault_reply, &mut self.message_buffer[4..], BINCODE_CONFIG).unwrap() as u32;
+        self.message_buffer[..4].copy_from_slice(&size.to_le_bytes());
+
+        // self.apf_stream.lock().unwrap().write_all(&self.message_buffer[..4 + (size as usize)]).unwrap();
+
+        let data = Vec::from(&self.message_buffer[..4 + (size as usize)]);
+        sender.send_blocking(data).unwrap();
+
+        // let reply = UffdMsgToFirecracker::FaultRep(fault_reply);
+        // let reply_json = serde_json::to_string(&reply).unwrap();
+        // self.apf_stream.write_all(reply_json.as_bytes()).unwrap();
+        // let stream = self.apf_stream.clone();
+        //
+        // spawn(move || {
+        //     println!("Sending delayed apf");
+        //     sleep(Duration::from_micros(500));
+        //
+        //     let reply = UffdMsgToFirecracker::FaultRep(fault_reply);
+        //     let reply_json = serde_json::to_string(&reply).unwrap();
+        //     stream.lock().unwrap().write_all(reply_json.as_bytes()).unwrap();
+        // });
     }
 
     pub fn construct_handler(
-        stream: &UnixStream,
+        stream: Arc<Mutex<UnixStream>>,
         backing_memory: *mut u8,
         backing_memory_size: usize,
     ) -> UffdHandler {
@@ -638,6 +773,7 @@ impl Runtime {
         let mut fds = [0; 3];
         let (bytes_read, fds_read) = unsafe {
             stream
+                .lock().unwrap()
                 .recv_with_fds(&mut iovecs, &mut fds)
                 .expect("recv_with_fds failed")
         };
@@ -676,14 +812,14 @@ impl Runtime {
 
         // Poll the stream for incoming uffds
         pollfds.push(libc::pollfd {
-            fd: self.stream.as_raw_fd(),
+            fd: self.stream.lock().unwrap().as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         });
 
         // Poll the stream for incoming async page faults
         pollfds.push(libc::pollfd {
-            fd: self.apf_stream.as_raw_fd(),
+            fd: self.apf_stream.lock().unwrap().as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         });
@@ -695,11 +831,35 @@ impl Runtime {
         });
 
         let mut uffd_msg_iter =
-            UffdMsgIterator::new(self.stream.try_clone().expect("Failed to clone stream"));
+            UffdMsgIterBincode::new(self.stream.clone());
 
         let mut apf_msg_iter =
-            UffdMsgIterator::new(self.apf_stream.try_clone().expect("Failed to clone stream"));
+            UffdMsgIterBincode::new(self.apf_stream.clone());
 
+        let r_stream = self.stream.clone();
+        let (r_send, r_recv) = unbounded::<Vec<u8>>();
+        spawn(move || {
+            smol::block_on(async {
+                while let Ok(message) = r_recv.recv().await {
+                    Timer::after(Duration::from_millis(1)).await;
+                    r_stream.lock().unwrap().write_all(&message).unwrap();
+                }
+            });
+        });
+
+        let a_stream = self.apf_stream.clone();
+        let (a_send, a_recv) = unbounded::<Vec<u8>>();
+        spawn(move || {
+            smol::block_on(async {
+                while let Ok(message) = a_recv.recv().await {
+                    Timer::after(Duration::from_millis(1)).await;
+                    a_stream.lock().unwrap().write_all(&message).unwrap();
+                }
+            });
+        });
+
+        let stream_fd = self.stream.lock().unwrap().as_raw_fd();
+        let apf_fd = self.apf_stream.lock().unwrap().as_raw_fd();
         loop {
             let pollfd_ptr = pollfds.as_mut_ptr();
             let pollfd_size = pollfds.len() as u64;
@@ -718,7 +878,7 @@ impl Runtime {
                 }
                 if fd.revents & libc::POLLIN != 0 {
                     nready -= 1;
-                    if fd.fd == self.stream.as_raw_fd() {
+                    if fd.fd == stream_fd {
                         for fault_request in uffd_msg_iter.by_ref() {
                             let page_size = self.handler.page_size;
 
@@ -726,32 +886,30 @@ impl Runtime {
                                 (fault_request.offset as usize) < self.handler.size(),
                                 "received bogus offset from firecracker"
                             );
-
+                            println!("Regular fault at offset {:0x}. CPU id: {:0x}", fault_request.offset, fault_request.vcpu);
                             // Handle one of FaultRequest page faults
                             pf_vcpu_event_dispatch(
                                 &mut self.handler,
                                 fault_request.offset as usize,
                             );
 
-                            self.send_fault_reply(fault_request.into_reply(page_size as u64));
+                            self.send_fault_reply(fault_request.into_reply(page_size as u64), &r_send);
                         }
-                    } else if fd.fd == self.apf_stream.as_raw_fd() {
+                    } else if fd.fd == apf_fd {
                         for fault_request in apf_msg_iter.by_ref() {
-                            println!("This was an async pf exit. {fault_request:?}");
                             let page_size = self.handler.page_size;
 
                             assert!(
                                 (fault_request.offset as usize) < self.handler.size(),
                                 "received bogus offset from firecracker"
                             );
-
+                            println!("APF fault at offset {:0x}. CPU id: {:0x}", fault_request.offset, fault_request.vcpu);
                             // Handle one of FaultRequest page faults
                             pf_vcpu_event_dispatch(
                                 &mut self.handler,
                                 fault_request.offset as usize,
                             );
-
-                            self.send_apf_reply(fault_request.into_reply(page_size as u64));
+                            self.send_apf_reply(fault_request.into_reply(page_size as u64), &a_send);
                         }
                     } else {
                         // Handle one of uffd page faults

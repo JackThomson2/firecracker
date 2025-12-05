@@ -69,7 +69,7 @@ fn log_sigsys_err(si_code: c_int, info: *mut siginfo_t) {
     let syscall = unsafe { *(info as *const i32).offset(SI_OFF_SYSCALL) };
     error!(
         "Shutting down VM after intercepting a bad syscall ({}).",
-        syscall
+        syscall,
     );
 }
 
