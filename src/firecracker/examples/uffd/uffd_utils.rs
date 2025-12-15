@@ -102,7 +102,7 @@ pub struct FaultRequest {
     /// Flags
     pub flags: u64,
     /// Async PF token
-    pub token: Option<u32>,
+    pub gpa: Option<u64>,
 }
 
 impl FaultRequest {
@@ -112,7 +112,7 @@ impl FaultRequest {
             offset: self.offset,
             len,
             flags: self.flags,
-            token: self.token,
+            gpa: self.gpa,
             zero: false,
         }
     }
@@ -130,7 +130,7 @@ pub struct FaultReply {
     /// Flags, must be copied from `FaultRequest`, otherwise 0
     pub flags: u64,
     /// Async PF token, must be copied from `FaultRequest`, otherwise None
-    pub token: Option<u32>,
+    pub gpa: Option<u64>,
     /// Whether the populated pages are zero pages
     pub zero: bool,
 }
@@ -841,7 +841,7 @@ impl Runtime {
         spawn(move || {
             smol::block_on(async {
                 while let Ok(message) = r_recv.recv().await {
-                    Timer::after(Duration::from_millis(1)).await;
+                    // Timer::after(Duration::from_millis(1)).await;
                     r_stream.lock().unwrap().write_all(&message).unwrap();
                 }
             });
@@ -852,7 +852,7 @@ impl Runtime {
         spawn(move || {
             smol::block_on(async {
                 while let Ok(message) = a_recv.recv().await {
-                    Timer::after(Duration::from_millis(1)).await;
+                    // Timer::after(Duration::from_millis(1)).await;
                     a_stream.lock().unwrap().write_all(&message).unwrap();
                 }
             });

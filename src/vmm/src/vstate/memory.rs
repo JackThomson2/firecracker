@@ -63,16 +63,7 @@ pub enum MemoryError {
     Mmap(std::io::Error),
 }
 
-#[allow(non_camel_case_types)]
-#[repr(C)]
-#[derive(Copy, Clone, Default, Debug)]
-pub struct kvm_async_pf_ready {
-    pub gpa: u64,
-    pub token: u32,
-    pub notpresent_injected: u32,
-}
-
-ioctl_iow_nr!(KVM_ASYNC_PF_READY, KVMIO, 0xd6, kvm_async_pf_ready);
+ioctl_iow_nr!(KVM_ASYNC_PF_READY, KVMIO, 0xd6, u64);
 
 /// Newtype that implements [`ReadVolatile`] and [`WriteVolatile`] if `T` implements `Read` or
 /// `Write` respectively, by reading/writing using a bounce buffer, and memcpy-ing into the

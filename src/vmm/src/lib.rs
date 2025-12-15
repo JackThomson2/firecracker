@@ -139,7 +139,7 @@ use vmm_sys_util::ioctl::ioctl_with_ref;
 use vmm_sys_util::syscall::SyscallReturnCode;
 use vmm_sys_util::terminal::Terminal;
 use vstate::kvm::Kvm;
-use vstate::memory::{kvm_async_pf_ready, KVM_ASYNC_PF_READY};
+use vstate::memory::{KVM_ASYNC_PF_READY};
 use vstate::vcpu::{self, StartThreadedError, VcpuSendEventError};
 
 use crate::arch::DeviceType;
@@ -926,7 +926,7 @@ impl Vmm {
                 vcpu,
                 offset,
                 flags: userfault_data.flags,
-                token: Some(userfault_data.size as u32),
+                gpa: Some(userfault_data.gpa),
             };
 
             stream.send_fault_request(fault_request);
@@ -945,7 +945,7 @@ impl Vmm {
             vcpu,
             offset,
             flags: userfault_data.flags,
-            token: None,
+            gpa: None,
         };
 
         // info!("Send fault request.. request: {fault_request_json:?}");
@@ -967,21 +967,14 @@ impl Vmm {
         let socket = self.apf_stream.as_mut().unwrap();
         for fault_reply in socket.by_ref() {
             let vcpu = fault_reply.vcpu.expect("vCPU must be set");
-            let notpresent_injected = ((fault_reply.flags & (1 << 6)) != 0) as u32;
-            let ready = kvm_async_pf_ready {
-                gpa: fault_reply.offset, 
-                token: fault_reply.token.unwrap(),
-                notpresent_injected,
-            };
-
             let delta = RECV_SENT_DELTA.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) - 1;
-            // info!("Sending APF ready message.. Delta is {delta},");
+            // info!("Sending APF ready message.. Delta is {delta}, Vcpu is {vcpu} Offset: {:X}", fault_reply.offset);
             // SAFETY: Safe for now
             unsafe {
                 SyscallReturnCode(ioctl_with_ref(
                     &self.vcpu_fds[vcpu as usize],
                     KVM_ASYNC_PF_READY(),
-                    &ready,
+                    &fault_reply.gpa.unwrap(),
                 ))
                 .into_empty_result()
                 .unwrap()

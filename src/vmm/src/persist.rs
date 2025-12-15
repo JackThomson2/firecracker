@@ -129,7 +129,7 @@ pub struct FaultRequest {
     /// Flags
     pub flags: u64,
     /// Async PF token
-    pub token: Option<u32>,
+    pub gpa: Option<u64>,
 }
 
 /// FaultReply
@@ -144,7 +144,7 @@ pub struct FaultReply {
     /// Flags, must be copied from `FaultRequest`, otherwise 0
     pub flags: u64,
     /// Async PF token, must be copied from `FaultRequest`, otherwise None
-    pub token: Option<u32>,
+    pub gpa: Option<u64>,
     /// Whether the populated pages are zero pages
     pub zero: bool,
 }
