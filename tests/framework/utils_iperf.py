@@ -28,7 +28,7 @@ class IPerf3Test:
     ):
         self._microvm = microvm
         self._base_port = base_port
-        self._runtime = runtime
+        self._runtime = runtime + omit # We treat runtime as time after omitted
         self._omit = omit
         self._mode = mode  # entry into mode-map
         self._num_clients = num_clients
