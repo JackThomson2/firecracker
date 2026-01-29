@@ -20,6 +20,8 @@ pub enum NormalizeCpuidError {
     PassthroughCacheTopology(#[from] PassthroughCacheTopologyError),
     /// Missing leaf 0x7 / subleaf 0.
     MissingLeaf0x7Subleaf0,
+    /// Missing KVM CPUID features leaf 0x40000001.
+    MissingKvmCpuidFeatures,
     /// Missing leaf 0x80000000.
     MissingLeaf0x80000000,
     /// Missing leaf 0x80000001.
@@ -111,17 +113,31 @@ impl super::AmdCpuid {
         self.update_extended_cache_topology_entry(cpu_count, cpus_per_core)?;
         self.update_extended_apic_id_entry(cpu_index, cpus_per_core)?;
         self.update_brand_string_entry()?;
-
+        self.update_kvm_feature_entry()?;
         Ok(())
     }
 
-    /// Passthrough cache topology.
+    fn update_kvm_feature_entry(&mut self) -> Result<(), NormalizeCpuidError> {
+        let leaf_40000001 = self
+            .get_mut(&CpuidKey::leaf(0x40000001))
+            .ok_or(NormalizeCpuidError::MissingKvmCpuidFeatures)?;
+        // KVM_HINT_REALTIME
+        set_bit(&mut leaf_40000001.result.edx, 0, true);
+        Ok(())
+    }
+
+    /// Ensure cache topology leaves exist.
+    ///
+    /// This function ensures that leaves 0x8000001d and 0x8000001e exist in the CPUID.
+    /// If they are not already present (from KVM's get_supported_cpuid), they are
+    /// populated from the host. The topology-specific fields (NumSharingCache, APIC IDs,
+    /// etc.) are later adjusted by update_extended_cache_topology_entry and
+    /// update_extended_apic_id_entry to match the VM's configuration.
     ///
     /// # Errors
     ///
-    /// This function passes through leaves from the host CPUID, if this does not match the AMD
-    /// specification it is possible to enter an indefinite loop. To avoid this, this will return an
-    /// error when the host CPUID vendor id does not match the AMD CPUID vendor id.
+    /// Returns an error if the host vendor ID does not match AMD, as the cache topology
+    /// enumeration loop relies on AMD-specific CPUID behavior.
     fn passthrough_cache_topology(&mut self) -> Result<(), PassthroughCacheTopologyError> {
         if get_vendor_id_from_host().map_err(PassthroughCacheTopologyError::NoVendorId)?
             != *VENDOR_ID_AMD
@@ -129,9 +145,8 @@ impl super::AmdCpuid {
             return Err(PassthroughCacheTopologyError::BadVendorId);
         }
 
-        // Pass-through host CPUID for leaves 0x8000001e and 0x8000001d.
-        {
-            // 0x8000001e - Processor Topology Information
+        // Only insert 0x8000001e if not already present from KVM
+        if self.get(&CpuidKey::leaf(0x8000001e)).is_none() {
             self.0.insert(
                 CpuidKey::leaf(0x8000001e),
                 CpuidEntry {
@@ -139,33 +154,15 @@ impl super::AmdCpuid {
                     result: CpuidRegisters::from(cpuid(0x8000001e)),
                 },
             );
+        }
 
-            // 0x8000001d - Cache Topology Information
+        // Only insert 0x8000001d subleaves if not already present from KVM
+        if self.get(&CpuidKey::subleaf(0x8000001d, 0)).is_none() {
             for subleaf in 0.. {
                 let result = CpuidRegisters::from(cpuid_count(0x8000001d, subleaf));
-                // From 'AMD64 Architecture Programmer’s Manual Volume 3: General-Purpose and System
-                // Instructions':
-                //
-                // > To gather information for all cache levels, software must repeatedly execute
-                // > CPUID with 8000_001Dh in EAX and ECX set to increasing values beginning with 0
-                // > until a value of 00h is returned in the field CacheType (EAX[4:0]) indicating
-                // > no more cache descriptions are available for this processor. If CPUID
-                // > Fn8000_0001_ECX[TopologyExtensions] = 0, then CPUID Fn8000_001Dh is reserved.
-                //
-                // On non-AMD hosts this condition may never be true thus this loop may be
-                // indefinite.
-
-                // CPUID Fn8000_0001D_EAX_x[4:0] (Field Name: CacheType)
-                // Cache type. Identifies the type of cache.
-                // ```text
-                // Bits Description
-                // 00h Null; no more caches.
-                // 01h Data cache
-                // 02h Instruction cache
-                // 03h Unified cache
-                // 1Fh-04h Reserved.
-                // ```
-                let cache_type = result.eax & 15;
+                // From 'AMD64 Architecture Programmer's Manual Volume 3':
+                // CacheType (EAX[4:0]) = 00h indicates no more cache descriptions.
+                let cache_type = result.eax & 0x1f;
                 if cache_type == 0 {
                     break;
                 }

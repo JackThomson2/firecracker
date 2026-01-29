@@ -14,6 +14,8 @@ use crate::cpu_config::x86_64::cpuid::{
 pub enum NormalizeCpuidError {
     /// Failed to set deterministic cache leaf: {0}
     DeterministicCache(#[from] DeterministicCacheError),
+    /// Missing KVM CPUID features leaf 0x40000001.
+    MissingKvmCpuidFeatures,
     /// Leaf 0x6 is missing from CPUID.
     MissingLeaf6,
     /// Leaf 0x7 / subleaf 0 is missing from CPUID.
@@ -75,9 +77,20 @@ impl super::IntelCpuid {
         self.update_performance_monitoring_entry()?;
         self.update_extended_topology_v2_entry();
         self.update_brand_string_entry()?;
+        self.update_kvm_feature_entry()?;
 
         Ok(())
     }
+
+    fn update_kvm_feature_entry(&mut self) -> Result<(), NormalizeCpuidError> {
+        let leaf_40000001 = self
+            .get_mut(&CpuidKey::leaf(0x40000001))
+            .ok_or(NormalizeCpuidError::MissingKvmCpuidFeatures)?;
+        // KVM_HINT_REALTIME
+        set_bit(&mut leaf_40000001.result.edx, 0, true);
+        Ok(())
+    }
+
 
     /// Update deterministic cache entry
     #[allow(clippy::unwrap_in_result)]
