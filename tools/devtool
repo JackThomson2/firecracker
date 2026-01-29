@@ -714,7 +714,11 @@ apply_linux_61_tweaks() {
                     echo "Reloading KVM modules with nx_huge_pages=never"
                     sudo modprobe -r $KVM_VENDOR_MOD kvm
                     sudo modprobe kvm nx_huge_pages=never
-                    sudo modprobe $KVM_VENDOR_MOD
+                    if [[ $KVM_VENDOR_MOD == "kvm_amd" ]]; then
+                        sudo modprobe kvm_amd avic=1
+                    else
+                        sudo modprobe $KVM_VENDOR_MOD
+                    fi
                 fi
                 rm "$lockfile"
                 break
@@ -733,6 +737,57 @@ apply_linux_61_tweaks() {
             echo "favordynmods is enabled"
         fi
     fi
+}
+
+# Enable AVIC on AMD for reduced VM exits
+apply_amd_avic_tweaks() {
+    if ! grep -q "svm" /proc/cpuinfo; then
+        return
+    fi
+
+    AVIC_PARAM=/sys/module/kvm_amd/parameters/avic
+    if [[ ! -f $AVIC_PARAM ]]; then
+        return
+    fi
+
+    if grep -q "Y\|1" $AVIC_PARAM; then
+        echo "AVIC already enabled"
+        return
+    fi
+
+    say "Enabling AMD AVIC for reduced VM exits"
+    lockfile="/tmp/.amd_avic_tweaks.lock"
+    set -C # noclobber
+    while true; do
+        if echo "$$" > "$lockfile"; then
+            echo "Successfully acquired lock"
+            if ! grep -q "Y\|1" $AVIC_PARAM; then
+                echo "Reloading kvm_amd with avic=1"
+                sudo modprobe -r kvm_amd
+                sudo modprobe kvm_amd avic=1
+            fi
+            rm "$lockfile"
+            break
+        else
+            sleep 5s
+        fi
+    done
+    tail -v $AVIC_PARAM
+}
+
+unapply_amd_avic_tweaks() {
+    if ! grep -q "svm" /proc/cpuinfo; then
+        return
+    fi
+
+    AVIC_PARAM=/sys/module/kvm_amd/parameters/avic
+    if [[ ! -f $AVIC_PARAM ]] || ! grep -q "Y\|1" $AVIC_PARAM; then
+        return
+    fi
+
+    say "Disabling AMD AVIC"
+    sudo modprobe -r kvm_amd
+    sudo modprobe kvm_amd avic=0
 }
 
 
@@ -855,6 +910,7 @@ cmd_test() {
     fi
 
     apply_linux_61_tweaks
+    apply_amd_avic_tweaks
 
     # If we got to here, we've got all we need to continue.
     say "Kernel version: $(uname -r)"
@@ -921,6 +977,7 @@ cmd_test() {
     if [[ $performance_tweaks -eq 1 ]]; then
       if [[ "$(uname --machine)" == "x86_64" ]]; then
         unapply_performance_tweaks
+        unapply_amd_avic_tweaks
       fi
 
       echo $huge_pages_old |sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages >/dev/null
