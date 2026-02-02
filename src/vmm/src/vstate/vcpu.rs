@@ -476,12 +476,12 @@ impl Vcpu {
         let apf_flag = userfaultfd_data.flags & (1 << 5);
         let async_pf = apf_flag != 0;
         if async_pf {
-            // let reject_apf_flag = 1 << 7;
-            // // SAFETY: Run in the context of a vm exit for memory fault
-            // unsafe {
-            //     self.kvm_vcpu.fd.get_kvm_run().__bindgen_anon_1.memory_fault.flags |= reject_apf_flag;
-            // }
-            //
+            let accept_apf_flag = 1 << 6;
+            // SAFETY: Run in the context of a vm exit for memory fault
+            unsafe {
+                self.kvm_vcpu.fd.get_kvm_run().__bindgen_anon_1.memory_fault.flags |= accept_apf_flag;
+            }
+
             // info!("We marked the apf as rejected!");
             return Ok(VcpuEmulation::Handled);
         }

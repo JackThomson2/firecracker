@@ -155,23 +155,23 @@ fn main() {
             }
         },
         |uffd_handler: &mut UffdHandler, offset: usize| {
-            if uffd_handler.faulted_pages.contains(&offset) {
-                println!("This had already been faulted hmmm at offst {offset:0x}");
-                return;
-            }
+            // if uffd_handler.faulted_pages.contains(&offset) {
+            //     println!("This had already been faulted hmmm at offst {offset:0x}");
+            //     return;
+            // }
 
             let bytes_written = uffd_handler.populate_via_write(offset, uffd_handler.page_size);
 
             if bytes_written == 0 {
-                println!(
-                    "got a vcpu fault for an already populated page at offset {}",
-                    offset
-                );
+                // println!(
+                //     "got a vcpu fault for an already populated page at offset {}",
+                //     offset
+                // );
             } else {
                 assert_eq!(bytes_written, uffd_handler.page_size);
             }
 
-            uffd_handler.faulted_pages.insert(offset);
+            // uffd_handler.faulted_pages.insert(offset);
         },
     );
 }

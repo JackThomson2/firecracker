@@ -351,12 +351,21 @@ pub struct Vmm {
     apf_stream: Option<UffdMessageBroker>
 }
 
-#[derive(Debug)]
 pub struct UffdMessageBroker {
     pub stream: UnixStream,
     read_buffer: [u8; 4096],
     write_buffer: [u8; 4096],
     current_pos: usize,
+    encode_buffer: bitcode::Buffer,
+}
+
+impl std::fmt::Debug for UffdMessageBroker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UffdMessageBroker")
+            .field("stream", &self.stream)
+            .field("current_pos", &self.current_pos)
+            .finish_non_exhaustive()
+    }
 }
 
 impl UffdMessageBroker {
@@ -366,12 +375,15 @@ impl UffdMessageBroker {
             read_buffer: [0; 4096],
             write_buffer: [0; 4096],
             current_pos: 0,
+            encode_buffer: bitcode::Buffer::new(),
         }
     }
 
     pub fn send_fault_request(&mut self, fault_request: FaultRequest) {
-        let size = bincode::encode_into_slice(fault_request, &mut self.write_buffer[4..], bincode::config::standard()).unwrap() as u32;
+        let encoded = self.encode_buffer.encode(&fault_request);
+        let size = encoded.len() as u32;
         self.write_buffer[..4].copy_from_slice(&size.to_le_bytes());
+        self.write_buffer[4..4 + encoded.len()].copy_from_slice(encoded);
 
         self.stream.write_all(&self.write_buffer[..4 + (size as usize)]).unwrap();
     }
@@ -414,7 +426,7 @@ impl Iterator for UffdMessageBroker {
         }
 
         let size = self.expected_size().unwrap() as usize;
-        let (found, _)  = bincode::decode_from_slice(&self.read_buffer[4..4 + size], bincode::config::standard()).unwrap();
+        let found = bitcode::decode(&self.read_buffer[4..4 + size]).unwrap();
 
         self.read_buffer.copy_within(4+size..self.current_pos, 0);
         self.current_pos -= 4 + size;
@@ -977,7 +989,9 @@ impl Vmm {
                     &fault_reply.gpa.unwrap(),
                 ))
                 .into_empty_result()
-                .unwrap()
+                .inspect_err(|err| {
+                    info!("Got error {err:?}");
+                });
             }
         }
     }

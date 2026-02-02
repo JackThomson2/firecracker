@@ -844,6 +844,7 @@ dependencies = [
  "libc",
  "log-instrument",
  "micro_http",
+ "rand",
  "regex",
  "seccompiler",
  "serde",

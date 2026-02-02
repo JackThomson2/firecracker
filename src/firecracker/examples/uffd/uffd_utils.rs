@@ -28,6 +28,7 @@ use std::thread::{sleep, spawn};
 use std::time::Duration;
 
 use async_channel::{unbounded, Sender};
+use rand::random_range;
 use serde::{Deserialize, Serialize};
 use serde_json::{Deserializer, StreamDeserializer};
 use smol::Timer;
@@ -93,7 +94,7 @@ pub struct GuestRegionUffdMapping {
     pub page_size: usize,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, bincode::Decode)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, bitcode::Decode)]
 pub struct FaultRequest {
     /// vCPU that encountered the fault
     pub vcpu: u32,
@@ -119,7 +120,7 @@ impl FaultRequest {
 }
 
 /// FaultReply
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, bincode::Encode)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, bitcode::Encode)]
 pub struct FaultReply {
     /// vCPU that encountered the fault, from `FaultRequest` (if present, otherwise 0)
     pub vcpu: Option<u32>,
@@ -146,7 +147,7 @@ pub enum UffdMsgFromFirecracker {
 }
 
 /// UffdMsgToFirecracker
-#[derive(Serialize, Deserialize, Debug, bincode::Encode)]
+#[derive(Serialize, Deserialize, Debug, bitcode::Encode)]
 #[serde(untagged)]
 pub enum UffdMsgToFirecracker {
     /// FaultRep
@@ -477,15 +478,13 @@ impl UffdHandler {
     }
 }
 
-struct UffdMsgIterBincode {
+struct UffdMsgIterBitcode {
     stream: Arc<Mutex<UnixStream>>,
     buffer: Vec<u8>,
     current_pos: usize,
 }
 
-const BINCODE_CONFIG:bincode::config::Configuration = bincode::config::standard();
-
-impl UffdMsgIterBincode {
+impl UffdMsgIterBitcode {
     fn new(stream: Arc<Mutex<UnixStream>>) -> Self {
         Self {
             stream,
@@ -511,7 +510,7 @@ impl UffdMsgIterBincode {
     }
 }
 
-impl Iterator for UffdMsgIterBincode {
+impl Iterator for UffdMsgIterBitcode {
     type Item = FaultRequest;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -528,7 +527,7 @@ impl Iterator for UffdMsgIterBincode {
         }
 
         let size = self.expected_size().unwrap() as usize;
-        let (found, _)  = bincode::decode_from_slice(&self.buffer[4..4 + size], BINCODE_CONFIG).unwrap();
+        let found = bitcode::decode(&self.buffer[4..4 + size]).unwrap();
 
         self.buffer.copy_within(4+size..self.current_pos, 0);
         self.current_pos -= 4 + size;
@@ -641,7 +640,6 @@ impl Iterator for UffdMsgIterator {
     }
 }
 
-#[derive(Debug)]
 pub struct Runtime {
     stream: Arc<Mutex<UnixStream>>,
     apf_stream: Arc<Mutex<UnixStream>>,
@@ -649,7 +647,16 @@ pub struct Runtime {
     backing_memory: *mut u8,
     backing_memory_size: usize,
     handler: UffdHandler,
-    message_buffer: [u8; 4096]
+    message_buffer: [u8; 4096],
+    encode_buffer: bitcode::Buffer,
+}
+
+impl std::fmt::Debug for Runtime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Runtime")
+            .field("backing_memory_size", &self.backing_memory_size)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Runtime {
@@ -681,12 +688,13 @@ impl Runtime {
 
         Self {
             stream,
-            apf_stream, //Arc::new(Mutex::new(apf_stream)),
+            apf_stream,
             backing_file,
             backing_memory: ret.cast(),
             backing_memory_size,
             handler,
             message_buffer: [0; 4096],
+            encode_buffer: bitcode::Buffer::new(),
         }
     }
 
@@ -728,19 +736,20 @@ impl Runtime {
     }
 
     pub fn send_fault_reply(&mut self, fault_reply: FaultReply, sender: &Sender<Vec<u8>>) {
-        let size = bincode::encode_into_slice(fault_reply, &mut self.message_buffer[4..], BINCODE_CONFIG).unwrap() as u32;
+        let encoded = self.encode_buffer.encode(&fault_reply);
+        let size = encoded.len() as u32;
         self.message_buffer[..4].copy_from_slice(&size.to_le_bytes());
+        self.message_buffer[4..4 + encoded.len()].copy_from_slice(encoded);
 
-        // self.stream.lock().unwrap().write_all(&self.message_buffer[..4 + (size as usize)]).unwrap();
         let data = Vec::from(&self.message_buffer[..4 + (size as usize)]);
         sender.send_blocking(data).unwrap();
     }
 
     pub fn send_apf_reply(&mut self, fault_reply: FaultReply, sender: &Sender<Vec<u8>>) {
-        let size = bincode::encode_into_slice(fault_reply, &mut self.message_buffer[4..], BINCODE_CONFIG).unwrap() as u32;
+        let encoded = self.encode_buffer.encode(&fault_reply);
+        let size = encoded.len() as u32;
         self.message_buffer[..4].copy_from_slice(&size.to_le_bytes());
-
-        // self.apf_stream.lock().unwrap().write_all(&self.message_buffer[..4 + (size as usize)]).unwrap();
+        self.message_buffer[4..4 + encoded.len()].copy_from_slice(encoded);
 
         let data = Vec::from(&self.message_buffer[..4 + (size as usize)]);
         sender.send_blocking(data).unwrap();
@@ -831,17 +840,18 @@ impl Runtime {
         });
 
         let mut uffd_msg_iter =
-            UffdMsgIterBincode::new(self.stream.clone());
+            UffdMsgIterBitcode::new(self.stream.clone());
 
         let mut apf_msg_iter =
-            UffdMsgIterBincode::new(self.apf_stream.clone());
+            UffdMsgIterBitcode::new(self.apf_stream.clone());
 
         let r_stream = self.stream.clone();
         let (r_send, r_recv) = unbounded::<Vec<u8>>();
         spawn(move || {
             smol::block_on(async {
                 while let Ok(message) = r_recv.recv().await {
-                    // Timer::after(Duration::from_millis(1)).await;
+                    // let delay = random_range(0..5000);
+                    // Timer::after(Duration::from_micros(delay)).await;
                     r_stream.lock().unwrap().write_all(&message).unwrap();
                 }
             });
@@ -852,11 +862,15 @@ impl Runtime {
         spawn(move || {
             smol::block_on(async {
                 while let Ok(message) = a_recv.recv().await {
-                    // Timer::after(Duration::from_millis(1)).await;
+                    // let delay = random_range(0..5000);
+                    // Timer::after(Duration::from_micros(delay)).await;
                     a_stream.lock().unwrap().write_all(&message).unwrap();
                 }
             });
         });
+
+        let mut apf_count = 0;
+        let mut no_apf_count = 0;
 
         let stream_fd = self.stream.lock().unwrap().as_raw_fd();
         let apf_fd = self.apf_stream.lock().unwrap().as_raw_fd();
@@ -886,7 +900,8 @@ impl Runtime {
                                 (fault_request.offset as usize) < self.handler.size(),
                                 "received bogus offset from firecracker"
                             );
-                            println!("Regular fault at offset {:0x}. CPU id: {:0x}", fault_request.offset, fault_request.vcpu);
+                            no_apf_count += 1;
+                            println!("Regular fault at offset {:0x}. CPU id: {:0x}. Count {no_apf_count}", fault_request.offset, fault_request.vcpu);
                             // Handle one of FaultRequest page faults
                             pf_vcpu_event_dispatch(
                                 &mut self.handler,
@@ -903,7 +918,9 @@ impl Runtime {
                                 (fault_request.offset as usize) < self.handler.size(),
                                 "received bogus offset from firecracker"
                             );
-                            println!("APF fault at offset {:0x}. CPU id: {:0x}", fault_request.offset, fault_request.vcpu);
+
+                            apf_count += 1;
+                            println!("APF fault at offset {:0x}. CPU id: {:0x}. Count {apf_count}", fault_request.offset, fault_request.vcpu);
                             // Handle one of FaultRequest page faults
                             pf_vcpu_event_dispatch(
                                 &mut self.handler,
