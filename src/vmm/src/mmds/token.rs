@@ -245,7 +245,7 @@ impl TokenAuthority {
 }
 
 /// Structure for token information.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 struct Token {
     // Nonce or Initialization Vector.
     iv: [u8; IV_LEN],
@@ -263,7 +263,7 @@ impl Token {
 
     /// Encode token structure into a string using base64 encoding.
     fn base64_encode(&self) -> Result<String, MmdsTokenError> {
-        let token_bytes: Vec<u8> = bitcode::serialize(self)?;
+        let token_bytes: Vec<u8> = bitcode::encode(self);
 
         // Encode token structure bytes into base64.
         Ok(base64::engine::general_purpose::STANDARD.encode(token_bytes))
@@ -281,7 +281,7 @@ impl Token {
         }
 
         let token: Token =
-            bitcode::deserialize(&token_bytes).map_err(|_| MmdsTokenError::ExpiryExtraction)?;
+            bitcode::decode(&token_bytes).map_err(|_| MmdsTokenError::ExpiryExtraction)?;
         Ok(token)
     }
 }
