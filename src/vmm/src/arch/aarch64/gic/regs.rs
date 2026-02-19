@@ -12,20 +12,20 @@ use serde::{Deserialize, Serialize};
 use crate::arch::aarch64::gic::GicError;
 use crate::arch::aarch64::gic::gicv3::regs::its_regs::ItsRegisterState;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct GicRegState<T> {
     pub(crate) chunks: Vec<T>,
 }
 
 /// Structure for serializing the state of the Vgic ICC regs
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct VgicSysRegsState {
     pub main_icc_regs: Vec<GicRegState<u64>>,
     pub ap_icc_regs: Vec<Option<GicRegState<u64>>>,
 }
 
 /// Structure used for serializing the state of the GIC registers.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct GicState {
     /// The state of the distributor registers.
     pub dist: Vec<GicRegState<u32>>,
@@ -36,7 +36,7 @@ pub struct GicState {
 }
 
 /// Structure used for serializing the state of the GIC registers for a specific vCPU.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct GicVcpuState {
     pub rdist: Vec<GicRegState<u32>>,
     pub icc: VgicSysRegsState,

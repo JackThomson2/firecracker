@@ -766,25 +766,25 @@ pub struct VcpuState {
     #[bitcode(with_serde)]
     pub saved_msrs: Vec<Msrs>,
     /// Debug regs.
-    #[bitcode(with_serde)]
+    #[bitcode(with_bytes)]
     pub debug_regs: kvm_debugregs,
     /// Lapic.
-    #[bitcode(with_serde)]
+    #[bitcode(with_bytes)]
     pub lapic: kvm_lapic_state,
     /// Mp state
-    #[bitcode(with_serde)]
+    #[bitcode(with_bytes)]
     pub mp_state: kvm_mp_state,
     /// Kvm regs.
-    #[bitcode(with_serde)]
+    #[bitcode(with_bytes)]
     pub regs: kvm_regs,
     /// Sregs.
-    #[bitcode(with_serde)]
+    #[bitcode(with_bytes)]
     pub sregs: kvm_sregs,
     /// Vcpu events
-    #[bitcode(with_serde)]
+    #[bitcode(with_bytes)]
     pub vcpu_events: kvm_vcpu_events,
     /// Xcrs.
-    #[bitcode(with_serde)]
+    #[bitcode(with_bytes)]
     pub xcrs: kvm_xcrs,
     /// Xsave.
     #[bitcode(with_serde)]

@@ -497,17 +497,20 @@ impl Peripherals {
 }
 
 /// Structure holding VCPU kvm state.
-#[derive(Default, Clone, Serialize, Deserialize)]
+#[derive(Default, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct VcpuState {
     /// Multiprocessing state.
+    #[bitcode(with_bytes)]
     pub mp_state: kvm_mp_state,
     /// Vcpu registers.
+    #[bitcode(with_serde)]
     pub regs: Aarch64RegisterVec,
     /// We will be using the mpidr for passing it to the VmState.
     /// The VmState will give this away for saving restoring the icc and redistributor
     /// registers.
     pub mpidr: u64,
     /// kvi states for vcpu initialization.
+    #[bitcode(with_bytes)]
     pub kvi: kvm_vcpu_init,
     /// ipa for steal_time region
     pub pvtime_ipa: Option<u64>,

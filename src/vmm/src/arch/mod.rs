@@ -42,7 +42,7 @@ pub use crate::arch::x86_64::{
 };
 
 /// Types of devices that can get attached to this platform.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Copy, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Copy, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub enum DeviceType {
     /// Device Type: Virtio.
     Virtio(u32),

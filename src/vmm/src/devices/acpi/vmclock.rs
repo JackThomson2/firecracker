@@ -148,7 +148,7 @@ pub struct VmClockState {
     /// GSI used for notifying the guest about device changes
     pub gsi: u32,
     /// Data we expose to the guest
-    #[bitcode(with_serde)]
+    #[bitcode(with_bytes)]
     pub inner: vmclock_abi,
 }
 

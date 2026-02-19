@@ -224,17 +224,17 @@ pub struct VmState {
     pub memory: GuestMemoryState,
     /// resource allocator
     pub resource_allocator: ResourceAllocator,
-    #[bitcode(with_serde)]
+    #[bitcode(with_bytes)]
     pitstate: kvm_pit_state2,
-    #[bitcode(with_serde)]
+    #[bitcode(with_bytes)]
     clock: kvm_clock_data,
     // TODO: rename this field to adopt inclusive language once Linux updates it, too.
-    #[bitcode(with_serde)]
+    #[bitcode(with_bytes)]
     pic_master: kvm_irqchip,
     // TODO: rename this field to adopt inclusive language once Linux updates it, too.
-    #[bitcode(with_serde)]
+    #[bitcode(with_bytes)]
     pic_slave: kvm_irqchip,
-    #[bitcode(with_serde)]
+    #[bitcode(with_bytes)]
     ioapic: kvm_irqchip,
 }
 

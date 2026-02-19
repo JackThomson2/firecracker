@@ -97,7 +97,7 @@ impl ArchVm {
 }
 
 /// Structure holding an general specific VM state.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct VmState {
     /// Guest memory state
     pub memory: GuestMemoryState,
