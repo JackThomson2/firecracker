@@ -30,7 +30,7 @@ pub enum PersistError {
 }
 
 /// Queue information saved in snapshot.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct QueueState {
     /// The maximal size in elements offered by the device
     max_size: u16,
@@ -50,10 +50,13 @@ pub struct QueueState {
     /// Guest physical address of the used ring
     used_ring: u64,
 
+    #[bitcode(with_serde)]
     next_avail: Wrapping<u16>,
+    #[bitcode(with_serde)]
     next_used: Wrapping<u16>,
 
     /// The number of added used buffers since last guest kick
+    #[bitcode(with_serde)]
     num_added: Wrapping<u16>,
 }
 
@@ -114,7 +117,7 @@ impl Persist<'_> for Queue {
 }
 
 /// State of a VirtioDevice.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct VirtioDeviceState {
     /// Device type.
     pub device_type: VirtioDeviceType,
@@ -191,7 +194,7 @@ impl VirtioDeviceState {
 }
 
 /// Transport information saved in snapshot.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct MmioTransportState {
     // The register where feature bits are stored.
     features_select: u32,

@@ -24,7 +24,7 @@ const BITS_PER_PBA_ENTRY: usize = 64;
 const FUNCTION_MASK_BIT: u8 = 14;
 const MSIX_ENABLE_BIT: u8 = 15;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, bitcode::Encode, bitcode::Decode)]
 /// MSI-X table entries
 pub struct MsixTableEntry {
     /// Lower 32 bits of the vector address
@@ -55,7 +55,7 @@ impl Default for MsixTableEntry {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 /// State for (de)serializing MSI-X configuration
 pub struct MsixConfigState {
     table_entries: Vec<MsixTableEntry>,

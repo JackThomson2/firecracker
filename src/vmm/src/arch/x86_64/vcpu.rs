@@ -757,27 +757,37 @@ impl Peripherals {
 }
 
 /// Structure holding VCPU kvm state.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct VcpuState {
     /// CpuId.
+    #[bitcode(with_serde)]
     pub cpuid: CpuId,
     /// Saved msrs.
+    #[bitcode(with_serde)]
     pub saved_msrs: Vec<Msrs>,
     /// Debug regs.
+    #[bitcode(with_serde)]
     pub debug_regs: kvm_debugregs,
     /// Lapic.
+    #[bitcode(with_serde)]
     pub lapic: kvm_lapic_state,
     /// Mp state
+    #[bitcode(with_serde)]
     pub mp_state: kvm_mp_state,
     /// Kvm regs.
+    #[bitcode(with_serde)]
     pub regs: kvm_regs,
     /// Sregs.
+    #[bitcode(with_serde)]
     pub sregs: kvm_sregs,
     /// Vcpu events
+    #[bitcode(with_serde)]
     pub vcpu_events: kvm_vcpu_events,
     /// Xcrs.
+    #[bitcode(with_serde)]
     pub xcrs: kvm_xcrs,
     /// Xsave.
+    #[bitcode(with_serde)]
     pub xsave: Xsave,
     /// Tsc khz.
     pub tsc_khz: Option<u32>,

@@ -66,7 +66,7 @@ pub(crate) struct ConfigSpace {
 unsafe impl ByteValued for ConfigSpace {}
 
 /// Holds state of the free page hinting run
-#[derive(Copy, Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Default, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub(crate) struct HintingState {
     /// The command requested by us. Set to STOP by default.
     pub host_cmd: u32,

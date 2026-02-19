@@ -62,7 +62,7 @@ pub enum MemoryError {
 }
 
 /// Type of the guest region
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub enum GuestRegionType {
     /// Guest DRAM
     Dram,
@@ -585,7 +585,7 @@ where
 }
 
 /// State of a guest memory region saved to file/buffer.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct GuestMemoryRegionState {
     // This should have been named `base_guest_addr` since it's _guest_ addr, but for
     // backward compatibility we have to keep this name. At least this comment should help.
@@ -600,7 +600,7 @@ pub struct GuestMemoryRegionState {
 }
 
 /// Describes guest memory regions and their snapshot file mappings.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct GuestMemoryState {
     /// List of regions.
     pub regions: Vec<GuestMemoryRegionState>,

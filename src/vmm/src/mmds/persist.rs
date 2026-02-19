@@ -14,7 +14,7 @@ use crate::snapshot::Persist;
 use crate::utils::net::mac::{MAC_ADDR_LEN, MacAddr};
 
 /// State of a MmdsNetworkStack.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct MmdsNetworkStackState {
     mac_addr: [u8; MAC_ADDR_LEN as usize],
     ipv4_addr: u32,

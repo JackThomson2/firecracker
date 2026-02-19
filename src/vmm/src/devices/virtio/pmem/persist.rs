@@ -14,7 +14,7 @@ use crate::vmm_config::pmem::PmemConfig;
 use crate::vstate::memory::{GuestMemoryMmap, GuestRegionMmap};
 use crate::vstate::vm::VmError;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct PmemState {
     pub virtio_state: VirtioDeviceState,
     pub config_space: ConfigSpace,

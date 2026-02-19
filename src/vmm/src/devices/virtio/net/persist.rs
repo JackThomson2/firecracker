@@ -24,14 +24,15 @@ use crate::vstate::memory::GuestMemoryMmap;
 
 /// Information about the network config's that are saved
 /// at snapshot.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct NetConfigSpaceState {
+    #[bitcode(with_serde)]
     guest_mac: Option<MacAddr>,
 }
 
 /// Information about the network device that are saved
 /// at snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct NetState {
     pub id: String,
     pub tap_if_name: String,

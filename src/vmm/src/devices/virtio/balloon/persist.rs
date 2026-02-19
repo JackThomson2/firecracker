@@ -19,7 +19,7 @@ use crate::vstate::memory::GuestMemoryMmap;
 
 /// Information about the balloon config's that are saved
 /// at snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct BalloonConfigSpaceState {
     num_pages: u32,
     actual_pages: u32,
@@ -27,7 +27,7 @@ pub struct BalloonConfigSpaceState {
 
 /// Information about the balloon stats that are saved
 /// at snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct BalloonStatsState {
     swap_in: Option<u64>,
     swap_out: Option<u64>,
@@ -97,7 +97,7 @@ impl BalloonStatsState {
 
 /// Information about the balloon that are saved
 /// at snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct BalloonState {
     stats_polling_interval_s: u16,
     stats_desc_index: Option<u16>,

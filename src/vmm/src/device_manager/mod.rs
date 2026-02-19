@@ -393,7 +393,7 @@ impl DeviceManager {
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 /// State of devices in the system
 pub struct DevicesState {
     /// MMIO devices state

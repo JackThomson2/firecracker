@@ -11,7 +11,7 @@ use crate::devices::virtio::transport::VirtioInterrupt;
 use crate::vstate::memory::GuestMemoryMmap;
 
 /// Block device state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub enum BlockState {
     Virtio(VirtioBlockState),
     VhostUser(VhostUserBlockState),

@@ -20,7 +20,7 @@ use crate::rate_limiter::persist::RateLimiterState;
 use crate::snapshot::Persist;
 
 /// Holds info about block's file engine type. Gets saved in snapshot.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub enum FileEngineTypeState {
     /// Sync File Engine.
     // If the snap version does not contain the `FileEngineType`, it must have been snapshotted
@@ -50,7 +50,7 @@ impl From<FileEngineTypeState> for FileEngineType {
 }
 
 /// Holds info about the block device. Gets saved in snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct VirtioBlockState {
     id: String,
     partuuid: Option<String>,

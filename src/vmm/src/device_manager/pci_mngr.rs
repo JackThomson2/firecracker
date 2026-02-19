@@ -222,7 +222,7 @@ impl PciDevices {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct VirtioDeviceState<T> {
     /// Device identifier
     pub device_id: String,
@@ -234,7 +234,7 @@ pub struct VirtioDeviceState<T> {
     pub transport_state: VirtioPciDeviceState,
 }
 
-#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct PciDevicesState {
     /// Whether PCI is enabled
     pub pci_enabled: bool,

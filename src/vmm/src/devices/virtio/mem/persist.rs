@@ -20,7 +20,7 @@ use crate::snapshot::Persist;
 use crate::utils::usize_to_u64;
 use crate::vstate::memory::{GuestMemoryMmap, GuestRegionMmap};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct VirtioMemState {
     pub virtio_state: VirtioDeviceState,
     addr: u64,

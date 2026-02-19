@@ -20,7 +20,7 @@ pub const DEFAULT_KERNEL_CMDLINE: &str = "reboot=k panic=1 nomodule 8250.nr_uart
 
 /// Strongly typed data structure used to configure the boot source of the
 /// microvm.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(deny_unknown_fields)]
 pub struct BootSourceConfig {
     /// Path of the kernel image.

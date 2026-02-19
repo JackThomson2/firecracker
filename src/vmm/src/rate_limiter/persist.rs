@@ -10,7 +10,7 @@ use super::*;
 use crate::snapshot::Persist;
 
 /// State for saving a TokenBucket.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct TokenBucketState {
     size: u64,
     one_time_burst: u64,
@@ -53,7 +53,7 @@ impl Persist<'_> for TokenBucket {
 }
 
 /// State for saving a RateLimiter.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct RateLimiterState {
     ops: Option<TokenBucketState>,
     bandwidth: Option<TokenBucketState>,

@@ -32,7 +32,7 @@ pub enum MachineConfigError {
 }
 
 /// Describes the possible (huge)page configurations for a microVM's memory.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub enum HugePageConfig {
     /// Do not use hugepages, e.g. back guest memory by 4K
     #[default]

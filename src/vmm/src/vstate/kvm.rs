@@ -89,7 +89,7 @@ impl Kvm {
 }
 
 /// Structure holding an general specific VM state.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct KvmState {
     /// Additional capabilities that were specified in cpu template.
     pub kvm_cap_modifiers: Vec<KvmCapability>,

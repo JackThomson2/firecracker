@@ -17,7 +17,7 @@ use crate::rate_limiter::persist::RateLimiterState;
 use crate::snapshot::Persist;
 use crate::vstate::memory::GuestMemoryMmap;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct EntropyState {
     pub virtio_state: VirtioDeviceState,
     rate_limiter_state: RateLimiterState,

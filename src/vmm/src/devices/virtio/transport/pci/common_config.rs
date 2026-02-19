@@ -21,7 +21,7 @@ use crate::logger::warn;
 
 pub const VIRTIO_PCI_COMMON_CONFIG_ID: &str = "virtio_pci_common_config";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct VirtioPciCommonConfigState {
     pub driver_status: u8,
     pub config_generation: u8,

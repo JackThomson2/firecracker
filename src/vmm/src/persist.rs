@@ -44,7 +44,7 @@ use crate::vstate::vm::{VmError, VmState};
 use crate::{EventManager, Vmm, vstate};
 
 /// Holds information related to the VM that is not part of VmState.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize, bitcode::Encode, bitcode::Decode)]
 pub struct VmInfo {
     /// Guest memory size.
     pub mem_size_mib: u64,
@@ -84,7 +84,7 @@ impl From<&Vmm> for VmInfo {
 }
 
 /// Contains the necessary state for saving/restoring a microVM.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct MicrovmState {
     /// Miscellaneous VM info.
     pub vm_info: VmInfo,
@@ -172,7 +172,7 @@ pub fn create_snapshot(
         .save_state(vm_info)
         .map_err(CreateSnapshotError::MicrovmState)?;
 
-    snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
+    snapshot_state_to_file(microvm_state, &params.snapshot_path)?;
 
     vmm.vm
         .snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
@@ -187,7 +187,7 @@ pub fn create_snapshot(
 }
 
 fn snapshot_state_to_file(
-    microvm_state: &MicrovmState,
+    microvm_state: MicrovmState,
     snapshot_path: &Path,
 ) -> Result<(), CreateSnapshotError> {
     use self::CreateSnapshotError::*;

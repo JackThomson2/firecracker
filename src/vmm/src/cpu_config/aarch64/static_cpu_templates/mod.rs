@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 pub mod v1n1;
 
 /// Templates available for configuring the supported ARM CPU types.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub enum StaticCpuTemplate {
     /// Template to mask Neoverse-V1 as Neoverse-N1
     V1N1,

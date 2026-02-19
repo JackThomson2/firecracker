@@ -30,7 +30,6 @@ use std::io::{Read, Write};
 
 use crc64::crc64;
 use semver::Version;
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::persist::SNAPSHOT_VERSION;
@@ -65,17 +64,18 @@ pub enum SnapshotError {
     SizeLimitExceeded(usize),
 }
 
-fn serialize<S: Serialize, W: Write>(data: &S, write: &mut W) -> Result<(), SnapshotError> {
-    let encoded = bitcode::serialize(data)?;
+fn serialize<S: bitcode::Encode, W: Write>(data: &Snapshot<S>, write: &mut W) -> Result<(), SnapshotError> {
+    let encoded = bitcode::encode(data);
     write.write_all(&encoded).map_err(SnapshotError::Io)
 }
 
 /// Firecracker snapshot header
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 struct SnapshotHdr {
     /// magic value
     magic: u64,
     /// Snapshot data version
+    #[bitcode(with_serde)]
     version: Version,
 }
 
@@ -109,7 +109,7 @@ pub fn get_format_version<R: Read>(reader: &mut R) -> Result<Version, SnapshotEr
     // in Firecracker use MicrovmState as the data type.
     use crate::persist::MicrovmState;
 
-    match bitcode::deserialize::<Snapshot<MicrovmState>>(data_buf) {
+    match bitcode::decode::<Snapshot<MicrovmState>>(data_buf) {
         Ok(snapshot) => Ok(snapshot.header.version),
         Err(e) => {
             // If deserialization fails, it could be due to:
@@ -125,7 +125,7 @@ pub fn get_format_version<R: Read>(reader: &mut R) -> Result<Version, SnapshotEr
 /// Firecracker snapshot type
 ///
 /// A type used to store and load Firecracker snapshots of a particular version
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct Snapshot<Data> {
     header: SnapshotHdr,
     /// The data stored int his [`Snapshot`]
@@ -150,7 +150,7 @@ impl<Data> Snapshot<Data> {
     }
 }
 
-impl<Data: DeserializeOwned> Snapshot<Data> {
+impl<Data: for<'a> bitcode::Decode<'a>> Snapshot<Data> {
     pub(crate) fn load_without_crc_check(buf: &[u8]) -> Result<Self, SnapshotError> {
         // Check size limit to prevent DOS attacks
         if buf.len() > SNAPSHOT_DESERIALIZATION_BYTES_LIMIT {
@@ -159,7 +159,7 @@ impl<Data: DeserializeOwned> Snapshot<Data> {
             ));
         }
 
-        let snapshot: Self = bitcode::deserialize(buf)?;
+        let snapshot: Self = bitcode::decode(buf)?;
 
         // Validate the header
         if snapshot.header.magic != SNAPSHOT_MAGIC_ID {
@@ -214,7 +214,7 @@ impl<Data: DeserializeOwned> Snapshot<Data> {
     }
 }
 
-impl<Data: Serialize> Snapshot<Data> {
+impl<Data: bitcode::Encode> Snapshot<Data> {
     /// Saves `self` to the given [`Write`] instance, computing the CRC of the written data,
     /// and then writing the CRC into the `Write` instance, too.
     pub fn save<W: Write>(&self, writer: &mut W) -> Result<(), SnapshotError> {
@@ -284,8 +284,7 @@ mod tests {
         let mut bad_snapshot = Snapshot::new(());
         bad_snapshot.header.magic = 0xDEADBEEF;
 
-        // Serialize the bad snapshot (without CRC for load_without_crc_check)
-        let corrupted_data = bitcode::serialize(&bad_snapshot).unwrap();
+        let corrupted_data = bitcode::encode(&bad_snapshot);
 
         assert!(matches!(
             Snapshot::<()>::load_without_crc_check(&corrupted_data),
@@ -319,7 +318,7 @@ mod tests {
         // Different major version: shouldn't work
         let mut bad_snapshot = Snapshot::new(());
         bad_snapshot.header.version.major = SNAPSHOT_VERSION.major + 1;
-        let data = bitcode::serialize(&bad_snapshot).unwrap();
+        let data = bitcode::encode(&bad_snapshot);
 
         assert!(matches!(
             Snapshot::<()>::load_without_crc_check(&data),
@@ -329,7 +328,7 @@ mod tests {
         //  minor > SNAPSHOT_VERSION.minor: shouldn't work
         let mut bad_snapshot = Snapshot::new(());
         bad_snapshot.header.version.minor = SNAPSHOT_VERSION.minor + 1;
-        let data = bitcode::serialize(&bad_snapshot).unwrap();
+        let data = bitcode::encode(&bad_snapshot);
         assert!(matches!(
             Snapshot::<()>::load_without_crc_check(&data),
             Err(SnapshotError::InvalidFormatVersion(v)) if v.minor == SNAPSHOT_VERSION.minor + 1
@@ -338,29 +337,29 @@ mod tests {
         // But we can support minor versions smaller or equal to ours. We also support
         // all patch versions within our supported major.minor version.
         let snapshot = Snapshot::new(());
-        let data = bitcode::serialize(&snapshot).unwrap();
+        let data = bitcode::encode(&snapshot);
         Snapshot::<()>::load_without_crc_check(&data).unwrap();
 
         if SNAPSHOT_VERSION.minor != 0 {
             let mut snapshot = Snapshot::new(());
             snapshot.header.version.minor = SNAPSHOT_VERSION.minor - 1;
-            let data = bitcode::serialize(&snapshot).unwrap();
+            let data = bitcode::encode(&snapshot);
             Snapshot::<()>::load_without_crc_check(&data).unwrap();
         }
 
         let mut snapshot = Snapshot::new(());
         snapshot.header.version.patch = 0;
-        let data = bitcode::serialize(&snapshot).unwrap();
+        let data = bitcode::encode(&snapshot);
         Snapshot::<()>::load_without_crc_check(&data).unwrap();
 
         let mut snapshot = Snapshot::new(());
         snapshot.header.version.patch = SNAPSHOT_VERSION.patch + 1;
-        let data = bitcode::serialize(&snapshot).unwrap();
+        let data = bitcode::encode(&snapshot);
         Snapshot::<()>::load_without_crc_check(&data).unwrap();
 
         let mut snapshot = Snapshot::new(());
         snapshot.header.version.patch = 1024;
-        let data = bitcode::serialize(&snapshot).unwrap();
+        let data = bitcode::encode(&snapshot);
         Snapshot::<()>::load_without_crc_check(&data).unwrap();
     }
 }

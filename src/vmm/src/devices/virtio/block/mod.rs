@@ -11,7 +11,7 @@ pub mod vhost_user;
 pub mod virtio;
 
 /// Configuration options for disk caching.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize, bitcode::Encode, bitcode::Decode)]
 pub enum CacheType {
     /// Flushing mechanic not will be advertised to the guest driver
     #[default]

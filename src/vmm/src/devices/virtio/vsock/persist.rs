@@ -17,7 +17,7 @@ use crate::snapshot::Persist;
 use crate::vstate::memory::GuestMemoryMmap;
 
 /// The Vsock serializable state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct VsockState {
     /// The vsock backend state.
     pub backend: VsockBackendState,
@@ -26,7 +26,7 @@ pub struct VsockState {
 }
 
 /// The Vsock frontend serializable state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct VsockFrontendState {
     /// Context Identifier.
     pub cid: u64,
@@ -34,7 +34,7 @@ pub struct VsockFrontendState {
 }
 
 /// The Vsock Unix Backend serializable state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct VsockBackendState {
     /// The path for the UDS socket.
     pub uds_path: String,

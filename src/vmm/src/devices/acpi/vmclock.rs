@@ -141,13 +141,14 @@ impl VmClock {
 /// (De)serialize-able state of the [`VmClock`]
 ///
 /// We could avoid this and reuse [`VmClock`] itself if `GuestAddress` was `Serialize`/`Deserialize`
-#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct VmClockState {
     /// Guest address in which we write the [`VmClock`] info
     pub guest_address: u64,
     /// GSI used for notifying the guest about device changes
     pub gsi: u32,
     /// Data we expose to the guest
+    #[bitcode(with_serde)]
     pub inner: vmclock_abi,
 }
 

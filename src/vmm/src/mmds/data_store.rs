@@ -21,7 +21,7 @@ pub struct Mmds {
 }
 
 /// MMDS version.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize, bitcode::Encode, bitcode::Decode)]
 pub enum MmdsVersion {
     #[default]
     /// MMDS version 1

@@ -235,8 +235,9 @@ const NOTIFY_OFF_MULTIPLIER: u32 = 4; // A dword per notification address.
 const VIRTIO_PCI_VENDOR_ID: u16 = 0x1af4;
 const VIRTIO_PCI_DEVICE_ID_BASE: u16 = 0x1040; // Add to device type to get device ID.
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct VirtioPciDeviceState {
+    #[bitcode(with_serde)]
     pub pci_device_bdf: PciBdf,
     pub device_activated: bool,
     pub cap_pci_cfg_offset: usize,

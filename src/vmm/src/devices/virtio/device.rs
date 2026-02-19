@@ -58,7 +58,7 @@ impl DeviceState {
 /// All used types fit in u8.
 #[allow(clippy::cast_possible_truncation)]
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub enum VirtioDeviceType {
     Net = virtio_ids::VIRTIO_ID_NET as u8,
     Block = virtio_ids::VIRTIO_ID_BLOCK as u8,

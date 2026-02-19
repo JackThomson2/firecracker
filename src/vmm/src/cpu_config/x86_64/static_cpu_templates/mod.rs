@@ -22,7 +22,7 @@ pub mod t2s;
 
 /// Template types available for configuring the x86 CPU features that map
 /// to EC2 instances.
-#[derive(Debug, Default, Display, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Display, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub enum StaticCpuTemplate {
     /// C3 Template.
     #[display("C3")]

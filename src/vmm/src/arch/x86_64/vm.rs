@@ -217,19 +217,24 @@ impl ArchVm {
     }
 }
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Default, Deserialize, Serialize, bitcode::Encode, bitcode::Decode)]
 /// Structure holding VM kvm state.
 pub struct VmState {
     /// guest memory state
     pub memory: GuestMemoryState,
     /// resource allocator
     pub resource_allocator: ResourceAllocator,
+    #[bitcode(with_serde)]
     pitstate: kvm_pit_state2,
+    #[bitcode(with_serde)]
     clock: kvm_clock_data,
     // TODO: rename this field to adopt inclusive language once Linux updates it, too.
+    #[bitcode(with_serde)]
     pic_master: kvm_irqchip,
     // TODO: rename this field to adopt inclusive language once Linux updates it, too.
+    #[bitcode(with_serde)]
     pic_slave: kvm_irqchip,
+    #[bitcode(with_serde)]
     ioapic: kvm_irqchip,
 }
 

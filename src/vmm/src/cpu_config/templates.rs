@@ -104,7 +104,7 @@ impl TryFrom<&str> for CustomCpuTemplate {
 /// Struct to represent user defined kvm capability.
 /// Users can add or remove kvm capabilities to be checked
 /// by FC in addition to those FC checks by default.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, bitcode::Encode, bitcode::Decode)]
 pub enum KvmCapability {
     /// Add capability to the check list.
     Add(u32),

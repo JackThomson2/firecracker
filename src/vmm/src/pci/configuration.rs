@@ -58,7 +58,7 @@ fn decode_64_bits_bar_size(bar_size_hi: u32, bar_size_lo: u32) -> u64 {
     size
 }
 
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 struct PciBar {
     addr: u32,
     size: u32,
@@ -66,7 +66,7 @@ struct PciBar {
 }
 
 /// PCI configuration space state for (de)serialization
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct PciConfigurationState {
     registers: Vec<u32>,
     writable_bits: Vec<u32>,

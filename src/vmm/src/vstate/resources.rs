@@ -40,19 +40,25 @@ fn allocate_many_ids(
 /// * GSIs for legacy x86_64 devices
 /// * GSIs for MMIO devicecs
 /// * Memory allocations in the MMIO address space
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct ResourceAllocator {
     /// Allocator for legacy device interrupt lines
+    #[bitcode(with_serde)]
     pub gsi_legacy_allocator: IdAllocator,
     /// Allocator for PCI device GSIs
+    #[bitcode(with_serde)]
     pub gsi_msi_allocator: IdAllocator,
     /// Allocator for memory in the 32-bit MMIO address space
+    #[bitcode(with_serde)]
     pub mmio32_memory: AddressAllocator,
     /// Allocator for memory in the 64-bit MMIO address space
+    #[bitcode(with_serde)]
     pub mmio64_memory: AddressAllocator,
     /// Allocator for memory after the 64-bit MMIO address space
+    #[bitcode(with_serde)]
     pub past_mmio64_memory: AddressAllocator,
     /// Memory allocator for system data
+    #[bitcode(with_serde)]
     pub system_memory: AddressAllocator,
 }
 

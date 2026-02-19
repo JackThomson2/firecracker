@@ -92,7 +92,7 @@ pub enum DevicePersistError {
 }
 
 /// Holds the state of a MMIO VirtIO device
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct VirtioDeviceState<T> {
     /// Device identifier.
     pub device_id: String,
@@ -106,7 +106,7 @@ pub struct VirtioDeviceState<T> {
 
 /// Holds the state of a legacy device connected to the MMIO space.
 #[cfg(target_arch = "aarch64")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct ConnectedLegacyState {
     /// Device identifier.
     pub type_: DeviceType,
@@ -114,14 +114,14 @@ pub struct ConnectedLegacyState {
     pub device_info: MMIODeviceInfo,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct MmdsState {
     pub version: MmdsVersion,
     pub imds_compat: bool,
 }
 
 /// Holds the device states.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct DeviceStates {
     #[cfg(target_arch = "aarch64")]
     // State of legacy devices in MMIO space.
@@ -164,7 +164,7 @@ impl fmt::Debug for MMIODevManagerConstructorArgs<'_> {
     }
 }
 
-#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct ACPIDeviceManagerState {
     vmgenid: VMGenIDState,
     vmclock: VmClockState,

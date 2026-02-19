@@ -62,7 +62,7 @@ pub enum MmioError {
 pub const MMIO_LEN: u64 = 0x1000;
 
 /// Stores the address range and irq allocated to this device.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct MMIODeviceInfo {
     /// Mmio address at which the device is registered.
     pub addr: u64,

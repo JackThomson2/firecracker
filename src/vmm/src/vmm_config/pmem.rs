@@ -21,7 +21,7 @@ pub enum PmemConfigError {
 }
 
 /// Use this structure to setup a Pmem device before boothing the kernel.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 #[serde(deny_unknown_fields)]
 pub struct PmemConfig {
     /// Unique identifier of the device.
