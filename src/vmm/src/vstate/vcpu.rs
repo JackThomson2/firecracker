@@ -421,7 +421,7 @@ fn handle_kvm_exit(
         Ok(run) => match run {
             VcpuExit::MmioRead(addr, data) => {
                 if let Some(mmio_bus) = &peripherals.mmio_bus {
-                    let _metric = METRICS.vcpu.exit_mmio_read_agg.record_latency_metrics();
+                    // let _metric = METRICS.vcpu.exit_mmio_read_agg.record_latency_metrics();
                     if let Err(err) = mmio_bus.read(addr, data) {
                         warn!("Invalid MMIO read @ {addr:#x}:{:#x}: {err}", data.len());
                     }
@@ -431,7 +431,7 @@ fn handle_kvm_exit(
             }
             VcpuExit::MmioWrite(addr, data) => {
                 if let Some(mmio_bus) = &peripherals.mmio_bus {
-                    let _metric = METRICS.vcpu.exit_mmio_write_agg.record_latency_metrics();
+                    // let _metric = METRICS.vcpu.exit_mmio_write_agg.record_latency_metrics();
                     if let Err(err) = mmio_bus.write(addr, data) {
                         warn!("Invalid MMIO read @ {addr:#x}:{:#x}: {err}", data.len());
                     }
