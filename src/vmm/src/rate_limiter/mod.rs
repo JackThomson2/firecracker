@@ -458,6 +458,16 @@ impl RateLimiter {
         self.timer_active
     }
 
+    /// Returns whether this rate limiter has no configured limits.
+    ///
+    /// A rate limiter is a no-op when both the bandwidth and ops buckets are
+    /// disabled (i.e. `None`). In this state, `consume()` always returns `true`
+    /// without doing any work, so callers can skip the call entirely.
+    #[inline(always)]
+    pub fn is_noop(&self) -> bool {
+        self.bandwidth.is_none() && self.ops.is_none()
+    }
+
     /// This function needs to be called every time there is an event on the
     /// FD provided by this object's `AsRawFd` trait implementation.
     ///

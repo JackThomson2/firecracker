@@ -431,7 +431,9 @@ impl Net {
     // Returns true on successful frame delivery.
     pub fn rate_limited_rx_single_frame(&mut self, frame_size: u32) -> bool {
         let rx_queue = &mut self.queues[RX_INDEX];
-        if !Self::rate_limiter_consume_op(&mut self.rx_rate_limiter, frame_size as u64) {
+        if !self.rx_rate_limiter.is_noop()
+            && !Self::rate_limiter_consume_op(&mut self.rx_rate_limiter, frame_size as u64)
+        {
             self.metrics.rx_rate_limiter_throttled.inc();
             return false;
         }
@@ -497,7 +499,7 @@ impl Net {
     // Returns whether MMDS consumed the frame.
     fn write_to_mmds_or_tap(
         mmds_ns: Option<&mut MmdsNetworkStack>,
-        rate_limiter: &mut RateLimiter,
+        rate_limiter: Option<&mut RateLimiter>,
         headers: &mut [u8],
         frame_iovec: &IoVecBuffer,
         tap: &mut Tap,
@@ -532,7 +534,9 @@ impl Net {
             METRICS.mmds.rx_accepted.inc();
 
             // MMDS frames are not accounted by the rate limiter.
-            Self::rate_limiter_replenish_op(rate_limiter, u64::from(frame_iovec.len()));
+            if let Some(rl) = rate_limiter {
+                Self::rate_limiter_replenish_op(rl, u64::from(frame_iovec.len()));
+            }
 
             // MMDS consumed the frame.
             return Ok(true);
@@ -714,10 +718,12 @@ impl Net {
                 continue;
             }
 
-            if !Self::rate_limiter_consume_op(
-                &mut self.tx_rate_limiter,
-                u64::from(self.tx_buffer.len()),
-            ) {
+            if !self.tx_rate_limiter.is_noop()
+                && !Self::rate_limiter_consume_op(
+                    &mut self.tx_rate_limiter,
+                    u64::from(self.tx_buffer.len()),
+                )
+            {
                 tx_queue.undo_pop();
                 self.metrics.tx_rate_limiter_throttled.inc();
                 break;
@@ -725,7 +731,11 @@ impl Net {
 
             let frame_consumed_by_mmds = Self::write_to_mmds_or_tap(
                 self.mmds_ns.as_mut(),
-                &mut self.tx_rate_limiter,
+                if self.tx_rate_limiter.is_noop() {
+                    None
+                } else {
+                    Some(&mut self.tx_rate_limiter)
+                },
                 &mut self.tx_frame_headers,
                 &self.tx_buffer,
                 &mut self.tap,
@@ -1972,7 +1982,7 @@ pub mod tests {
             assert!(
                 Net::write_to_mmds_or_tap(
                     net.mmds_ns.as_mut(),
-                    &mut net.tx_rate_limiter,
+                    Some(&mut net.tx_rate_limiter),
                     &mut headers,
                     &buffer,
                     &mut net.tap,
@@ -2011,7 +2021,7 @@ pub mod tests {
             0,
             Net::write_to_mmds_or_tap(
                 net.mmds_ns.as_mut(),
-                &mut net.tx_rate_limiter,
+                Some(&mut net.tx_rate_limiter),
                 &mut headers,
                 &buffer,
                 &mut net.tap,
@@ -2026,7 +2036,7 @@ pub mod tests {
             1,
             Net::write_to_mmds_or_tap(
                 net.mmds_ns.as_mut(),
-                &mut net.tx_rate_limiter,
+                Some(&mut net.tx_rate_limiter),
                 &mut headers,
                 &buffer,
                 &mut net.tap,
