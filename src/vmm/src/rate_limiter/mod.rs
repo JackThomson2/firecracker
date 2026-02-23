@@ -119,6 +119,7 @@ impl TokenBucket {
 
     // Replenishes token bucket based on elapsed time. Should only be called internally by `Self`.
     #[allow(clippy::cast_possible_truncation)]
+    #[inline]
     fn auto_replenish(&mut self) {
         // Compute time passed since last refill/update.
         let now = Instant::now();
@@ -172,6 +173,7 @@ impl TokenBucket {
     }
 
     /// Attempts to consume `tokens` from the bucket and returns whether the action succeeded.
+    #[inline]
     pub fn reduce(&mut self, mut tokens: u64) -> BucketReduction {
         // First things first: consume the one-time-burst budget.
         if self.one_time_burst > 0 {
@@ -219,6 +221,7 @@ impl TokenBucket {
     }
 
     /// "Manually" adds tokens to bucket.
+    #[inline]
     pub fn force_replenish(&mut self, tokens: u64) {
         // This means we are still during the burst interval.
         // Of course there is a very small chance  that the last reduce() also used up burst
@@ -385,6 +388,7 @@ impl RateLimiter {
     /// Attempts to consume tokens and returns whether that is possible.
     ///
     /// If rate limiting is disabled on provided `token_type`, this function will always succeed.
+    #[inline]
     pub fn consume(&mut self, tokens: u64, token_type: TokenType) -> bool {
         // If the timer is active, we can't consume tokens from any bucket and the function fails.
         if self.timer_active {
@@ -437,6 +441,7 @@ impl RateLimiter {
     ///
     /// Can be used to *manually* add tokens to a bucket. Useful for reverting a
     /// `consume()` if needed.
+    #[inline]
     pub fn manual_replenish(&mut self, tokens: u64, token_type: TokenType) {
         // Identify the required token bucket.
         let token_bucket = match token_type {

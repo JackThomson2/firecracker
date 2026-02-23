@@ -407,6 +407,7 @@ impl Net {
     }
 
     // Helper function to consume one op with `size` bytes from a rate limiter
+    #[inline]
     fn rate_limiter_consume_op(rate_limiter: &mut RateLimiter, size: u64) -> bool {
         if !rate_limiter.consume(1, TokenType::Ops) {
             return false;
@@ -421,6 +422,7 @@ impl Net {
     }
 
     // Helper function to replenish one operation with `size` bytes from a rate limiter
+    #[inline]
     fn rate_limiter_replenish_op(rate_limiter: &mut RateLimiter, size: u64) {
         rate_limiter.manual_replenish(1, TokenType::Ops);
         rate_limiter.manual_replenish(size, TokenType::Bytes);
