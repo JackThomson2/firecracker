@@ -11,3 +11,5 @@ pub mod vcpu;
 pub mod vm;
 /// Module for guest memfd
 pub mod guest_memfd;
+/// Module for exitless async page fault support
+pub mod exitless_apf;

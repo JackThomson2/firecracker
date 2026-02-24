@@ -30,7 +30,7 @@ use crate::vstate::memory::{
     Address, GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion,
     GuestRegionMmap, MaybeBounce,
 };
-use crate::vstate::vcpu::VcpuError;
+use crate::vstate::vcpu::{SharedApfStream, VcpuError};
 use crate::{DirtyBitmap, Vcpu, mem_size_mib};
 
 pub(crate) const GUEST_MEMFD_FLAG_SUPPORT_SHARED: u64 = 1 << 0;
@@ -46,6 +46,9 @@ pub struct UserfaultData {
     /// Size
     pub size: u64,
 }
+
+/// Shared guest memory reference for GPA to offset conversion
+pub type SharedGuestMemory = std::sync::Arc<std::sync::RwLock<GuestMemoryMmap>>;
 
 /// Architecture independent parts of a VM.
 #[derive(Debug)]
@@ -170,6 +173,7 @@ impl Vm {
         vcpu_count: u8,
         secret_free: bool,
         writer: &File,
+        apf_stream: Option<SharedApfStream>,
     ) -> Result<(Vec<Vcpu>, EventFd), VmError> {
         self.arch_pre_create_vcpus(vcpu_count)?;
 
@@ -185,7 +189,7 @@ impl Vm {
                 None
             };
 
-            let vcpu = Vcpu::new(cpu_idx, self, exit_evt, userfault_resolved, vcpu_writer)
+            let vcpu = Vcpu::new(cpu_idx, self, exit_evt, userfault_resolved, vcpu_writer, apf_stream.clone())
                 .map_err(VmError::CreateVcpu)?;
             vcpus.push(vcpu);
         }
@@ -354,6 +358,7 @@ impl Vm {
             }
         }
 
+        // Update guest memory
         self.common.guest_memory = new_guest_memory;
 
         Ok(())
@@ -515,6 +520,8 @@ fn mincore_bitmap(region: &GuestRegionMmap) -> Result<Vec<u64>, VmError> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::os::fd::FromRawFd;
+
     use vm_memory::GuestAddress;
     use vm_memory::mmap::MmapRegionBuilder;
 
@@ -633,7 +640,12 @@ pub(crate) mod tests {
         let vcpu_count = 2;
         let (_, mut vm) = setup_vm_with_memory(mib_to_bytes(128));
 
-        let (vcpu_vec, _) = vm.create_vcpus(vcpu_count, false).unwrap();
+        let (vcpu_vec, _) = {
+            let (_, writer_fd) = crate::builder::pipe2(libc::O_NONBLOCK).unwrap();
+            // SAFETY: writer_fd is valid
+            let writer = unsafe { std::fs::File::from_raw_fd(writer_fd) };
+            vm.create_vcpus(vcpu_count, false, &writer, None).unwrap()
+        };
 
         assert_eq!(vcpu_vec.len(), vcpu_count as usize);
     }

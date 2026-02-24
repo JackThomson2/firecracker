@@ -42,6 +42,7 @@ fn main() {
 
     let mut runtime = Runtime::new(stream, file, apf_stream);
     runtime.install_panic_hook();
+
     runtime.run(
         |uffd_handler: &mut UffdHandler| {
             // Read an event from the userfaultfd.

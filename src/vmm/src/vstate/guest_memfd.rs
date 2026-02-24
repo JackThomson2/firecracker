@@ -16,7 +16,7 @@ use kvm_ioctls::VmFd;
 use vm_memory::{Address, GuestMemory, GuestMemoryRegion};
 use vmm_sys_util::ioctl::{ioctl_with_mut_ref, ioctl_with_ref};
 use vmm_sys_util::syscall::SyscallReturnCode;
-use vmm_sys_util::{ioctl_ioc_nr, ioctl_ior_nr, ioctl_iow_nr, ioctl_iowr_nr};
+use vmm_sys_util::{ioctl_ior_nr, ioctl_iow_nr, ioctl_iowr_nr};
 
 use crate::builder::StartMicrovmError;
 use crate::vstate::memory::{GuestRegionMmap, MemoryError};
@@ -85,15 +85,6 @@ pub struct kvm_memory_attributes {
     pub flags: u64,
 }
 
-#[allow(non_camel_case_types)]
-#[repr(C)]
-#[derive(Copy, Clone, Default, Debug)]
-pub struct kvm_async_pf_ready {
-    pub gpa: u64,
-    pub token: u32,
-    pub notpresent_injected: u32,
-}
-
 use std::os::raw::c_void;
 
 #[allow(non_camel_case_types)]
@@ -124,14 +115,11 @@ ioctl_iow_nr!(
     kvm_memory_attributes
 );
 
-// VM ioctl used to notify about async page ready
-ioctl_iow_nr!(KVM_ASYNC_PF_READY, KVMIO, 0xd6, kvm_async_pf_ready);
-
-// VM ioctl used to notify about async page ready
-ioctl_iow_nr!(KVM_GUEST_MEMFD_COPY, KVMIO, 0xd7, kvm_guest_memfd_copy);
+// VM ioctl used to copy into guest memfd
+ioctl_iow_nr!(KVM_GUEST_MEMFD_COPY, KVMIO, 0xda, kvm_guest_memfd_copy);
 
 // VM ioctl to prefault SPTEs
-ioctl_iowr_nr!(KVM_PRE_FAULT_MEMORY, KVMIO, 0xd8, kvm_pre_fault_memory);
+ioctl_iowr_nr!(KVM_PRE_FAULT_MEMORY, KVMIO, 0xd5, kvm_pre_fault_memory);
 
 #[allow(non_camel_case_types)]
 #[repr(C)]

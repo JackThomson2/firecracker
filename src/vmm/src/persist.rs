@@ -39,7 +39,7 @@ use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, Mach
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory;
-use crate::vstate::memory::{GuestMemoryState, GuestRegionMmap, MemoryError};
+use crate::vstate::memory::{GuestMemoryState, GuestRegionMmap, MemoryError, GuestMemoryRegion};
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::{VmError, VmState};
 use crate::{EventManager, Vmm, vstate};
@@ -108,6 +108,8 @@ pub struct GuestRegionUffdMapping {
     pub size: usize,
     /// Offset in the backend file/buffer where the region contents are.
     pub offset: u64,
+    /// Guest physical address start for this region.
+    pub gpa_start: u64,
     /// The configured page size for this memory region.
     pub page_size: usize,
     /// Tracks if is guest memfd
@@ -610,6 +612,7 @@ fn create_guest_memory(
             base_host_virt_addr: mem_region.as_ptr() as u64,
             size: mem_region.size(),
             offset,
+            gpa_start: mem_region.start_addr().0,
             page_size: huge_pages.page_size(),
             page_size_kib: huge_pages.page_size(),
             is_guest_memfd,
@@ -814,15 +817,19 @@ mod tests {
                 base_host_virt_addr: 0,
                 size: 0x100000,
                 offset: 0,
+                gpa_start: 0,
                 page_size: HugePageConfig::None.page_size(),
                 page_size_kib: HugePageConfig::None.page_size(),
+                is_guest_memfd: false,
             },
             GuestRegionUffdMapping {
                 base_host_virt_addr: 0x100000,
                 size: 0x200000,
-                offset: 0,
+                offset: 0x100000,
+                gpa_start: 0x100000,
                 page_size: HugePageConfig::Hugetlbfs2M.page_size(),
                 page_size_kib: HugePageConfig::Hugetlbfs2M.page_size(),
+                is_guest_memfd: false,
             },
         ];
 

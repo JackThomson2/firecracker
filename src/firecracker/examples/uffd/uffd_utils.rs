@@ -13,7 +13,7 @@
 
 mod userfault_bitmap;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -22,7 +22,7 @@ use std::os::fd::RawFd;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::net::UnixStream;
 use std::ptr;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{sleep, spawn};
 use std::time::Duration;
@@ -48,6 +48,134 @@ struct uffdio_continue {
 }
 
 ioctl_iowr_nr!(UFFDIO_CONTINUE, 0xAA, 0x7, uffdio_continue);
+
+// Exitless APF support — must match kernel UAPI definitions
+pub const KVM_APF_RING_SIZE: usize = 32;
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct KvmApfRingEntry {
+    pub gpa: u64,
+    pub flags: u64,
+}
+
+#[repr(C)]
+pub struct KvmApfRing {
+    pub head: AtomicU32,
+    pub tail: AtomicU32,
+    pub reserved: u32,
+    pub padding: u32,
+    pub entries: [KvmApfRingEntry; KVM_APF_RING_SIZE],
+}
+
+/// Matches kernel `struct kvm_apf_shared_page` — both rings in one page.
+#[repr(C)]
+pub struct KvmApfSharedPage {
+    pub notify: KvmApfRing,
+    pub complete: KvmApfRing,
+}
+
+impl KvmApfRing {
+    pub fn pop(&self) -> Option<KvmApfRingEntry> {
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Relaxed);
+        if head == tail {
+            return None;
+        }
+        let entry = self.entries[tail as usize];
+        self.tail.store((tail + 1) % KVM_APF_RING_SIZE as u32, Ordering::Release);
+        Some(entry)
+    }
+}
+
+/// Per-vCPU exitless APF context (handler side).
+/// Receives a single shared-page memfd from Firecracker containing both rings.
+pub struct ExitlessApfVcpu {
+    pub eventfd: RawFd,
+    pub complete_eventfd: RawFd,
+    pub shared_page: *mut KvmApfSharedPage,
+    buff: [u8; 8],
+}
+
+impl ExitlessApfVcpu {
+    /// Create from fds sent by Firecracker:
+    /// (notify_eventfd, complete_eventfd, shared_page_memfd)
+    pub fn from_fds(
+        eventfd: RawFd,
+        complete_eventfd: RawFd,
+        shared_page_memfd: RawFd,
+    ) -> std::io::Result<Self> {
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let ptr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                page_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                shared_page_memfd,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        // Close the memfd — the mapping keeps it alive
+        unsafe { libc::close(shared_page_memfd) };
+
+        Ok(Self {
+            eventfd,
+            complete_eventfd,
+            shared_page: ptr as *mut KvmApfSharedPage,
+            buff: [0; 8]
+        })
+    }
+
+    #[inline]
+    pub fn notify_ring(&self) -> &KvmApfRing {
+        unsafe { &(*self.shared_page).notify }
+    }
+
+    #[inline]
+    fn complete_ring(&self) -> &KvmApfRing {
+        unsafe { &(*self.shared_page).complete }
+    }
+
+    #[inline]
+    pub fn drain_eventfd(&mut self) {
+        unsafe { libc::read(self.eventfd, self.buff.as_mut_ptr() as *mut c_void, 8) };
+    }
+
+    /// Signal APF completion via the completion ring + eventfd.
+    #[inline]
+    pub fn signal_ready(&self, gpa: u64) {
+        let ring = self.complete_ring();
+        let head = ring.head.load(Ordering::Relaxed);
+        let tail = ring.tail.load(Ordering::Acquire);
+        let next = (head + 1) % KVM_APF_RING_SIZE as u32;
+        if next == tail {
+            return; // Ring full
+        }
+        let entry = KvmApfRingEntry { gpa, flags: 0 };
+        unsafe {
+            let slot = &raw const ring.entries[head as usize] as *mut KvmApfRingEntry;
+            ptr::write(slot, entry);
+        }
+        ring.head.store(next, Ordering::Release);
+        let val: u64 = 1;
+        unsafe { libc::write(self.complete_eventfd, &val as *const u64 as *const c_void, 8) };
+    }
+}
+
+impl Drop for ExitlessApfVcpu {
+    fn drop(&mut self) {
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        unsafe {
+            libc::munmap(self.shared_page as *mut c_void, page_size);
+            libc::close(self.eventfd);
+            libc::close(self.complete_eventfd);
+        }
+    }
+}
 
 #[repr(C)]
 struct uffdio_range {
@@ -90,6 +218,9 @@ pub struct GuestRegionUffdMapping {
     pub size: usize,
     /// Offset in the backend file/buffer where the region contents are.
     pub offset: u64,
+    /// Guest physical address start for this region.
+    #[serde(default)]
+    pub gpa_start: u64,
     /// The configured page size for this memory region.
     pub page_size: usize,
 }
@@ -312,6 +443,16 @@ impl UffdHandler {
         for pfn in pfn_start..pfn_end {
             self.removed_pages.insert(pfn);
         }
+    }
+
+    /// Convert guest physical address to file offset
+    pub fn gpa_to_offset(&self, gpa: u64) -> Option<u64> {
+        for region in &self.mem_regions {
+            if gpa >= region.gpa_start && gpa < region.gpa_start + region.size as u64 {
+                return Some(gpa - region.gpa_start + region.offset);
+            }
+        }
+        None
     }
 
     pub fn addr_to_offset(&self, addr: *mut u8) -> u64 {
@@ -649,6 +790,8 @@ pub struct Runtime {
     handler: UffdHandler,
     message_buffer: [u8; 4096],
     encode_buffer: bitcode::Buffer,
+    /// Exitless APF contexts keyed by eventfd
+    exitless_vcpus: HashMap<RawFd, ExitlessApfVcpu>,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -695,7 +838,66 @@ impl Runtime {
             handler,
             message_buffer: [0; 4096],
             encode_buffer: bitcode::Buffer::new(),
+            exitless_vcpus: HashMap::new(),
         }
+    }
+
+    /// Receive exitless APF fds from Firecracker.
+    /// Firecracker sends: "exitless_apf:{num_vcpus}" with 3 fds per vCPU:
+    /// [notify_eventfd, complete_eventfd, shared_page_memfd] × num_vcpus
+    pub fn try_receive_exitless_apf(&mut self) -> std::io::Result<bool> {
+        let mut msg_buf = [0u8; 256];
+        let mut fds = [0i32; 64];
+
+        {
+            let stream = self.stream.lock().unwrap();
+            stream.set_nonblocking(false).expect("set nonblocking");
+        }
+
+        println!("Waiting for exitless APF fds");
+        let (bytes_read, fds_read) = {
+            let stream = self.stream.lock().unwrap();
+            let mut iovecs = [libc::iovec {
+                iov_base: msg_buf.as_mut_ptr().cast(),
+                iov_len: msg_buf.len(),
+            }];
+            match unsafe { stream.recv_with_fds(&mut iovecs, &mut fds) } {
+                Ok(r) => r,
+                Err(e) => {
+                    stream.set_nonblocking(true).expect("Set nonblocking");
+                    let errno = e.errno();
+                    return Err(std::io::Error::from_raw_os_error(errno));
+                }
+            }
+        };
+
+        let message = String::from_utf8_lossy(&msg_buf[..bytes_read]);
+        println!("Received: {bytes_read} bytes, {fds_read} fds. Message: {message:?}");
+
+        {
+            let stream = self.stream.lock().unwrap();
+            stream.set_nonblocking(true).expect("set nonblocking");
+        }
+
+        if fds_read == 0 || fds_read % 3 != 0 {
+            println!("Expected 3 fds per vCPU, got {fds_read}");
+            return Ok(false);
+        }
+
+        let num_vcpus = fds_read / 3;
+        for i in 0..num_vcpus {
+            let base = i * 3;
+            let ctx = ExitlessApfVcpu::from_fds(
+                fds[base],     // notify_eventfd
+                fds[base + 1], // complete_eventfd
+                fds[base + 2], // shared_page_memfd
+            )?;
+            let eventfd = ctx.eventfd;
+            self.exitless_vcpus.insert(eventfd, ctx);
+        }
+
+        println!("Exitless APF ready for {} vCPUs", num_vcpus);
+        Ok(!self.exitless_vcpus.is_empty())
     }
 
     fn peer_process_credentials(&self) -> libc::ucred {
@@ -869,11 +1071,27 @@ impl Runtime {
             });
         });
 
-        let mut apf_count = 0;
-        let mut no_apf_count = 0;
+        let mut _regular_fault_count = 0;
 
         let stream_fd = self.stream.lock().unwrap().as_raw_fd();
         let apf_fd = self.apf_stream.lock().unwrap().as_raw_fd();
+
+        // Try to receive exitless APF fds from Firecracker
+        if let Ok(true) = self.try_receive_exitless_apf() {
+            // Add exitless eventfds to poll list
+            for ctx in self.exitless_vcpus.values() {
+                pollfds.push(libc::pollfd {
+                    fd: ctx.eventfd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+            }
+
+            println!("Exitless APF ready for {} vCPUs", self.exitless_vcpus.len());
+        } else {
+            println!("No exitless APF fds received..");
+        }
+
         loop {
             let pollfd_ptr = pollfds.as_mut_ptr();
             let pollfd_size = pollfds.len() as u64;
@@ -900,9 +1118,7 @@ impl Runtime {
                                 (fault_request.offset as usize) < self.handler.size(),
                                 "received bogus offset from firecracker"
                             );
-                            no_apf_count += 1;
-                            println!("Regular fault at offset {:0x}. CPU id: {:0x}. Count {no_apf_count}", fault_request.offset, fault_request.vcpu);
-                            // Handle one of FaultRequest page faults
+                            _regular_fault_count += 1;
                             pf_vcpu_event_dispatch(
                                 &mut self.handler,
                                 fault_request.offset as usize,
@@ -911,30 +1127,40 @@ impl Runtime {
                             self.send_fault_reply(fault_request.into_reply(page_size as u64), &r_send);
                         }
                     } else if fd.fd == apf_fd {
-                        for fault_request in apf_msg_iter.by_ref() {
+                        for mut fault_request in apf_msg_iter.by_ref() {
                             let page_size = self.handler.page_size;
+
+                            if let Some(gpa) = fault_request.gpa {
+                                fault_request.offset = self.handler.gpa_to_offset(gpa)
+                                    .expect("Failed to convert GPA to offset");
+                            }
 
                             assert!(
                                 (fault_request.offset as usize) < self.handler.size(),
                                 "received bogus offset from firecracker"
                             );
 
-                            apf_count += 1;
-                            println!("APF fault at offset {:0x}. CPU id: {:0x}. Count {apf_count}", fault_request.offset, fault_request.vcpu);
-                            // Handle one of FaultRequest page faults
                             pf_vcpu_event_dispatch(
                                 &mut self.handler,
                                 fault_request.offset as usize,
                             );
                             self.send_apf_reply(fault_request.into_reply(page_size as u64), &a_send);
                         }
+                    } else if let Some(ctx) = self.exitless_vcpus.get_mut(&fd.fd) {
+                        ctx.drain_eventfd();
+
+                        while let Some(entry) = ctx.notify_ring().pop() {
+                            let gpa = entry.gpa;
+                            if let Some(offset) = self.handler.gpa_to_offset(gpa) {
+                                pf_vcpu_event_dispatch(&mut self.handler, offset as usize);
+                                ctx.signal_ready(gpa);
+                            }
+                        }
                     } else {
-                        // Handle one of uffd page faults
                         pf_event_dispatch(&mut self.handler);
                     }
                 }
             }
-            // If connection is closed, we can skip the socket from being polled.
             pollfds.retain(|pollfd| pollfd.revents & (libc::POLLRDHUP | libc::POLLHUP) == 0);
         }
     }

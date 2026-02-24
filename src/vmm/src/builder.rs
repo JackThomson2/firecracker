@@ -71,7 +71,7 @@ use crate::vmm_config::machine_config::MachineConfigError;
 use crate::vmm_config::snapshot::{LoadSnapshotParams, MemBackendType};
 use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{MaybeBounce, MemoryError, create_memfd};
-use crate::vstate::vcpu::{Vcpu, VcpuError};
+use crate::vstate::vcpu::{SharedApfStream, Vcpu, VcpuError};
 use crate::vstate::vm::{GUEST_MEMFD_FLAG_NO_DIRECT_MAP, GUEST_MEMFD_FLAG_SUPPORT_SHARED, Vm};
 use crate::{device_manager, EventManager, UffdMessageBroker, Vmm, VmmError};
 
@@ -146,7 +146,7 @@ impl std::convert::From<linux_loader::cmdline::Error> for StartMicrovmError {
     }
 }
 
-fn pipe2(flags: libc::c_int) -> io::Result<(RawFd, RawFd)> {
+pub(crate) fn pipe2(flags: libc::c_int) -> io::Result<(RawFd, RawFd)> {
     let mut fds = [0, 0];
     // SAFETY: Safe as we know flags are good
     let res = unsafe { libc::pipe2(fds.as_mut_ptr(), flags) };
@@ -164,7 +164,7 @@ fn create_vmm_and_vcpus(
     vcpu_count: u8,
     mut kvm_capabilities: Vec<KvmCapability>,
     secret_free: bool,
-    apf_stream: Option<UffdMessageBroker>,
+    apf_stream: Option<SharedApfStream>,
 ) -> Result<(Vmm, Vec<Vcpu>), VmmError> {
     if secret_free {
         kvm_capabilities.push(KvmCapability::Add(Cap::GuestMemfd as u32));
@@ -193,7 +193,10 @@ fn create_vmm_and_vcpus(
     // Instantiate ACPI device manager.
     let acpi_device_manager = ACPIDeviceManager::new();
 
-    let (vcpus, vcpus_exit_evt) = vm.create_vcpus(vcpu_count, secret_free, &writer)?;
+    let (vcpus, vcpus_exit_evt) = vm.create_vcpus(vcpu_count, secret_free, &writer, apf_stream.clone())?;
+
+    // Collect vcpu fds early (needed for exitless APF setup before VM runs)
+    let vcpu_fds: Vec<RawFd> = vcpus.iter().map(|v| v.kvm_vcpu.fd.as_raw_fd()).collect();
 
     #[cfg(target_arch = "x86_64")]
     let pio_device_manager = {
@@ -224,7 +227,7 @@ fn create_vmm_and_vcpus(
         uffd: None,
         uffd_socket: None,
         vcpus_handles: Vec::new(),
-        vcpu_fds: Vec::new(),
+        vcpu_fds,
         vcpus_exit_evt,
         reader,
         resource_allocator,
@@ -235,6 +238,8 @@ fn create_vmm_and_vcpus(
         guest_memfd: None,
         eventfd: None,
         apf_stream,
+        exitless_apf: Vec::new(),
+        exitless_apf_setup_done: false,
     };
 
     Ok((vmm, vcpus))
@@ -581,12 +586,14 @@ pub fn build_microvm_from_snapshot(
 
     // FIXME: Hardcoding the APF socket path as it's awkward to bring it here.
     let apf_sock = "/apf.socket";
-    let apf_stream = UnixStream::connect(apf_sock)
+    let apf_stream: Option<SharedApfStream> = UnixStream::connect(apf_sock)
         .inspect(|stream| {
             stream
                 .set_nonblocking(true)
                 .expect("Failed to set non-blocking mode");
-        }).map(UffdMessageBroker::new).ok();
+        })
+        .map(|s| std::sync::Arc::new(std::sync::Mutex::new(UffdMessageBroker::new(s))))
+        .ok();
 
     let (mut vmm, mut vcpus) = create_vmm_and_vcpus(
         instance_info,
@@ -671,6 +678,8 @@ pub fn build_microvm_from_snapshot(
 
     if let Some(uff_socket) = socket {
         vmm.uffd_socket = Some(UffdMessageBroker::new(uff_socket));
+        // Send vcpu fds early - handler will lazily init when vcpus are online
+        vmm.setup_exitless_apf();
     };
 
     #[cfg(target_arch = "x86_64")]
@@ -1035,6 +1044,7 @@ pub(crate) fn set_stdout_nonblocking() {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::os::fd::FromRawFd;
 
     use linux_loader::cmdline::Cmdline;
     use vmm_sys_util::tempfile::TempFile;
@@ -1132,7 +1142,12 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let (_, vcpus_exit_evt) = vm.create_vcpus(1, false).unwrap();
+        let (_, vcpus_exit_evt) = {
+            let (_, writer_fd) = super::pipe2(libc::O_NONBLOCK).unwrap();
+            // SAFETY: writer_fd is valid
+            let writer = unsafe { std::fs::File::from_raw_fd(writer_fd) };
+            vm.create_vcpus(1, false, &writer, None).unwrap()
+        };
 
         Vmm {
             events_observer: Some(std::io::stdin()),
@@ -1143,12 +1158,17 @@ pub(crate) mod tests {
             uffd: None,
             uffd_socket: None,
             vcpus_handles: Vec::new(),
+            vcpu_fds: Vec::new(),
             vcpus_exit_evt,
+            reader: unsafe { std::fs::File::from_raw_fd(0) },
             resource_allocator: ResourceAllocator::new().unwrap(),
             mmio_device_manager,
             #[cfg(target_arch = "x86_64")]
             pio_device_manager,
             acpi_device_manager,
+            guest_memfd: None,
+            eventfd: None,
+            apf_stream: None,
         }
     }
 

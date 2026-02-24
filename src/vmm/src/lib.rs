@@ -139,7 +139,7 @@ use vmm_sys_util::ioctl::ioctl_with_ref;
 use vmm_sys_util::syscall::SyscallReturnCode;
 use vmm_sys_util::terminal::Terminal;
 use vstate::kvm::Kvm;
-use vstate::memory::{KVM_ASYNC_PF_READY};
+use vstate::memory::{KvmAPFReq, KVM_APF_OP_READY, KVM_ASYNC_PF};
 use vstate::vcpu::{self, StartThreadedError, VcpuSendEventError};
 
 use crate::arch::DeviceType;
@@ -347,8 +347,14 @@ pub struct Vmm {
 
     pub eventfd: Option<i32>,
 
-    /// APF
-    apf_stream: Option<UffdMessageBroker>
+    /// APF stream shared with vCPUs
+    apf_stream: Option<vstate::vcpu::SharedApfStream>,
+
+    /// Exitless APF contexts (one per vCPU)
+    exitless_apf: Vec<vstate::exitless_apf::ExitlessApfContext>,
+
+    /// Whether exitless APF setup has been done
+    exitless_apf_setup_done: bool,
 }
 
 pub struct UffdMessageBroker {
@@ -495,8 +501,6 @@ impl Vmm {
             vcpu.kvm_vcpu
                 .set_pio_bus(self.pio_device_manager.io_bus.clone());
 
-            self.vcpu_fds.push(vcpu.kvm_vcpu.fd.as_raw_fd());
-
             self.vcpus_handles
                 .push(vcpu.start_threaded(vcpu_seccomp_filter.clone(), barrier.clone())?);
         }
@@ -505,6 +509,54 @@ impl Vmm {
         barrier.wait();
 
         Ok(())
+    }
+
+    /// Set up exitless APF - creates contexts in Firecracker (where the KVM ioctl works)
+    /// and sends eventfds + shared page memfds to the handler.
+    pub fn setup_exitless_apf(&mut self) {
+        use vmm_sys_util::sock_ctrl_msg::ScmSocket;
+
+        if self.exitless_apf_setup_done {
+            return;
+        }
+
+        info!(
+            "Setting up exitless APF for {} vCPUs",
+            self.vcpu_fds.len()
+        );
+
+        // Create ExitlessApfContext for each vCPU (does the KVM_SET_APF_EVENTFD ioctl)
+        let mut contexts = Vec::new();
+        let mut handler_fds = Vec::new();
+        for &vcpu_fd in &self.vcpu_fds {
+            match vstate::exitless_apf::ExitlessApfContext::new(vcpu_fd) {
+                Ok(ctx) => {
+                    let (notify_fd, complete_fd, memfd) = ctx.fds_for_handler();
+                    handler_fds.push(notify_fd);
+                    handler_fds.push(complete_fd);
+                    handler_fds.push(memfd);
+                    contexts.push(ctx);
+                }
+                Err(e) => {
+                    error!("Failed to create exitless APF context for vcpu fd {}: {}", vcpu_fd, e);
+                    return;
+                }
+            }
+        }
+
+        // Send the fds to the handler: 3 fds per vCPU
+        // [notify_eventfd, complete_eventfd, shared_page_memfd] × num_vcpus
+        if let Some(ref uffd_socket) = self.uffd_socket {
+            let msg = format!("exitless_apf:{}", self.vcpu_fds.len());
+            match uffd_socket.stream.send_with_fds(&[msg.as_bytes()], &handler_fds) {
+                Ok(n) => {
+                    info!("Sent {} bytes with {} fds for exitless APF", n, handler_fds.len());
+                    self.exitless_apf = contexts;
+                    self.exitless_apf_setup_done = true;
+                }
+                Err(e) => error!("Failed to send exitless APF fds: {}", e),
+            }
+        }
     }
 
     /// Sends a resume command to the vCPUs.
@@ -528,6 +580,7 @@ impl Vmm {
         }
 
         self.instance_info.state = VmState::Running;
+
         Ok(())
     }
 
@@ -910,43 +963,7 @@ impl Vmm {
     }
 
     fn process_vcpu_userfault(&mut self, vcpu: u32, userfault_data: UserfaultData) {
-        let async_pf = (userfault_data.flags & (1 << 5)) != 0;
-        if async_pf {
-            let delta = RECV_SENT_DELTA.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
-            let total = TOTAL_SENT.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
-            let start = Instant::now();
-            let Some(stream) = &mut self.apf_stream else {
-                error!("No apf stream...");
-                return;
-            };
-            // info!("We received an async page fault message");
-
-            let offset = self
-                .vm
-                .guest_memory()
-                .gpa_to_offset(GuestAddress(userfault_data.gpa))
-                .expect("Failed to convert GPA to offset");
-
-
-            // info!(
-            //     "APF: flags 0x{:x} size/token 0x{:x} gpa {:x}. Offset {offset:x}. Delta {delta}, total {total}. VCPU {vcpu}.",
-            //     userfault_data.flags, userfault_data.size, userfault_data.gpa
-            // );
-
-            // Async PF handling begin
-            let fault_request = FaultRequest {
-                vcpu,
-                offset,
-                flags: userfault_data.flags,
-                gpa: Some(userfault_data.gpa),
-            };
-
-            stream.send_fault_request(fault_request);
-            let elapsed = start.elapsed();
-            // info!("Send request: {fault_request:?} byte length: {}. Time taken: {elapsed:?}", fault_request_json.as_bytes().len());
-            return;
-        }
-
+        // APF requests are now sent directly by vCPUs, so we only handle sync faults here
         let offset = self
             .vm
             .guest_memory()
@@ -960,7 +977,6 @@ impl Vmm {
             gpa: None,
         };
 
-        // info!("Send fault request.. request: {fault_request_json:?}");
         self.uffd_socket
             .as_mut()
             .expect("Uffd socket is not set")
@@ -976,23 +992,59 @@ impl Vmm {
     }
 
     fn process_apf_socket(&mut self) {
-        let socket = self.apf_stream.as_mut().unwrap();
-        for fault_reply in socket.by_ref() {
-            let vcpu = fault_reply.vcpu.expect("vCPU must be set");
-            let delta = RECV_SENT_DELTA.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) - 1;
-            // info!("Sending APF ready message.. Delta is {delta}, Vcpu is {vcpu} Offset: {:X}", fault_reply.offset);
-            // SAFETY: Safe for now
-            unsafe {
-                SyscallReturnCode(ioctl_with_ref(
-                    &self.vcpu_fds[vcpu as usize],
-                    KVM_ASYNC_PF_READY(),
-                    &fault_reply.gpa.unwrap(),
-                ))
-                .into_empty_result()
-                .inspect_err(|err| {
-                    info!("Got error {err:?}");
-                });
+        let mut stream = self.apf_stream.as_ref().unwrap().lock().unwrap();
+        for fault_reply in stream.by_ref() {
+            let vcpu = fault_reply.vcpu.expect("vCPU must be set") as usize;
+            let gpa = fault_reply.gpa.unwrap();
+            let _delta = RECV_SENT_DELTA.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) - 1;
+
+            // Use exitless completion ring if available, otherwise fall back to ioctl
+            if vcpu < self.exitless_apf.len() {
+                if !self.exitless_apf[vcpu].signal_complete(gpa) {
+                    warn!("Completion ring full for vCPU {vcpu}, falling back to ioctl");
+                    self.apf_ready_ioctl(vcpu, gpa);
+                }
+            } else {
+                self.apf_ready_ioctl(vcpu, gpa);
             }
+        }
+    }
+
+    fn apf_ready_ioctl(&self, vcpu: usize, gpa: u64) {
+        let apf_message = KvmAPFReq {
+            gpa,
+            op: KVM_APF_OP_READY,
+            flags: 0,
+            reserved: [0; 2]
+        };
+
+        // SAFETY: ioctl on a valid vcpu fd with a valid gpa reference
+        unsafe {
+            SyscallReturnCode(ioctl_with_ref(
+                &self.vcpu_fds[vcpu],
+                KVM_ASYNC_PF(),
+                &apf_message,
+            ))
+            .into_empty_result()
+            .inspect_err(|err| {
+                info!("KVM_ASYNC_PF_READY error: {err:?}");
+            });
+        }
+    }
+
+    fn process_exitless_apf(&mut self, vcpu: u32, gpa: u64) {
+        // Send fault request to handler via APF stream
+        if let Some(apf_stream) = &self.apf_stream {
+            let fault_request = FaultRequest {
+                vcpu,
+                offset: 0, // Handler will use GPA
+                flags: 0,
+                gpa: Some(gpa),
+            };
+
+            let mut stream = apf_stream.lock().unwrap();
+            stream.send_fault_request(fault_request);
+            RECV_SENT_DELTA.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         }
     }
 
@@ -1120,11 +1172,28 @@ impl MutEventSubscriber for Vmm {
             }
         }
 
-        if let Some(apf_socket) = &self.apf_stream {
-            if apf_socket.active_event_in_uffd_socket(source, event_set) {
+        if let Some(apf_stream) = &self.apf_stream {
+            let stream = apf_stream.lock().unwrap();
+            if stream.active_event_in_uffd_socket(source, event_set) {
+                drop(stream);
                 self.process_apf_socket();
             }
         }
+
+        // Handle exitless APF eventfds
+        // let mut exitless_entries = Vec::new();
+        // for (vcpu_idx, ctx) in self.exitless_apf.iter().enumerate() {
+        //     if source == ctx.eventfd_fd() && event_set == EventSet::IN {
+        //         ctx.drain_eventfd();
+        //         while let Some(entry) = ctx.pop_entry() {
+        //             exitless_entries.push((vcpu_idx as u32, entry.gpa));
+        //         }
+        //     }
+        // }
+        // for (vcpu_idx, gpa) in exitless_entries {
+        //     info!("Exitless APF: vCPU {} gpa={:#x}", vcpu_idx, gpa);
+        //     self.process_exitless_apf(vcpu_idx, gpa);
+        // }
     }
 
     fn init(&mut self, ops: &mut EventOps) {
@@ -1139,8 +1208,16 @@ impl MutEventSubscriber for Vmm {
         }
 
         if let Some(apf_stream) = self.apf_stream.as_ref() {
-            if let Err(err) = ops.add(Events::new(&apf_stream.stream, EventSet::IN)) {
+            let stream = apf_stream.lock().unwrap();
+            if let Err(err) = ops.add(Events::new(&stream.stream, EventSet::IN)) {
                 error!("Failed to register apf stream socket: {err}");
+            }
+        }
+
+        // Register exitless APF eventfds
+        for (i, ctx) in self.exitless_apf.iter().enumerate() {
+            if let Err(err) = ops.add(Events::new(ctx.eventfd(), EventSet::IN)) {
+                error!("Failed to register exitless APF eventfd for vCPU {}: {}", i, err);
             }
         }
     }

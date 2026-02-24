@@ -7,7 +7,6 @@
 
 use std::cell::RefCell;
 use std::fs::File;
-#[cfg(feature = "gdb")]
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{Ordering, fence};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
@@ -40,6 +39,8 @@ pub const VCPU_RTSIG_OFFSET: i32 = 0;
 // TODO: remove when KVM userfault support is merged upstream.
 /// VM exit due to a userfault.
 const KVM_MEMORY_EXIT_FLAG_USERFAULT: u64 = 1 << 4;
+/// APF flag in memory fault exit
+const KVM_MEMORY_EXIT_FLAG_APF: u64 = 1 << 5;
 
 /// Errors associated with the wrappers over KVM ioctls.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -97,6 +98,12 @@ type UserfaultResolved = Arc<(Mutex<bool>, Condvar)>;
 // is closed.
 thread_local!(static TLS_VCPU_PTR: RefCell<Option<KvmRunWrapper>> = const { RefCell::new(None) });
 
+use crate::persist::FaultRequest;
+use crate::UffdMessageBroker;
+
+/// Shared APF stream for sending async page fault requests directly to handler
+pub type SharedApfStream = std::sync::Arc<std::sync::Mutex<UffdMessageBroker>>;
+
 /// A wrapper around creating and using a vcpu.
 #[derive(Debug)]
 pub struct Vcpu {
@@ -120,6 +127,8 @@ pub struct Vcpu {
     response_sender: Sender<VcpuResponse>,
     /// A condvar to notify the vCPU that a userfault has been resolved
     userfault_resolved: Option<UserfaultResolved>,
+    /// Shared stream for sending APF requests directly to handler
+    apf_stream: Option<SharedApfStream>,
 }
 
 impl Vcpu {
@@ -169,12 +178,14 @@ impl Vcpu {
     /// * `exit_evt` - An `EventFd` that will be written into when this vcpu exits.
     /// * `userfault_resolved` - An optional condvar that will get active when a userfault is
     ///   resolved.
+    /// * `apf_stream` - Optional shared stream for sending APF requests directly to handler.
     pub fn new(
         index: u8,
         vm: &Vm,
         exit_evt: EventFd,
         userfault_resolved: Option<UserfaultResolved>,
         writer: File,
+        apf_stream: Option<SharedApfStream>,
     ) -> Result<Self, VcpuError> {
         let (event_sender, event_receiver) = channel();
         let (response_sender, response_receiver) = channel();
@@ -191,6 +202,7 @@ impl Vcpu {
             writer,
             kvm_vcpu,
             userfault_resolved,
+            apf_stream,
         })
     }
 
@@ -467,24 +479,49 @@ impl Vcpu {
         &mut self,
         userfaultfd_data: UserfaultData,
     ) -> Result<VcpuEmulation, VcpuError> {
+        let apf_flag = userfaultfd_data.flags & (1 << 5);
+        let async_pf = apf_flag != 0;
+
+        if async_pf {
+            // Send APF request directly to handler, bypassing VMM
+            // Handler will convert GPA to offset using its region mappings
+            if let Some(stream) = &self.apf_stream {
+                let fault_request = FaultRequest {
+                    vcpu: self.kvm_vcpu.index as u32,
+                    offset: 0, // Handler will compute from GPA
+                    flags: userfaultfd_data.flags,
+                    gpa: Some(userfaultfd_data.gpa),
+                };
+
+                stream.lock().unwrap().send_fault_request(fault_request);
+            }
+
+            // Accept the APF via KVM_ASYNC_PF ioctl with KVM_APF_OP_ACCEPT
+            let req = crate::vstate::memory::KvmAPFReq {
+                gpa: userfaultfd_data.gpa,
+                op: crate::vstate::memory::KVM_APF_OP_ACCEPT,
+                flags: 0,
+                reserved: [0; 2],
+            };
+            let vcpu_raw_fd = self.kvm_vcpu.fd.as_raw_fd();
+            // SAFETY: ioctl on a valid vcpu fd with a valid req reference
+            unsafe {
+                vmm_sys_util::ioctl::ioctl_with_ref(
+                    &vcpu_raw_fd,
+                    crate::vstate::memory::KVM_ASYNC_PF(),
+                    &req,
+                );
+            }
+
+            return Ok(VcpuEmulation::Handled);
+        }
+
+        // Sync path: notify VMM and wait for resolution
         self.response_sender
             .send(VcpuResponse::Userfault(userfaultfd_data))
             .expect("Failed to send userfault data");
 
         self.exit_evt.write(1).expect("Failed to write exit event");
-
-        let apf_flag = userfaultfd_data.flags & (1 << 5);
-        let async_pf = apf_flag != 0;
-        if async_pf {
-            let accept_apf_flag = 1 << 6;
-            // SAFETY: Run in the context of a vm exit for memory fault
-            unsafe {
-                self.kvm_vcpu.fd.get_kvm_run().__bindgen_anon_1.memory_fault.flags |= accept_apf_flag;
-            }
-
-            // info!("We marked the apf as rejected!");
-            return Ok(VcpuEmulation::Handled);
-        }
 
         let (lock, cvar) = self
             .userfault_resolved
@@ -810,6 +847,7 @@ pub(crate) mod tests {
 
     #[cfg(target_arch = "x86_64")]
     use std::collections::BTreeMap;
+    use std::os::fd::FromRawFd;
     use std::sync::{Arc, Barrier, Mutex};
 
     use linux_loader::loader::KernelLoader;
@@ -970,7 +1008,12 @@ pub(crate) mod tests {
     pub(crate) fn setup_vcpu(mem_size: usize) -> (Kvm, Vm, Vcpu) {
         let (kvm, mut vm) = setup_vm_with_memory(mem_size);
 
-        let (mut vcpus, _) = vm.create_vcpus(1, false).unwrap();
+        let (mut vcpus, _) = {
+            let (_, writer_fd) = crate::builder::pipe2(libc::O_NONBLOCK).unwrap();
+            // SAFETY: writer_fd is valid
+            let writer = unsafe { std::fs::File::from_raw_fd(writer_fd) };
+            vm.create_vcpus(1, false, &writer, None).unwrap()
+        };
         let mut vcpu = vcpus.remove(0);
 
         #[cfg(target_arch = "aarch64")]
