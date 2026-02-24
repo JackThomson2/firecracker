@@ -120,17 +120,15 @@ use std::io::{self, Read, Write};
 use std::os::fd::RawFd;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::AtomicU64;
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Barrier, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use device_manager::acpi::ACPIDeviceManager;
 use device_manager::resources::ResourceAllocator;
 use devices::acpi::vmgenid::VmGenIdError;
 use event_manager::{EventManager as BaseEventManager, EventOps, Events, MutEventSubscriber};
 use seccomp::BpfProgram;
-use semver::Op;
 use userfaultfd::Uffd;
 use vm_memory::GuestAddress;
 use vmm_sys_util::epoll::EventSet;
@@ -276,9 +274,6 @@ pub enum VmmError {
 /// Shorthand type for KVM dirty page bitmap.
 pub type DirtyBitmap = HashMap<u32, Vec<u64>>;
 
-static RECV_SENT_DELTA: AtomicU64 = AtomicU64::new(0);
-static TOTAL_SENT: AtomicU64 = AtomicU64::new(0);
-
 /// Returns the size of guest memory, in MiB.
 pub(crate) fn mem_size_mib(guest_memory: &GuestMemoryMmap) -> u64 {
     guest_memory.iter().map(|region| region.len()).sum::<u64>() >> 20
@@ -332,7 +327,8 @@ pub struct Vmm {
     vcpu_fds: Vec<RawFd>,
     // Used by Vcpus and devices to initiate teardown; Vmm should never write here.
     vcpus_exit_evt: EventFd,
-    // Reader for APF
+    // Pipe reader for APF notifications
+    #[allow(dead_code)]
     reader: File,
 
     // Allocator for guest resources
@@ -343,8 +339,10 @@ pub struct Vmm {
     pio_device_manager: PortIODeviceManager,
     acpi_device_manager: ACPIDeviceManager,
 
+    /// Guest memfd file handle.
     pub guest_memfd: Option<File>,
 
+    /// Eventfd for APF notifications.
     pub eventfd: Option<i32>,
 
     /// APF stream shared with vCPUs
@@ -357,7 +355,9 @@ pub struct Vmm {
     exitless_apf_setup_done: bool,
 }
 
+/// Length-prefixed bitcode message broker over a `UnixStream`.
 pub struct UffdMessageBroker {
+    /// Underlying socket stream.
     pub stream: UnixStream,
     read_buffer: [u8; 4096],
     write_buffer: [u8; 4096],
@@ -375,6 +375,7 @@ impl std::fmt::Debug for UffdMessageBroker {
 }
 
 impl UffdMessageBroker {
+    /// Create a new broker wrapping the given stream.
     pub fn new(stream: UnixStream) -> Self {
         Self {
             stream,
@@ -385,6 +386,7 @@ impl UffdMessageBroker {
         }
     }
 
+    /// Encode and send a fault request over the stream.
     pub fn send_fault_request(&mut self, fault_request: FaultRequest) {
         let encoded = self.encode_buffer.encode(&fault_request);
         let size = encoded.len() as u32;
@@ -394,6 +396,7 @@ impl UffdMessageBroker {
         self.stream.write_all(&self.write_buffer[..4 + (size as usize)]).unwrap();
     }
 
+    /// Check if the given event source and set match this broker's stream.
     pub fn active_event_in_uffd_socket(&self, source: RawFd, event_set: EventSet) -> bool {
         self.stream.as_raw_fd() == source && event_set == EventSet::IN
     }
@@ -407,11 +410,11 @@ impl UffdMessageBroker {
     }
 
     fn can_decode(&self) -> bool {
-        let Some(expeced_size) = self.expected_size() else {
+        let Some(expected_size) = self.expected_size() else {
             return false;
         };
 
-        self.current_pos - 4 >= expeced_size as usize
+        self.current_pos - 4 >= expected_size as usize
     }
 }
 
@@ -996,7 +999,6 @@ impl Vmm {
         for fault_reply in stream.by_ref() {
             let vcpu = fault_reply.vcpu.expect("vCPU must be set") as usize;
             let gpa = fault_reply.gpa.unwrap();
-            let _delta = RECV_SENT_DELTA.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) - 1;
 
             // Use exitless completion ring if available, otherwise fall back to ioctl
             if vcpu < self.exitless_apf.len() {
@@ -1020,7 +1022,7 @@ impl Vmm {
 
         // SAFETY: ioctl on a valid vcpu fd with a valid gpa reference
         unsafe {
-            SyscallReturnCode(ioctl_with_ref(
+            let _ = SyscallReturnCode(ioctl_with_ref(
                 &self.vcpu_fds[vcpu],
                 KVM_ASYNC_PF(),
                 &apf_message,
@@ -1032,22 +1034,20 @@ impl Vmm {
         }
     }
 
+    #[allow(dead_code)]
     fn process_exitless_apf(&mut self, vcpu: u32, gpa: u64) {
-        // Send fault request to handler via APF stream
         if let Some(apf_stream) = &self.apf_stream {
             let fault_request = FaultRequest {
                 vcpu,
-                offset: 0, // Handler will use GPA
+                offset: 0, // Handler will compute from GPA
                 flags: 0,
                 gpa: Some(gpa),
             };
 
             let mut stream = apf_stream.lock().unwrap();
             stream.send_fault_request(fault_request);
-            RECV_SENT_DELTA.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         }
     }
-
 
     /// Gets a reference to kvm-ioctls Vm
     #[cfg(feature = "gdb")]
@@ -1179,21 +1179,6 @@ impl MutEventSubscriber for Vmm {
                 self.process_apf_socket();
             }
         }
-
-        // Handle exitless APF eventfds
-        // let mut exitless_entries = Vec::new();
-        // for (vcpu_idx, ctx) in self.exitless_apf.iter().enumerate() {
-        //     if source == ctx.eventfd_fd() && event_set == EventSet::IN {
-        //         ctx.drain_eventfd();
-        //         while let Some(entry) = ctx.pop_entry() {
-        //             exitless_entries.push((vcpu_idx as u32, entry.gpa));
-        //         }
-        //     }
-        // }
-        // for (vcpu_idx, gpa) in exitless_entries {
-        //     info!("Exitless APF: vCPU {} gpa={:#x}", vcpu_idx, gpa);
-        //     self.process_exitless_apf(vcpu_idx, gpa);
-        // }
     }
 
     fn init(&mut self, ops: &mut EventOps) {

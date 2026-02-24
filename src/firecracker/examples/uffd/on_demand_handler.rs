@@ -34,14 +34,10 @@ fn main() {
         .set_nonblocking(true)
         .expect("Cannot set non-blocking");
 
-    println!("UFFD socket connected..");
-
     let (apf_stream, _) = apf_listener.accept().expect("Cannot listen on UDS apf socket");
     apf_stream
         .set_nonblocking(true)
         .expect("Cannot set non-blocking");
-
-    println!("APF socket connected..");
 
     let mut runtime = Runtime::new(stream, file, apf_stream);
     runtime.install_panic_hook();
@@ -156,23 +152,11 @@ fn main() {
             }
         },
         |uffd_handler: &mut UffdHandler, offset: usize| {
-            // if uffd_handler.faulted_pages.contains(&offset) {
-            //     println!("This had already been faulted hmmm at offst {offset:0x}");
-            //     return;
-            // }
-
             let bytes_written = uffd_handler.populate_via_write(offset, uffd_handler.page_size);
 
-            if bytes_written == 0 {
-                // println!(
-                //     "got a vcpu fault for an already populated page at offset {}",
-                //     offset
-                // );
-            } else {
+            if bytes_written != 0 {
                 assert_eq!(bytes_written, uffd_handler.page_size);
             }
-
-            // uffd_handler.faulted_pages.insert(offset);
         },
     );
 }

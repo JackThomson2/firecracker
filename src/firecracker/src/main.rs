@@ -352,7 +352,7 @@ fn main_exec() -> Result<(), MainError> {
     }
 
     let mut seccomp_filters: BpfThreadMap = SeccompConfig::from_args(
-        true,
+        arguments.flag_present("no-seccomp"),
         arguments.single_value("seccomp-filter"),
     )
     .and_then(seccomp::get_filters)

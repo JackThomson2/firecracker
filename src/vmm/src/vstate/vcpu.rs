@@ -116,6 +116,7 @@ pub struct Vcpu {
     #[cfg(feature = "gdb")]
     gdb_event: Option<Sender<usize>>,
     /// Pipe for Async Page Faults
+    #[allow(dead_code)]
     writer: File,
     /// The receiving end of events channel owned by the vcpu side.
     event_receiver: Receiver<VcpuEvent>,
@@ -479,12 +480,10 @@ impl Vcpu {
         &mut self,
         userfaultfd_data: UserfaultData,
     ) -> Result<VcpuEmulation, VcpuError> {
-        let apf_flag = userfaultfd_data.flags & (1 << 5);
-        let async_pf = apf_flag != 0;
+        let is_async_pf = userfaultfd_data.flags & KVM_MEMORY_EXIT_FLAG_APF != 0;
 
-        if async_pf {
-            // Send APF request directly to handler, bypassing VMM
-            // Handler will convert GPA to offset using its region mappings
+        if is_async_pf {
+            // Send APF request directly to handler — handler converts GPA to offset
             if let Some(stream) = &self.apf_stream {
                 let fault_request = FaultRequest {
                     vcpu: self.kvm_vcpu.index as u32,
@@ -492,11 +491,10 @@ impl Vcpu {
                     flags: userfaultfd_data.flags,
                     gpa: Some(userfaultfd_data.gpa),
                 };
-
                 stream.lock().unwrap().send_fault_request(fault_request);
             }
 
-            // Accept the APF via KVM_ASYNC_PF ioctl with KVM_APF_OP_ACCEPT
+            // Accept the APF via KVM_ASYNC_PF ioctl
             let req = crate::vstate::memory::KvmAPFReq {
                 gpa: userfaultfd_data.gpa,
                 op: crate::vstate::memory::KVM_APF_OP_ACCEPT,

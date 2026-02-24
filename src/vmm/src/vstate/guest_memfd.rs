@@ -1,10 +1,7 @@
 // Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Module containing various structs, ioctls, constants and functions related to guest_memfd
-//! support
-//!
-//! Intended only a PoC, and to keep the changes to Firecracker somewhat centralized
+//! Structs, ioctls, constants and functions related to guest_memfd support.
 
 #![allow(missing_docs)]
 
@@ -167,26 +164,11 @@ impl Vm {
         region: &GuestRegionMmap,
         guest_memfd: &File,
     ) -> Result<(), VmError> {
-        // Set the "userspace_addr" to an mmap of the guest_memfd. Since the guest_memfd is mapped
-        // into host userspace, this will trick KVM into gup-ing guest_memfd whenever it thinks
-        // that it is accessing normal guest memory (as KVM's guest memory accessor functions
-        // are not enlightened about the possibility of guest_memfd existing, and will always
-        // gup via userspace_addr).
         let memory_region = kvm_userspace_memory_region2 {
             slot,
             guest_phys_addr: region.start_addr().raw_value(),
             memory_size: region.len(),
-            /* userspace_addr: unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    region.len() as _,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_NORESERVE | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                    -1,
-                    0,
-                ) as _
-            }, */
-            // FIXME for multiple regions
+            // FIXME: handle multiple regions properly
             userspace_addr: region.get_host_address(vm_memory::MemoryRegionAddress(0)).unwrap() as u64,
             guest_memfd_offset: region.start_addr().raw_value(),
             guest_memfd: guest_memfd.as_raw_fd() as u32,
@@ -211,8 +193,7 @@ impl Vmm {
             let attributes = kvm_memory_attributes {
                 address: region.start_addr().raw_value(),
                 size: region.len(),
-                // FIXME: uncomment if want to take a snapshot.
-                // attributes: KVM_MEMORY_ATTRIBUTE_PRIVATE,
+                // TODO: use KVM_MEMORY_ATTRIBUTE_PRIVATE for snapshot support
                 attributes: KVM_MEMORY_ATTRIBUTE_USERFAULT,
                 ..Default::default()
             };

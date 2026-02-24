@@ -24,14 +24,11 @@ use std::os::unix::net::UnixStream;
 use std::ptr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{sleep, spawn};
+use std::thread::spawn;
 use std::time::Duration;
 
 use async_channel::{unbounded, Sender};
-use rand::random_range;
 use serde::{Deserialize, Serialize};
-use serde_json::{Deserializer, StreamDeserializer};
-use smol::Timer;
 use userfaultfd::{Error, Event, Uffd};
 use vmm_sys_util::ioctl::ioctl_with_mut_ref;
 use vmm_sys_util::ioctl_iowr_nr;
@@ -299,7 +296,6 @@ pub struct UffdHandler {
     backing_buffer: *const u8,
     pub uffd: Uffd,
     removed_pages: HashSet<u64>,
-    pub faulted_pages: HashSet<usize>,
     pub guest_memfd: Option<File>,
     pub guest_memfd_addr: Option<*mut u8>,
     pub userfault_bitmap: Option<UserfaultBitmap>,
@@ -407,7 +403,6 @@ impl UffdHandler {
                     backing_buffer,
                     uffd,
                     removed_pages: HashSet::new(),
-                    faulted_pages: HashSet::new(),
                     guest_memfd,
                     guest_memfd_addr,
                     userfault_bitmap,
@@ -419,7 +414,6 @@ impl UffdHandler {
                 backing_buffer,
                 uffd,
                 removed_pages: HashSet::new(),
-                faulted_pages: HashSet::new(),
                 guest_memfd: None,
                 guest_memfd_addr: None,
                 userfault_bitmap: None,
@@ -643,11 +637,11 @@ impl UffdMsgIterBitcode {
     }
 
     fn can_decode(&self) -> bool {
-        let Some(expeced_size) = self.expected_size() else {
+        let Some(expected_size) = self.expected_size() else {
             return false;
         };
 
-        self.current_pos - 4 >= expeced_size as usize
+        self.current_pos - 4 >= expected_size as usize
     }
 }
 
@@ -664,120 +658,16 @@ impl Iterator for UffdMsgIterBitcode {
         }
 
         if !self.can_decode() {
-            return None
+            return None;
         }
 
         let size = self.expected_size().unwrap() as usize;
         let found = bitcode::decode(&self.buffer[4..4 + size]).unwrap();
 
-        self.buffer.copy_within(4+size..self.current_pos, 0);
+        self.buffer.copy_within(4 + size..self.current_pos, 0);
         self.current_pos -= 4 + size;
 
         Some(found)
-    }
-}
-
-struct UffdMsgIteratorLocked {
-    stream: Arc<Mutex<UnixStream>>,
-    buffer: Vec<u8>,
-    current_pos: usize,
-}
-
-impl UffdMsgIteratorLocked {
-    fn new(stream: Arc<Mutex<UnixStream>>) -> Self {
-        Self {
-            stream,
-            buffer: vec![0u8; 4096],
-            current_pos: 0,
-        }
-    }
-}
-
-impl Iterator for UffdMsgIteratorLocked {
-    type Item = FaultRequest;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.stream.lock().unwrap().read(&mut self.buffer[self.current_pos..]) {
-            Ok(bytes_read) => self.current_pos += bytes_read,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Continue with existing buffer data
-            }
-            Err(e) => panic!("Failed to read from stream: {}", e,),
-        }
-
-        if self.current_pos == 0 {
-            return None;
-        }
-
-        let str_slice = std::str::from_utf8(&self.buffer[..self.current_pos]).unwrap();
-        let mut stream: StreamDeserializer<_, Self::Item> =
-            Deserializer::from_str(str_slice).into_iter();
-
-        match stream.next()? {
-            Ok(value) => {
-                let consumed = stream.byte_offset();
-                self.buffer.copy_within(consumed..self.current_pos, 0);
-                self.current_pos -= consumed;
-                Some(value)
-            }
-            Err(e) => panic!(
-                "Failed to deserialize JSON message: {}. Error: {}",
-                String::from_utf8_lossy(&self.buffer[..self.current_pos]),
-                e
-            ),
-        }
-    }
-}
-
-struct UffdMsgIterator {
-    stream: UnixStream,
-    buffer: Vec<u8>,
-    current_pos: usize,
-}
-
-impl UffdMsgIterator {
-    fn new(stream: UnixStream) -> Self {
-        Self {
-            stream,
-            buffer: vec![0u8; 4096],
-            current_pos: 0,
-        }
-    }
-}
-
-impl Iterator for UffdMsgIterator {
-    type Item = FaultRequest;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.stream.read(&mut self.buffer[self.current_pos..]) {
-            Ok(bytes_read) => self.current_pos += bytes_read,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Continue with existing buffer data
-            }
-            Err(e) => panic!("Failed to read from stream: {}", e,),
-        }
-
-        if self.current_pos == 0 {
-            return None;
-        }
-
-        let str_slice = std::str::from_utf8(&self.buffer[..self.current_pos]).unwrap();
-        let mut stream: StreamDeserializer<_, Self::Item> =
-            Deserializer::from_str(str_slice).into_iter();
-
-        match stream.next()? {
-            Ok(value) => {
-                let consumed = stream.byte_offset();
-                self.buffer.copy_within(consumed..self.current_pos, 0);
-                self.current_pos -= consumed;
-                Some(value)
-            }
-            Err(e) => panic!(
-                "Failed to deserialize JSON message: {}. Error: {}",
-                String::from_utf8_lossy(&self.buffer[..self.current_pos]),
-                e
-            ),
-        }
     }
 }
 
@@ -854,8 +744,7 @@ impl Runtime {
             stream.set_nonblocking(false).expect("set nonblocking");
         }
 
-        println!("Waiting for exitless APF fds");
-        let (bytes_read, fds_read) = {
+        let (_bytes_read, fds_read) = {
             let stream = self.stream.lock().unwrap();
             let mut iovecs = [libc::iovec {
                 iov_base: msg_buf.as_mut_ptr().cast(),
@@ -871,16 +760,12 @@ impl Runtime {
             }
         };
 
-        let message = String::from_utf8_lossy(&msg_buf[..bytes_read]);
-        println!("Received: {bytes_read} bytes, {fds_read} fds. Message: {message:?}");
-
         {
             let stream = self.stream.lock().unwrap();
             stream.set_nonblocking(true).expect("set nonblocking");
         }
 
         if fds_read == 0 || fds_read % 3 != 0 {
-            println!("Expected 3 fds per vCPU, got {fds_read}");
             return Ok(false);
         }
 
@@ -896,7 +781,7 @@ impl Runtime {
             self.exitless_vcpus.insert(eventfd, ctx);
         }
 
-        println!("Exitless APF ready for {} vCPUs", num_vcpus);
+        println!("Exitless APF: {} vCPUs configured", num_vcpus);
         Ok(!self.exitless_vcpus.is_empty())
     }
 
@@ -937,7 +822,7 @@ impl Runtime {
         }));
     }
 
-    pub fn send_fault_reply(&mut self, fault_reply: FaultReply, sender: &Sender<Vec<u8>>) {
+    pub fn send_reply(&mut self, fault_reply: FaultReply, sender: &Sender<Vec<u8>>) {
         let encoded = self.encode_buffer.encode(&fault_reply);
         let size = encoded.len() as u32;
         self.message_buffer[..4].copy_from_slice(&size.to_le_bytes());
@@ -945,30 +830,6 @@ impl Runtime {
 
         let data = Vec::from(&self.message_buffer[..4 + (size as usize)]);
         sender.send_blocking(data).unwrap();
-    }
-
-    pub fn send_apf_reply(&mut self, fault_reply: FaultReply, sender: &Sender<Vec<u8>>) {
-        let encoded = self.encode_buffer.encode(&fault_reply);
-        let size = encoded.len() as u32;
-        self.message_buffer[..4].copy_from_slice(&size.to_le_bytes());
-        self.message_buffer[4..4 + encoded.len()].copy_from_slice(encoded);
-
-        let data = Vec::from(&self.message_buffer[..4 + (size as usize)]);
-        sender.send_blocking(data).unwrap();
-
-        // let reply = UffdMsgToFirecracker::FaultRep(fault_reply);
-        // let reply_json = serde_json::to_string(&reply).unwrap();
-        // self.apf_stream.write_all(reply_json.as_bytes()).unwrap();
-        // let stream = self.apf_stream.clone();
-        //
-        // spawn(move || {
-        //     println!("Sending delayed apf");
-        //     sleep(Duration::from_micros(500));
-        //
-        //     let reply = UffdMsgToFirecracker::FaultRep(fault_reply);
-        //     let reply_json = serde_json::to_string(&reply).unwrap();
-        //     stream.lock().unwrap().write_all(reply_json.as_bytes()).unwrap();
-        // });
     }
 
     pub fn construct_handler(
@@ -1052,8 +913,6 @@ impl Runtime {
         spawn(move || {
             smol::block_on(async {
                 while let Ok(message) = r_recv.recv().await {
-                    // let delay = random_range(0..5000);
-                    // Timer::after(Duration::from_micros(delay)).await;
                     r_stream.lock().unwrap().write_all(&message).unwrap();
                 }
             });
@@ -1064,21 +923,16 @@ impl Runtime {
         spawn(move || {
             smol::block_on(async {
                 while let Ok(message) = a_recv.recv().await {
-                    // let delay = random_range(0..5000);
-                    // Timer::after(Duration::from_micros(delay)).await;
                     a_stream.lock().unwrap().write_all(&message).unwrap();
                 }
             });
         });
-
-        let mut _regular_fault_count = 0;
 
         let stream_fd = self.stream.lock().unwrap().as_raw_fd();
         let apf_fd = self.apf_stream.lock().unwrap().as_raw_fd();
 
         // Try to receive exitless APF fds from Firecracker
         if let Ok(true) = self.try_receive_exitless_apf() {
-            // Add exitless eventfds to poll list
             for ctx in self.exitless_vcpus.values() {
                 pollfds.push(libc::pollfd {
                     fd: ctx.eventfd,
@@ -1086,10 +940,6 @@ impl Runtime {
                     revents: 0,
                 });
             }
-
-            println!("Exitless APF ready for {} vCPUs", self.exitless_vcpus.len());
-        } else {
-            println!("No exitless APF fds received..");
         }
 
         loop {
@@ -1118,13 +968,12 @@ impl Runtime {
                                 (fault_request.offset as usize) < self.handler.size(),
                                 "received bogus offset from firecracker"
                             );
-                            _regular_fault_count += 1;
                             pf_vcpu_event_dispatch(
                                 &mut self.handler,
                                 fault_request.offset as usize,
                             );
 
-                            self.send_fault_reply(fault_request.into_reply(page_size as u64), &r_send);
+                            self.send_reply(fault_request.into_reply(page_size as u64), &r_send);
                         }
                     } else if fd.fd == apf_fd {
                         for mut fault_request in apf_msg_iter.by_ref() {
@@ -1144,7 +993,7 @@ impl Runtime {
                                 &mut self.handler,
                                 fault_request.offset as usize,
                             );
-                            self.send_apf_reply(fault_request.into_reply(page_size as u64), &a_send);
+                            self.send_reply(fault_request.into_reply(page_size as u64), &a_send);
                         }
                     } else if let Some(ctx) = self.exitless_vcpus.get_mut(&fd.fd) {
                         ctx.drain_eventfd();

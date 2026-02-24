@@ -28,7 +28,12 @@ use vmm_sys_util::ioctl_iow_nr;
 
 const KVMIO: u32 = 0xAE;
 
-ioctl_iow_nr!(KVM_SET_APF_EVENTFD, KVMIO, 0xd9, KvmApfEventfd);
+/// `KVM_SET_APF_EVENTFD` ioctl — registers eventfds for exitless APF.
+mod apf_eventfd_ioctl {
+    use super::*;
+    ioctl_iow_nr!(KVM_SET_APF_EVENTFD, KVMIO, 0xd9, KvmApfEventfd);
+}
+use apf_eventfd_ioctl::KVM_SET_APF_EVENTFD;
 
 /// Matches kernel `KVM_APF_RING_SIZE`.
 pub const KVM_APF_RING_SIZE: usize = 32;
@@ -37,10 +42,15 @@ pub const KVM_APF_RING_SIZE: usize = 32;
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct KvmApfEventfd {
+    /// Notification eventfd file descriptor.
     pub fd: i32,
+    /// Completion eventfd file descriptor.
     pub complete_fd: i32,
+    /// Address of the shared page.
     pub page_addr: u64,
+    /// Flags (currently unused).
     pub flags: u32,
+    /// Padding for alignment.
     pub padding: u32,
 }
 
@@ -48,7 +58,9 @@ pub struct KvmApfEventfd {
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct KvmApfRingEntry {
+    /// Guest physical address.
     pub gpa: u64,
+    /// Entry flags.
     pub flags: u64,
 }
 
@@ -56,22 +68,50 @@ pub struct KvmApfRingEntry {
 /// Producer writes head, consumer writes tail.
 #[repr(C)]
 pub struct KvmApfRing {
+    /// Producer index.
     pub head: AtomicU32,
+    /// Consumer index.
     pub tail: AtomicU32,
+    /// Reserved field.
     pub reserved: u32,
+    /// Padding for alignment.
     pub padding: u32,
+    /// Ring entries.
     pub entries: [KvmApfRingEntry; KVM_APF_RING_SIZE],
+}
+
+// Debug cannot be derived due to AtomicU32 fields.
+impl std::fmt::Debug for KvmApfRing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KvmApfRing")
+            .field("head", &self.head.load(Ordering::Relaxed))
+            .field("tail", &self.tail.load(Ordering::Relaxed))
+            .finish()
+    }
 }
 
 /// Matches kernel `struct kvm_apf_shared_page`.
 /// Both rings live in a single PAGE_SIZE mmap.
 #[repr(C)]
 pub struct KvmApfSharedPage {
+    /// Notification ring (kernel → userspace).
     pub notify: KvmApfRing,
+    /// Completion ring (userspace → kernel).
     pub complete: KvmApfRing,
 }
 
+// Debug cannot be derived due to KvmApfRing.
+impl std::fmt::Debug for KvmApfSharedPage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KvmApfSharedPage")
+            .field("notify", &self.notify)
+            .field("complete", &self.complete)
+            .finish()
+    }
+}
+
 impl KvmApfRing {
+    /// Returns true if the ring has entries to consume.
     pub fn has_entries(&self) -> bool {
         self.head.load(Ordering::Acquire) != self.tail.load(Ordering::Relaxed)
     }
@@ -100,12 +140,16 @@ impl KvmApfRing {
         if next == tail {
             return false;
         }
-        let slot = (self as *const KvmApfRing as *mut KvmApfRing)
-            .cast::<u8>()
-            .add(std::mem::offset_of!(KvmApfRing, entries))
-            .cast::<KvmApfRingEntry>()
-            .add(head as usize);
-        std::ptr::write(slot, entry);
+        // SAFETY: Caller guarantees exclusive producer access. The pointer
+        // arithmetic is within the bounds of the entries array.
+        unsafe {
+            let slot = (self as *const KvmApfRing as *mut KvmApfRing)
+                .cast::<u8>()
+                .add(std::mem::offset_of!(KvmApfRing, entries))
+                .cast::<KvmApfRingEntry>()
+                .add(head as usize);
+            std::ptr::write(slot, entry);
+        }
         self.head.store(next, Ordering::Release);
         true
     }
@@ -143,6 +187,7 @@ unsafe impl Send for ExitlessApfContext {}
 unsafe impl Sync for ExitlessApfContext {}
 
 impl ExitlessApfContext {
+    /// Create a new exitless APF context for the given vCPU fd.
     pub fn new(vcpu_fd: RawFd) -> io::Result<Self> {
         let eventfd = EventFd::new(libc::EFD_NONBLOCK)?;
         let complete_eventfd = EventFd::new(libc::EFD_NONBLOCK)?;
@@ -200,26 +245,32 @@ impl ExitlessApfContext {
         })
     }
 
+    /// Returns a reference to the notification eventfd.
     pub fn eventfd(&self) -> &EventFd {
         &self.eventfd
     }
 
+    /// Returns the raw fd of the notification eventfd.
     pub fn eventfd_fd(&self) -> RawFd {
         self.eventfd.as_raw_fd()
     }
 
+    /// Returns a reference to the completion eventfd.
     pub fn complete_eventfd(&self) -> &EventFd {
         &self.complete_eventfd
     }
 
+    /// Returns the raw fd of the completion eventfd.
     pub fn complete_eventfd_fd(&self) -> RawFd {
         self.complete_eventfd.as_raw_fd()
     }
 
+    /// Returns true if there are pending notification entries.
     pub fn has_pending(&self) -> bool {
         unsafe { (*self.shared_page).notify.has_entries() }
     }
 
+    /// Pop the next notification entry, if any.
     pub fn pop_entry(&self) -> Option<KvmApfRingEntry> {
         unsafe { (*self.shared_page).notify.pop() }
     }
@@ -235,6 +286,7 @@ impl ExitlessApfContext {
         pushed
     }
 
+    /// Drain the notification eventfd counter.
     pub fn drain_eventfd(&self) {
         let _ = self.eventfd.read();
     }

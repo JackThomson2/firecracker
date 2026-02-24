@@ -14,11 +14,9 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use event_manager::{MutEventSubscriber, SubscriberOps};
-use kvm_bindings::kvm_enable_cap;
 use kvm_ioctls::Cap;
 use libc::EFD_NONBLOCK;
 use linux_loader::cmdline::Cmdline as LoaderKernelCmdline;
-use log::info;
 use utils::time::TimestampUs;
 #[cfg(target_arch = "aarch64")]
 use vm_memory::GuestAddress;
@@ -72,7 +70,7 @@ use crate::vmm_config::snapshot::{LoadSnapshotParams, MemBackendType};
 use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{MaybeBounce, MemoryError, create_memfd};
 use crate::vstate::vcpu::{SharedApfStream, Vcpu, VcpuError};
-use crate::vstate::vm::{GUEST_MEMFD_FLAG_NO_DIRECT_MAP, GUEST_MEMFD_FLAG_SUPPORT_SHARED, Vm};
+use crate::vstate::vm::{GUEST_MEMFD_FLAG_SUPPORT_SHARED, Vm};
 use crate::{device_manager, EventManager, UffdMessageBroker, Vmm, VmmError};
 
 /// Errors associated with starting the instance.
@@ -522,7 +520,6 @@ pub enum BuildMicrovmFromSnapshotError {
 }
 
 fn memfd_to_slice(memfd: &Option<File>) -> Result<Option<&mut [u8]>, MemoryError> {
-    info!("Memfd to slice now...");
     if let Some(bitmap_file) = memfd {
         let len = u64_to_usize(
             bitmap_file
@@ -576,7 +573,7 @@ pub fn build_microvm_from_snapshot(
     // Build Vmm.
     debug!("event_start: build microvm from snapshot");
 
-    let secret_free = true;
+    let secret_free = vm_resources.machine_config.secret_free;
 
     let mut kvm_capabilities = microvm_state.kvm_state.kvm_cap_modifiers.clone();
 
@@ -722,7 +719,6 @@ pub fn build_microvm_from_snapshot(
     }
 
     // Restore kvm vm state.
-    debug!("Resorting state..");
     #[cfg(target_arch = "x86_64")]
     vmm.vm.restore_state(&microvm_state.vm_state)?;
 
@@ -765,7 +761,6 @@ pub fn build_microvm_from_snapshot(
 
     debug!("Starting vcpus");
 
-    // vmm.set_guest_memory_private(false)?;
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
     vmm.start_vcpus(
         vcpus,
@@ -1169,6 +1164,8 @@ pub(crate) mod tests {
             guest_memfd: None,
             eventfd: None,
             apf_stream: None,
+            exitless_apf: Vec::new(),
+            exitless_apf_setup_done: false,
         }
     }
 

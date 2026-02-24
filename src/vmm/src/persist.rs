@@ -12,10 +12,9 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use log::error;
+use bitcode::{Decode, Encode};
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use bitcode::{Encode, Decode};
 use userfaultfd::{FeatureFlags, RegisterMode, Uffd, UffdBuilder};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
@@ -533,23 +532,18 @@ pub fn guest_memory_from_uffd(
     guest_memfd: Option<File>,
     userfault_bitmap_memfd: Option<&File>,
 ) -> GuestMemoryResult {
-    info!("Creating guest memory..");
     let guest_memfd_fd = guest_memfd.as_ref().map(|f| f.as_raw_fd());
-    info!("Creating guest memory from mappings..");
     let (guest_memory, backend_mappings) =
         create_guest_memory(mem_state, track_dirty_pages, huge_pages, guest_memfd)?;
 
-    info!("Creating uffd builder");
     let mut uffd_builder = UffdBuilder::new();
 
     // We only make use of this if balloon devices are present, but we can enable it unconditionally
     // because the only place the kernel checks this is in a hook from madvise, e.g. it doesn't
     // actively change the behavior of UFFD, only passively. Without balloon devices
     // we never call madvise anyway, so no need to put this into a conditional.
-    info!("Checking uffd features");
     uffd_builder.require_features(FeatureFlags::EVENT_REMOVE);
 
-    info!("Creating uffd now");
     let uffd = uffd_builder
         .close_on_exec(true)
         .non_blocking(true)
@@ -560,9 +554,7 @@ pub fn guest_memory_from_uffd(
     let mut mode = RegisterMode::MISSING;
     let mut fds = vec![uffd.as_raw_fd()];
 
-    info!("Creating gmem");
     if let Some(gmem) = guest_memfd_fd {
-        info!("Gmem is some..");
         mode = RegisterMode::from_bits_retain(UFFDIO_REGISTER_MODE_MINOR);
         fds.push(gmem);
         fds.push(
@@ -572,19 +564,11 @@ pub fn guest_memory_from_uffd(
         );
     }
 
-    info!("Registering with mode...");
     for mem_region in guest_memory.iter() {
-        info!("Registering a region now..");
-        info!("Start of region: {:0x}. Size is : {}", mem_region.as_ptr() as usize, mem_region.size());
-        if let Err(err) = uffd.register_with_mode(mem_region.as_ptr().cast(), mem_region.size() as _, mode) {
-            if let userfaultfd::Error::SystemError(e) = err {
-                error!("We got error {e:?}");
-            }
-            panic!("Not good {err:?}");
-        }
+        uffd.register_with_mode(mem_region.as_ptr().cast(), mem_region.size() as _, mode)
+            .map_err(GuestMemoryFromUffdError::Register)?;
     }
 
-    info!("Sending uffd handshakre...");
     let socket = send_uffd_handshake(mem_uds_path, &backend_mappings, fds)?;
 
     Ok((guest_memory, Some(uffd), Some(socket)))

@@ -12,7 +12,6 @@ use std::ptr::null_mut;
 use std::sync::Arc;
 
 use kvm_bindings::KVMIO;
-use log::info;
 use serde::{Deserialize, Serialize};
 pub use vm_memory::bitmap::{AtomicBitmap, BS, Bitmap, BitmapSlice};
 pub use vm_memory::mmap::MmapRegionBuilder;
@@ -63,21 +62,35 @@ pub enum MemoryError {
     Mmap(std::io::Error),
 }
 
+/// Request structure for the `KVM_ASYNC_PF` ioctl.
 #[derive(Debug, Copy, Clone)]
 #[repr(C)]
 pub struct KvmAPFReq {
+    /// Guest physical address of the faulting page.
     pub gpa: u64,
+    /// Operation code (ready, accept, or sync-complete).
     pub op: u32,
+    /// Flags (currently unused, must be 0).
     pub flags: u32,
+    /// Reserved for future use.
     pub reserved: [u64; 2],
 }
 
-/// Ops for KVM_ASYNC_PF ioctl
+/// Mark an async page fault as ready (page is now available).
 pub const KVM_APF_OP_READY: u32 = 0;
+/// Accept an async page fault (vCPU acknowledges the APF).
 pub const KVM_APF_OP_ACCEPT: u32 = 1;
+/// Signal synchronous completion of an async page fault.
+#[allow(dead_code)]
 pub const KVM_APF_OP_SYNC_COMPLETE: u32 = 2;
 
-ioctl_iow_nr!(KVM_ASYNC_PF, KVMIO, 0xd6, KvmAPFReq);
+/// `KVM_ASYNC_PF` ioctl — manages async page faults on a vCPU.
+#[allow(missing_docs)]
+mod apf_ioctl {
+    use super::*;
+    ioctl_iow_nr!(KVM_ASYNC_PF, KVMIO, 0xd6, KvmAPFReq);
+}
+pub use apf_ioctl::KVM_ASYNC_PF;
 
 /// Newtype that implements [`ReadVolatile`] and [`WriteVolatile`] if `T` implements `Read` or
 /// `Write` respectively, by reading/writing using a bounce buffer, and memcpy-ing into the
@@ -242,8 +255,6 @@ pub fn create(
             } else {
                 (-1, 0)
             };
-
-            info!("MMAP on file now.. FD {fd} offset {fd_off}");
 
             // SAFETY: the arguments to mmap cannot cause any memory unsafety in the rust sense
             let ptr = unsafe {

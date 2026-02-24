@@ -34,6 +34,7 @@ use crate::vstate::vcpu::{SharedApfStream, VcpuError};
 use crate::{DirtyBitmap, Vcpu, mem_size_mib};
 
 pub(crate) const GUEST_MEMFD_FLAG_SUPPORT_SHARED: u64 = 1 << 0;
+#[allow(dead_code)]
 pub(crate) const GUEST_MEMFD_FLAG_NO_DIRECT_MAP: u64 = 1 << 1;
 
 /// KVM userfault information
@@ -46,9 +47,6 @@ pub struct UserfaultData {
     /// Size
     pub size: u64,
 }
-
-/// Shared guest memory reference for GPA to offset conversion
-pub type SharedGuestMemory = std::sync::Arc<std::sync::RwLock<GuestMemoryMmap>>;
 
 /// Architecture independent parts of a VM.
 #[derive(Debug)]
@@ -315,8 +313,6 @@ impl Vm {
             None => 0,
         };
 
-        info!("Memory flags set: {flags:0b}");
-
         let memory_region = kvm_userspace_memory_region2 {
             slot: next_slot,
             guest_phys_addr: region.start_addr().raw_value(),
@@ -332,10 +328,8 @@ impl Vm {
         let new_guest_memory = self.common.guest_memory.insert_region(Arc::new(region))?;
 
         if self.fd().check_extension(Cap::UserMemory2) {
-            info!("Using usermemory 2");
             self.set_user_memory_region2(memory_region)?;
         } else {
-            info!("Using normal usermemory");
             // Something is seriously wrong if we manage to set these fields on a host that doesn't
             // even allow creation of guest_memfds!
             assert_eq!(memory_region.guest_memfd, 0);
