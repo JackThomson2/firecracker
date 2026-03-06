@@ -274,7 +274,7 @@ pub fn build_microvm_for_boot(
         .cpu_template
         .get_cpu_template()?;
 
-    let secret_free = vm_resources.machine_config.secret_free;
+    let secret_free = true; //vm_resources.machine_config.secret_free;
 
     let (mut vmm, mut vcpus) = create_vmm_and_vcpus(
         instance_info,
@@ -573,7 +573,7 @@ pub fn build_microvm_from_snapshot(
     // Build Vmm.
     debug!("event_start: build microvm from snapshot");
 
-    let secret_free = vm_resources.machine_config.secret_free;
+    let secret_free = true; // vm_resources.machine_config.secret_free;
 
     let mut kvm_capabilities = microvm_state.kvm_state.kvm_cap_modifiers.clone();
 

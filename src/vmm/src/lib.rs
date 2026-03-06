@@ -1000,15 +1000,10 @@ impl Vmm {
             let vcpu = fault_reply.vcpu.expect("vCPU must be set") as usize;
             let gpa = fault_reply.gpa.unwrap();
 
-            // Use exitless completion ring if available, otherwise fall back to ioctl
-            if vcpu < self.exitless_apf.len() {
-                if !self.exitless_apf[vcpu].signal_complete(gpa) {
-                    warn!("Completion ring full for vCPU {vcpu}, falling back to ioctl");
-                    self.apf_ready_ioctl(vcpu, gpa);
-                }
-            } else {
-                self.apf_ready_ioctl(vcpu, gpa);
-            }
+            // This is the fallback path — only used when the exitless notify
+            // ring was full and the vCPU exited. The handler resolved the page
+            // and replied over the socket. Signal KVM directly via ioctl.
+            self.apf_ready_ioctl(vcpu, gpa);
         }
     }
 

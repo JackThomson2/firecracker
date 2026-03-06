@@ -174,6 +174,42 @@ impl Drop for ExitlessApfVcpu {
     }
 }
 
+/// Wrapper to send a raw shared-page pointer across threads.
+///
+/// # Safety
+/// The shared page is backed by a memfd mmap that outlives all spawned tasks.
+struct SendableSharedPage(*mut KvmApfSharedPage);
+unsafe impl Send for SendableSharedPage {}
+
+/// A deferred APF completion request.
+struct ApfCompletion {
+    shared_page: SendableSharedPage,
+    complete_eventfd: RawFd,
+    gpa: u64,
+}
+unsafe impl Send for ApfCompletion {}
+
+/// Signal APF completion via the shared completion ring + eventfd.
+///
+/// Thread-safe: only touches a shared mmap and a raw fd write.
+fn signal_apf_ready(shared_page: SendableSharedPage, complete_eventfd: RawFd, gpa: u64) {
+    let ring = unsafe { &(*shared_page.0).complete };
+    let head = ring.head.load(Ordering::Relaxed);
+    let tail = ring.tail.load(Ordering::Acquire);
+    let next = (head + 1) % KVM_APF_RING_SIZE as u32;
+    if next == tail {
+        return; // Ring full
+    }
+    let entry = KvmApfRingEntry { gpa, flags: 0 };
+    unsafe {
+        let slot = &raw const ring.entries[head as usize] as *mut KvmApfRingEntry;
+        ptr::write(slot, entry);
+    }
+    ring.head.store(next, Ordering::Release);
+    let val: u64 = 1;
+    unsafe { libc::write(complete_eventfd, &val as *const u64 as *const c_void, 8) };
+}
+
 #[repr(C)]
 struct uffdio_range {
     start: u64,
@@ -781,7 +817,7 @@ impl Runtime {
             self.exitless_vcpus.insert(eventfd, ctx);
         }
 
-        println!("Exitless APF: {} vCPUs configured", num_vcpus);
+        println!("Exitless APF: {num_vcpus} vCPUs configured");
         Ok(!self.exitless_vcpus.is_empty())
     }
 
@@ -928,6 +964,19 @@ impl Runtime {
             });
         });
 
+        // Exitless APF completion channel — signals completion with artificial delay.
+        let (apf_complete_send, apf_complete_recv) = unbounded::<ApfCompletion>();
+        spawn(move || {
+            smol::block_on(async {
+                while let Ok(req) = apf_complete_recv.recv().await {
+                    smol::spawn(async move {
+                        smol::Timer::after(Duration::from_micros(100)).await;
+                        signal_apf_ready(req.shared_page, req.complete_eventfd, req.gpa);
+                    }).detach();
+                }
+            });
+        });
+
         let stream_fd = self.stream.lock().unwrap().as_raw_fd();
         let apf_fd = self.apf_stream.lock().unwrap().as_raw_fd();
 
@@ -998,11 +1047,22 @@ impl Runtime {
                     } else if let Some(ctx) = self.exitless_vcpus.get_mut(&fd.fd) {
                         ctx.drain_eventfd();
 
+                        let complete_eventfd = ctx.complete_eventfd;
+                        let shared_page = ctx.shared_page;
+
                         while let Some(entry) = ctx.notify_ring().pop() {
                             let gpa = entry.gpa;
                             if let Some(offset) = self.handler.gpa_to_offset(gpa) {
                                 pf_vcpu_event_dispatch(&mut self.handler, offset as usize);
-                                ctx.signal_ready(gpa);
+                                signal_apf_ready(SendableSharedPage(shared_page), complete_eventfd, gpa);
+
+                                // apf_complete_send
+                                //     .send_blocking(ApfCompletion {
+                                //         shared_page: SendableSharedPage(shared_page),
+                                //         complete_eventfd,
+                                //         gpa,
+                                //     })
+                                //     .unwrap();
                             }
                         }
                     } else {

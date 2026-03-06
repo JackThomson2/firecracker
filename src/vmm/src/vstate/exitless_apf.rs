@@ -275,17 +275,6 @@ impl ExitlessApfContext {
         unsafe { (*self.shared_page).notify.pop() }
     }
 
-    /// Signal completion of an APF by writing GPA to the completion ring
-    /// and signaling the completion eventfd.
-    pub fn signal_complete(&self, gpa: u64) -> bool {
-        let entry = KvmApfRingEntry { gpa, flags: 0 };
-        let pushed = unsafe { (*self.shared_page).complete.push(entry) };
-        if pushed {
-            let _ = self.complete_eventfd.write(1);
-        }
-        pushed
-    }
-
     /// Drain the notification eventfd counter.
     pub fn drain_eventfd(&self) {
         let _ = self.eventfd.read();

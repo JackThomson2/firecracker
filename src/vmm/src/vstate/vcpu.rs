@@ -483,18 +483,19 @@ impl Vcpu {
         let is_async_pf = userfaultfd_data.flags & KVM_MEMORY_EXIT_FLAG_APF != 0;
 
         if is_async_pf {
-            // Send APF request directly to handler — handler converts GPA to offset
+            // Exitless ring was full — kernel fell back to a vCPU exit.
+            // Send APF request directly to handler for resolution, then
+            // accept so the vCPU can re-enter immediately.
             if let Some(stream) = &self.apf_stream {
                 let fault_request = FaultRequest {
                     vcpu: self.kvm_vcpu.index as u32,
-                    offset: 0, // Handler will compute from GPA
+                    offset: 0,
                     flags: userfaultfd_data.flags,
                     gpa: Some(userfaultfd_data.gpa),
                 };
                 stream.lock().unwrap().send_fault_request(fault_request);
             }
 
-            // Accept the APF via KVM_ASYNC_PF ioctl
             let req = crate::vstate::memory::KvmAPFReq {
                 gpa: userfaultfd_data.gpa,
                 op: crate::vstate::memory::KVM_APF_OP_ACCEPT,
@@ -502,7 +503,6 @@ impl Vcpu {
                 reserved: [0; 2],
             };
             let vcpu_raw_fd = self.kvm_vcpu.fd.as_raw_fd();
-            // SAFETY: ioctl on a valid vcpu fd with a valid req reference
             unsafe {
                 vmm_sys_util::ioctl::ioctl_with_ref(
                     &vcpu_raw_fd,
