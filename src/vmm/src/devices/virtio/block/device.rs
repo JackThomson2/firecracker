@@ -1,6 +1,7 @@
 // Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 
 use event_manager::{EventOps, Events, MutEventSubscriber};
@@ -99,6 +100,38 @@ impl Block {
         match self {
             Self::Virtio(b) => b.read_only,
             Self::VhostUser(b) => b.read_only,
+        }
+    }
+
+    /// Get the rate limiter fd (for async event loop).
+    pub fn rate_limiter_fd(&self) -> RawFd {
+        match self {
+            Self::Virtio(b) => b.rate_limiter.as_raw_fd(),
+            Self::VhostUser(_) => -1,
+        }
+    }
+
+    /// Get the async completion fd if using async IO engine.
+    pub fn async_completion_fd(&self) -> Option<RawFd> {
+        match self {
+            Self::Virtio(b) => b.async_completion_fd(),
+            Self::VhostUser(_) => None,
+        }
+    }
+
+    /// Process rate limiter event (for async event loop).
+    pub fn process_rate_limiter_event(&mut self) {
+        match self {
+            Self::Virtio(b) => b.process_rate_limiter_event(),
+            Self::VhostUser(_) => {}
+        }
+    }
+
+    /// Process async completion event (for async event loop).
+    pub fn process_async_completion_event(&mut self) {
+        match self {
+            Self::Virtio(b) => b.process_async_completion_event(),
+            Self::VhostUser(_) => {}
         }
     }
 
@@ -212,6 +245,35 @@ impl VirtioDevice for Block {
         match self {
             Self::Virtio(b) => b.prepare_save(),
             Self::VhostUser(b) => b.prepare_save(),
+        }
+    }
+
+    fn async_fd_tags(&self) -> Vec<(RawFd, u32)> {
+        match self {
+            Self::Virtio(b) => {
+                let mut fds = vec![(b.queue_evts[0].as_raw_fd(), 1)]; // PROCESS_QUEUE
+                fds.push((b.rate_limiter.as_raw_fd(), 2)); // PROCESS_RATE_LIMITER
+                if let Some(fd) = b.async_completion_fd() {
+                    fds.push((fd, 3)); // PROCESS_ASYNC_COMPLETION
+                }
+                fds
+            }
+            Self::VhostUser(_) => Vec::new(),
+        }
+    }
+
+    fn process_async_event(&mut self, tag: u32) {
+        if !self.is_activated() {
+            return;
+        }
+        match self {
+            Self::Virtio(b) => match tag {
+                1 => b.process_queue_event(),
+                2 => b.process_rate_limiter_event(),
+                3 => b.process_async_completion_event(),
+                _ => {}
+            },
+            Self::VhostUser(_) => {}
         }
     }
 }

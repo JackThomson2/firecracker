@@ -22,33 +22,25 @@ use vmm::logger::{
 use vmm::rpc_interface::{ApiRequest, ApiResponse, VmmAction};
 use vmm::seccomp::BpfProgramRef;
 use vmm::vmm_config::snapshot::SnapshotType;
-use vmm_sys_util::eventfd::EventFd;
 
 /// Structure associated with the API server implementation.
 #[derive(Debug)]
 pub struct ApiServer {
-    /// Sender which allows passing messages to the VMM.
-    api_request_sender: mpsc::Sender<ApiRequest>,
+    /// Sender which allows passing messages to the VMM (tokio mpsc).
+    api_request_sender: tokio::sync::mpsc::Sender<ApiRequest>,
     /// Receiver which collects messages from the VMM.
     vmm_response_receiver: mpsc::Receiver<ApiResponse>,
-    /// FD on which we notify the VMM that we have sent at least one
-    /// `VmmRequest`.
-    to_vmm_fd: EventFd,
 }
 
 impl ApiServer {
     /// Constructor for `ApiServer`.
-    ///
-    /// Returns the newly formed `ApiServer`.
     pub fn new(
-        api_request_sender: mpsc::Sender<ApiRequest>,
+        api_request_sender: tokio::sync::mpsc::Sender<ApiRequest>,
         vmm_response_receiver: mpsc::Receiver<ApiResponse>,
-        to_vmm_fd: EventFd,
     ) -> Self {
         ApiServer {
             api_request_sender,
             vmm_response_receiver,
-            to_vmm_fd,
         }
     }
 
@@ -168,9 +160,8 @@ impl ApiServer {
         };
 
         self.api_request_sender
-            .send(vmm_action)
+            .blocking_send(vmm_action)
             .expect("Failed to send VMM message");
-        self.to_vmm_fd.write(1).expect("Cannot update send VMM fd");
         let vmm_outcome = *(self.vmm_response_receiver.recv().expect("VMM disconnected"));
         let response = ParsedRequest::convert_to_response(&vmm_outcome);
 
@@ -241,11 +232,10 @@ mod tests {
 
     #[test]
     fn test_serve_vmm_action_request() {
-        let to_vmm_fd = EventFd::new(libc::EFD_NONBLOCK).unwrap();
-        let (api_request_sender, _from_api) = channel();
+        let (api_request_sender, _from_api) = tokio::sync::mpsc::channel(1);
         let (to_api, vmm_response_receiver) = channel();
 
-        let mut api_server = ApiServer::new(api_request_sender, vmm_response_receiver, to_vmm_fd);
+        let mut api_server = ApiServer::new(api_request_sender, vmm_response_receiver);
         to_api
             .send(Box::new(Err(VmmActionError::StartMicrovm(
                 StartMicrovmError::MissingKernelConfig,
@@ -299,11 +289,10 @@ mod tests {
 
     #[test]
     fn test_handle_request() {
-        let to_vmm_fd = EventFd::new(libc::EFD_NONBLOCK).unwrap();
-        let (api_request_sender, _from_api) = channel();
+        let (api_request_sender, _from_api) = tokio::sync::mpsc::channel(1);
         let (to_api, vmm_response_receiver) = channel();
 
-        let mut api_server = ApiServer::new(api_request_sender, vmm_response_receiver, to_vmm_fd);
+        let mut api_server = ApiServer::new(api_request_sender, vmm_response_receiver);
 
         // Test an Actions request.
         let (mut sender, receiver) = UnixStream::pair().unwrap();
@@ -379,15 +368,14 @@ mod tests {
         let path_to_socket = tmp_socket.as_path().to_str().unwrap().to_owned();
         let api_thread_path_to_socket = path_to_socket.clone();
 
-        let to_vmm_fd = EventFd::new(libc::EFD_NONBLOCK).unwrap();
-        let (api_request_sender, _from_api) = channel();
+        let (api_request_sender, _from_api) = tokio::sync::mpsc::channel(1);
         let (to_api, vmm_response_receiver) = channel();
         let seccomp_filters = get_empty_filters();
         let server = HttpServer::new(PathBuf::from(api_thread_path_to_socket)).unwrap();
         thread::Builder::new()
             .name("fc_api_test".to_owned())
             .spawn(move || {
-                ApiServer::new(api_request_sender, vmm_response_receiver, to_vmm_fd).run(
+                ApiServer::new(api_request_sender, vmm_response_receiver).run(
                     server,
                     ProcessTimeReporter::new(Some(1), Some(1), Some(1)),
                     seccomp_filters.get("api").unwrap(),
@@ -421,8 +409,7 @@ mod tests {
         let path_to_socket = tmp_socket.as_path().to_str().unwrap().to_owned();
         let api_thread_path_to_socket = path_to_socket.clone();
 
-        let to_vmm_fd = EventFd::new(libc::EFD_NONBLOCK).unwrap();
-        let (api_request_sender, _from_api) = channel();
+        let (api_request_sender, _from_api) = tokio::sync::mpsc::channel(1);
         let (_to_api, vmm_response_receiver) = channel();
         let seccomp_filters = get_empty_filters();
 
@@ -430,7 +417,7 @@ mod tests {
         thread::Builder::new()
             .name("fc_api_test".to_owned())
             .spawn(move || {
-                ApiServer::new(api_request_sender, vmm_response_receiver, to_vmm_fd).run(
+                ApiServer::new(api_request_sender, vmm_response_receiver).run(
                     server,
                     ProcessTimeReporter::new(Some(1), Some(1), Some(1)),
                     seccomp_filters.get("api").unwrap(),
@@ -466,8 +453,7 @@ mod tests {
         tmp_socket.remove().unwrap();
         let path_to_socket = tmp_socket.as_path().to_str().unwrap().to_owned();
 
-        let to_vmm_fd = EventFd::new(libc::EFD_NONBLOCK).unwrap();
-        let (api_request_sender, _from_api) = channel();
+        let (api_request_sender, _from_api) = tokio::sync::mpsc::channel(1);
         let (_to_api, vmm_response_receiver) = channel();
         let seccomp_filters = get_empty_filters();
 
@@ -480,7 +466,7 @@ mod tests {
         let api_thread = thread::Builder::new()
             .name("fc_api_test".to_owned())
             .spawn(move || {
-                ApiServer::new(api_request_sender, vmm_response_receiver, to_vmm_fd).run(
+                ApiServer::new(api_request_sender, vmm_response_receiver).run(
                     server,
                     ProcessTimeReporter::new(Some(1), Some(1), Some(1)),
                     seccomp_filters.get("api").unwrap(),

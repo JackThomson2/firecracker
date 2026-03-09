@@ -496,6 +496,30 @@
             {
                 "syscall": "mprotect",
                 "comment": "Used by memory hotplug to protect access to underlying host memory"
+            },
+            {
+                "syscall": "epoll_create1",
+                "comment": "Tokio runtime creation"
+            },
+            {
+                "syscall": "fcntl",
+                "comment": "Tokio runtime: F_GETFL for non-blocking setup"
+            },
+            {
+                "syscall": "clone3",
+                "comment": "Tokio spawn_blocking threadpool"
+            },
+            {
+                "syscall": "set_robust_list",
+                "comment": "Tokio spawn_blocking threadpool"
+            },
+            {
+                "syscall": "rseq",
+                "comment": "Tokio spawn_blocking threadpool"
+            },
+            {
+                "syscall": "prctl",
+                "comment": "Tokio spawn_blocking threadpool"
             }
         ]
     },
@@ -568,8 +592,8 @@
                 "comment": "sigaltstack is used by Rust stdlib to remove alternative signal stack during thread teardown."
             },
             {
-              "syscall": "getrandom",
-              "comment": "getrandom is used by `HttpServer` to reinialize `HashMap` after moving to the API thread"
+                "syscall": "getrandom",
+                "comment": "getrandom is used by `HttpServer` to reinialize `HashMap` after moving to the API thread"
             },
             {
                 "syscall": "accept4",

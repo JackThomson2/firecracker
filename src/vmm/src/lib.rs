@@ -16,6 +16,12 @@
 /// Supported platforms: x86_64 and aarch64.
 pub mod arch;
 
+/// Async event loop using a single-threaded Tokio runtime.
+pub mod async_event_loop;
+
+/// Channel-based MMIO proxy for vCPU→device communication.
+pub mod mmio_proxy;
+
 /// High-level interface over Linux io_uring.
 ///
 /// Aims to provide an easy-to-use interface, while making some Firecracker-specific simplifying
@@ -326,9 +332,13 @@ pub struct Vmm {
     /// Handles to the vcpu threads with vcpu_fds inside them.
     pub vcpus_handles: Vec<VcpuHandle>,
     // Used by Vcpus and devices to initiate teardown; Vmm should never write here.
-    vcpus_exit_evt: EventFd,
+    /// EventFd used by vCPUs to signal exit to the VMM thread.
+    pub vcpus_exit_evt: EventFd,
     // Device manager
-    device_manager: DeviceManager,
+    /// Device manager for all peripheral devices.
+    pub device_manager: DeviceManager,
+    /// Device fd handlers for the async event loop, built before seccomp.
+    pub device_handlers: Option<Vec<crate::async_event_loop::FdHandler>>,
 }
 
 impl Vmm {

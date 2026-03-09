@@ -349,9 +349,8 @@ impl<'a> PrebootApiController<'a> {
         seccomp_filters: &BpfThreadMap,
         event_manager: &mut EventManager,
         instance_info: InstanceInfo,
-        from_api: &std::sync::mpsc::Receiver<ApiRequest>,
+        from_api: &mut tokio::sync::mpsc::Receiver<ApiRequest>,
         to_api: &std::sync::mpsc::Sender<ApiResponse>,
-        api_event_fd: &vmm_sys_util::eventfd::EventFd,
         boot_timer_enabled: bool,
         pci_enabled: bool,
         mmds_size_limit: usize,
@@ -386,14 +385,8 @@ impl<'a> PrebootApiController<'a> {
         while preboot_controller.built_vmm.is_none() {
             // Get request
             let req = from_api
-                .recv()
+                .blocking_recv()
                 .expect("The channel's sending half was disconnected. Cannot receive data.");
-
-            // Also consume the API event along with the message. It is safe to unwrap()
-            // because this event_fd is blocking.
-            api_event_fd
-                .read()
-                .expect("VMM: Failed to read the API event_fd");
 
             // Process the request.
             let res = preboot_controller.handle_preboot_request(*req);

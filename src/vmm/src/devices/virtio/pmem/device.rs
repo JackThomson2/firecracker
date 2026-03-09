@@ -408,6 +408,17 @@ impl VirtioDevice for Pmem {
             self.handle_queue();
         }
     }
+
+    fn async_fd_tags(&self) -> Vec<(std::os::unix::io::RawFd, u32)> {
+        use std::os::unix::io::AsRawFd;
+        vec![(self.queue_events()[0].as_raw_fd(), 1)]
+    }
+
+    fn process_async_event(&mut self, _tag: u32) {
+        if self.is_activated() {
+            self.process_queue();
+        }
+    }
 }
 
 #[cfg(test)]

@@ -608,43 +608,22 @@ fn run_without_api(
     mmds_size_limit: usize,
     metadata_json: Option<&str>,
 ) -> Result<(), RunWithoutApiError> {
-    let mut event_manager = EventManager::new().expect("Unable to create EventManager");
+    let tokio_rt = vmm::async_event_loop::create_runtime();
 
-    // Create the firecracker metrics object responsible for periodically printing metrics.
+    let mut event_manager = EventManager::new().expect("Unable to create EventManager");
     let firecracker_metrics = Arc::new(Mutex::new(metrics::PeriodicMetrics::new()));
     event_manager.add_subscriber(firecracker_metrics.clone());
 
-    // Build the microVm. We can ignore VmResources since it's not used without api.
     let vmm = build_microvm_from_json(
-        seccomp_filters,
-        &mut event_manager,
-        // Safe to unwrap since '--no-api' requires this to be set.
-        config_json.unwrap(),
-        instance_info,
-        bool_timer_enabled,
-        pci_enabled,
-        mmds_size_limit,
-        metadata_json,
-    )
-    .map_err(RunWithoutApiError::BuildMicroVMFromJson)?;
+        seccomp_filters, &mut event_manager, config_json.unwrap(), instance_info,
+        bool_timer_enabled, pci_enabled, mmds_size_limit, metadata_json,
+    ).map_err(RunWithoutApiError::BuildMicroVMFromJson)?;
 
-    // Start the metrics.
-    firecracker_metrics
-        .lock()
-        .expect("Poisoned lock")
+    firecracker_metrics.lock().expect("Poisoned lock")
         .start(metrics::WRITE_METRICS_PERIOD_MS);
 
-    // Run the EventManager that drives everything in the microVM.
-    loop {
-        event_manager
-            .run()
-            .expect("Failed to start the event manager");
+    let handlers = vmm.lock().unwrap().device_handlers.take().unwrap_or_default();
 
-        match vmm.lock().unwrap().shutdown_exit_code() {
-            Some(FcExitCode::Ok) => break,
-            Some(exit_code) => return Err(RunWithoutApiError::Shutdown(exit_code)),
-            None => continue,
-        }
-    }
-    Ok(())
+    vmm::async_event_loop::run_no_api(&tokio_rt, vmm, handlers)
+        .map_err(RunWithoutApiError::Shutdown)
 }

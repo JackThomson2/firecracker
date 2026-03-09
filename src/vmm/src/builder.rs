@@ -40,7 +40,7 @@ use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
 #[cfg(feature = "gdb")]
 use crate::gdb;
 use crate::initrd::{InitrdConfig, InitrdError};
-use crate::logger::debug;
+use crate::logger::{debug, info};
 use crate::persist::{MicrovmState, MicrovmStateError};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
@@ -320,6 +320,7 @@ pub fn build_microvm_for_boot(
         vcpus_handles: Vec::new(),
         vcpus_exit_evt,
         device_manager,
+        device_handlers: None,
     };
     let vmm = Arc::new(Mutex::new(vmm));
 
@@ -355,6 +356,12 @@ pub fn build_microvm_for_boot(
     // Execution panics if filters cannot be loaded, use --no-seccomp if skipping filters
     // altogether is the desired behaviour.
     // Keep this as the last step before resuming vcpus.
+
+    // Build device fd→handler map for the Tokio event loop BEFORE seccomp.
+    let device_handlers = crate::async_event_loop::build_device_handlers(&vmm.lock().unwrap());
+    info!("Built {} device handlers for async event loop", device_handlers.len());
+    vmm.lock().unwrap().device_handlers = Some(device_handlers);
+
     crate::seccomp::apply_filter(
         seccomp_filters
             .get("vmm")
@@ -522,6 +529,7 @@ pub fn build_microvm_from_snapshot(
         vcpus_handles: Vec::new(),
         vcpus_exit_evt,
         device_manager,
+        device_handlers: None,
     };
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
@@ -871,6 +879,7 @@ pub(crate) mod tests {
             vcpus_handles: Vec::new(),
             vcpus_exit_evt,
             device_manager: default_device_manager(),
+            device_handlers: None,
         }
     }
 

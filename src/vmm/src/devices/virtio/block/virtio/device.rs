@@ -11,6 +11,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom};
 use std::ops::Deref;
 use std::os::linux::fs::MetadataExt;
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -515,6 +516,15 @@ impl VirtioBlock {
                 .unwrap_or_else(|_| {
                     self.metrics.event_fails.inc();
                 });
+        }
+    }
+
+    /// Get the async completion fd, if using async IO engine.
+    pub fn async_completion_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        if let super::io::FileEngine::Async(ref engine) = self.disk.file_engine {
+            Some(engine.completion_evt().as_raw_fd())
+        } else {
+            None
         }
     }
 

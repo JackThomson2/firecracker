@@ -214,6 +214,14 @@ pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
 
     /// Prepare the device for saving its state
     fn prepare_save(&mut self) {}
+
+    /// Return (fd, tag) pairs for the async event loop.
+    fn async_fd_tags(&self) -> Vec<(std::os::unix::io::RawFd, u32)> {
+        Vec::new()
+    }
+
+    /// Process an async event identified by tag. Called when the fd becomes readable.
+    fn process_async_event(&mut self, _tag: u32) {}
 }
 
 impl fmt::Debug for dyn VirtioDevice {

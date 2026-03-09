@@ -960,6 +960,21 @@ impl VirtioDevice for Balloon {
             self.notify_queue_events();
         }
     }
+
+    fn async_fd_tags(&self) -> Vec<(std::os::unix::io::RawFd, u32)> {
+        use std::os::unix::io::AsRawFd;
+        self.queue_evts
+            .iter()
+            .enumerate()
+            .map(|(i, evt)| (evt.as_raw_fd(), (i + 1) as u32))
+            .collect()
+    }
+
+    fn process_async_event(&mut self, _tag: u32) {
+        if self.is_activated() {
+            let _ = self.process_virtio_queues();
+        }
+    }
 }
 
 #[cfg(test)]

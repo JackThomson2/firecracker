@@ -402,8 +402,58 @@ impl DeviceManager {
         }
     }
 
+    /// Collect all virtio devices as (type, id, Arc<Mutex<dyn VirtioDevice>>).
+    pub fn collect_virtio_devices(
+        &self,
+    ) -> Vec<(VirtioDeviceType, String, Arc<Mutex<dyn VirtioDevice>>)> {
+        let mut result = Vec::new();
+        if self.is_pci_enabled() {
+            for ((dev_type, dev_id), pci_dev) in &self.pci_devices.virtio_devices {
+                let vdev = pci_dev.lock().expect("Poisoned lock").virtio_device().clone();
+                result.push((*dev_type, dev_id.clone(), vdev));
+            }
+        } else {
+            for ((dev_type, dev_id), mmio_dev) in &self.mmio_devices.virtio_devices {
+                let vdev = mmio_dev.inner.lock().expect("Poisoned lock").device().clone();
+                result.push((*dev_type, dev_id.clone(), vdev));
+            }
+        }
+        result
+    }
+
     pub fn is_pci_enabled(&self) -> bool {
         self.pci_devices.pci_segment.is_some()
+    }
+
+    /// Replace all MMIO virtio devices on the bus with channel-based proxies.
+    /// Returns the MMIO channel receiver for the async event loop.
+    /// After this call, vCPU MMIO accesses go through the channel instead of
+    /// locking the device mutex directly.
+    pub fn swap_to_mmio_proxies(
+        &self,
+        bus: &crate::vstate::bus::Bus,
+    ) -> tokio::sync::mpsc::Receiver<crate::mmio_proxy::MmioRequest> {
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+
+        if !self.is_pci_enabled() {
+            for (_, mmio_dev) in &self.mmio_devices.virtio_devices {
+                let addr = mmio_dev.resources.addr;
+                let len = mmio_dev.resources.len;
+
+                // Remove old device from bus
+                let _ = bus.remove(addr, len);
+
+                // Insert proxy that forwards to the event loop
+                let proxy = Arc::new(crate::mmio_proxy::MmioProxy::new(
+                    tx.clone(),
+                    mmio_dev.inner.clone(),
+                ));
+                let _ = bus.insert(proxy, addr, len);
+            }
+        }
+        // TODO: PCI proxy support
+
+        rx
     }
 }
 

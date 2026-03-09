@@ -8,6 +8,7 @@
 use std::collections::VecDeque;
 use std::mem::{self};
 use std::net::Ipv4Addr;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::num::Wrapping;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
@@ -381,6 +382,21 @@ impl Net {
     /// Provides a reference to the configured TX rate limiter.
     pub fn tx_rate_limiter(&self) -> &RateLimiter {
         &self.tx_rate_limiter
+    }
+
+    /// Get tap fd for async event loop.
+    pub fn tap_fd(&self) -> RawFd {
+        self.tap.as_raw_fd()
+    }
+
+    /// Get rx rate limiter fd for async event loop.
+    pub fn rx_rate_limiter_fd(&self) -> RawFd {
+        self.rx_rate_limiter.as_raw_fd()
+    }
+
+    /// Get tx rate limiter fd for async event loop.
+    pub fn tx_rate_limiter_fd(&self) -> RawFd {
+        self.tx_rate_limiter.as_raw_fd()
     }
 
     /// Trigger queue notification for the guest if we used enough descriptors
@@ -1055,6 +1071,30 @@ impl VirtioDevice for Net {
         self.rx_buffer.iovec.clear();
         self.rx_buffer.used_bytes = 0;
         self.rx_buffer.used_descriptors = 0;
+    }
+
+    fn async_fd_tags(&self) -> Vec<(RawFd, u32)> {
+        let mut fds = Vec::new();
+        fds.push((self.queue_evts[0].as_raw_fd(), 1)); // RX queue
+        fds.push((self.queue_evts[1].as_raw_fd(), 2)); // TX queue
+        fds.push((self.tap.as_raw_fd(), 3)); // Tap RX
+        fds.push((self.rx_rate_limiter.as_raw_fd(), 4)); // RX rate limiter
+        fds.push((self.tx_rate_limiter.as_raw_fd(), 5)); // TX rate limiter
+        fds
+    }
+
+    fn process_async_event(&mut self, tag: u32) {
+        if !self.is_activated() {
+            return;
+        }
+        match tag {
+            1 => self.process_rx_queue_event(),
+            2 => self.process_tx_queue_event(),
+            3 => self.process_tap_rx_event(),
+            4 => self.process_rx_rate_limiter_event(),
+            5 => self.process_tx_rate_limiter_event(),
+            _ => {}
+        }
     }
 }
 
