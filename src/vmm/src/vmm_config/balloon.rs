@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 pub use crate::devices::virtio::balloon::BALLOON_DEV_ID;
 pub use crate::devices::virtio::balloon::device::BalloonStats;
 use crate::devices::virtio::balloon::{Balloon, BalloonConfig};
+use crate::DeviceMutex;
 
-type MutexBalloon = Arc<Mutex<Balloon>>;
+type MutexBalloon = Arc<DeviceMutex<Balloon>>;
 
 /// Errors associated with the operations allowed on the balloon.
 #[derive(Debug, derive_more::From, thiserror::Error, displaydoc::Display)]
@@ -90,7 +91,7 @@ impl BalloonBuilder {
     /// Inserts a Balloon device in the store.
     /// If an entry already exists, it will overwrite it.
     pub fn set(&mut self, cfg: BalloonDeviceConfig) -> Result<(), BalloonConfigError> {
-        self.inner = Some(Arc::new(Mutex::new(Balloon::new(
+        self.inner = Some(Arc::new(DeviceMutex::new(Balloon::new(
             cfg.amount_mib,
             cfg.deflate_on_oom,
             cfg.stats_polling_interval_s,
@@ -115,7 +116,7 @@ impl BalloonBuilder {
     pub fn get_config(&self) -> Result<BalloonDeviceConfig, BalloonConfigError> {
         self.get()
             .ok_or(BalloonConfigError::DeviceNotFound)
-            .map(|balloon_mutex| balloon_mutex.lock().expect("Poisoned lock").config())
+            .map(|balloon_mutex| balloon_mutex.blocking_lock().config())
             .map(BalloonDeviceConfig::from)
     }
 }
@@ -158,7 +159,7 @@ pub(crate) mod tests {
         assert!(builder.get().is_none());
 
         builder.set(balloon_config).unwrap();
-        assert_eq!(builder.get().unwrap().lock().unwrap().num_pages(), 0);
+        assert_eq!(builder.get().unwrap().lock().expect("Poisoned lock").num_pages(), 0);
         assert_eq!(builder.get_config().unwrap(), default_balloon_config);
 
         let _update_config = BalloonUpdateConfig { amount_mib: 5 };
@@ -192,7 +193,7 @@ pub(crate) mod tests {
     fn test_set_device() {
         let mut builder = BalloonBuilder::new();
         let balloon = Balloon::new(0, true, 0, false, false).unwrap();
-        builder.set_device(Arc::new(Mutex::new(balloon)));
+        builder.set_device(Arc::new(DeviceMutex::new(balloon)));
         assert!(builder.inner.is_some());
     }
 }

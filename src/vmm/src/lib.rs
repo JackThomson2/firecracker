@@ -126,6 +126,10 @@ use std::collections::HashMap;
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Barrier, Mutex};
+
+/// Tokio-aware mutex for VirtioDevice instances.
+/// Use `.lock().await` in async contexts, `.lock().expect("Poisoned lock")` in sync contexts.
+pub type DeviceMutex<T> = tokio::sync::Mutex<T>;
 use std::time::Duration;
 
 use device_manager::DeviceManager;

@@ -282,7 +282,7 @@ impl VmResources {
         let net_devs_with_mmds: Vec<_> = self
             .net_builder
             .iter()
-            .filter(|net| net.lock().expect("Poisoned lock").mmds_ns().is_some())
+            .filter(|net| net.blocking_lock().mmds_ns().is_some())
             .collect();
 
         if !net_devs_with_mmds.is_empty() {
@@ -295,7 +295,7 @@ impl VmResources {
             };
 
             for net_dev in net_devs_with_mmds {
-                let net = net_dev.lock().unwrap();
+                let net = net_dev.blocking_lock();
                 inner_mmds_config
                     .network_interfaces
                     .push(net.id().to_string());
@@ -439,7 +439,7 @@ impl VmResources {
         if !network_interfaces.iter().all(|id| {
             self.net_builder
                 .iter()
-                .any(|device| device.lock().expect("Poisoned lock").id() == id)
+                .any(|device| device.blocking_lock().id() == id)
         }) {
             return Err(MmdsConfigError::InvalidNetworkInterfaceId);
         }
@@ -451,7 +451,7 @@ impl VmResources {
         // existing built network devices whose names are defined in the
         // network interface ID list.
         for net_device in self.net_builder.iter() {
-            let mut net_device_lock = net_device.lock().expect("Poisoned lock");
+            let mut net_device_lock = net_device.blocking_lock();
             if network_interfaces.contains(&net_device_lock.id) {
                 net_device_lock.configure_mmds_network_stack(ipv4_addr, mmds.clone());
             } else {
@@ -474,7 +474,7 @@ impl VmResources {
             .block
             .devices
             .iter()
-            .any(|b| b.lock().expect("Poisoned lock").is_vhost_user());
+            .any(|b| b.blocking_lock().is_vhost_user());
 
         // Page faults are more expensive for shared memory mapping, including  memfd.
         // For this reason, we only back guest memory with a memfd

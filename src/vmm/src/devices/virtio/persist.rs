@@ -17,6 +17,7 @@ use crate::devices::virtio::queue::Queue;
 use crate::devices::virtio::transport::mmio::MmioTransport;
 use crate::snapshot::Persist;
 use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
+use crate::DeviceMutex;
 
 /// Errors thrown during restoring virtio state.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -211,7 +212,7 @@ pub struct MmioTransportConstructorArgs {
     /// Interrupt to use for the device
     pub interrupt: Arc<IrqTrigger>,
     /// Device associated with the current MMIO state.
-    pub device: Arc<Mutex<dyn VirtioDevice>>,
+    pub device: Arc<DeviceMutex<dyn VirtioDevice>>,
     /// Is device backed by vhost-user.
     pub is_vhost_user: bool,
 }
@@ -395,7 +396,7 @@ mod tests {
 
     impl PartialEq for MmioTransport {
         fn eq(&self, other: &MmioTransport) -> bool {
-            let self_dev_type = self.device().lock().unwrap().device_type();
+            let self_dev_type = self.device().lock().expect("Poisoned lock").device_type();
             self.acked_features_select == other.acked_features_select &&
                 self.features_select == other.features_select &&
                 self.queue_select == other.queue_select &&
@@ -404,7 +405,7 @@ mod tests {
                 self.interrupt.irq_status.load(Ordering::SeqCst) == other.interrupt.irq_status.load(Ordering::SeqCst) &&
                 // Only checking equality of device type, actual device (de)ser is tested by that
                 // device's tests.
-                self_dev_type == other.device().lock().unwrap().device_type()
+                self_dev_type == other.device().lock().expect("Poisoned lock").device_type()
         }
     }
 
@@ -412,7 +413,7 @@ mod tests {
         mmio_transport: MmioTransport,
         interrupt: Arc<IrqTrigger>,
         mem: GuestMemoryMmap,
-        device: Arc<Mutex<dyn VirtioDevice>>,
+        device: Arc<DeviceMutex<dyn VirtioDevice>>,
     ) {
         let transport_state = mmio_transport.save();
         let serialized_data = bitcode::serialize(&transport_state).unwrap();
@@ -446,7 +447,7 @@ mod tests {
             f.as_path().to_str().unwrap().to_string(),
             FileEngineType::default(),
         );
-        let block = Arc::new(Mutex::new(block));
+        let block = Arc::new(DeviceMutex::new(block));
         let mmio_transport =
             MmioTransport::new(mem.clone(), interrupt.clone(), block.clone(), false);
 
@@ -457,11 +458,11 @@ mod tests {
         MmioTransport,
         Arc<IrqTrigger>,
         GuestMemoryMmap,
-        Arc<Mutex<Net>>,
+        Arc<DeviceMutex<Net>>,
     ) {
         let mem = default_mem();
         let interrupt = Arc::new(IrqTrigger::new());
-        let net = Arc::new(Mutex::new(default_net()));
+        let net = Arc::new(DeviceMutex::new(default_net()));
         let mmio_transport = MmioTransport::new(mem.clone(), interrupt.clone(), net.clone(), false);
 
         (mmio_transport, interrupt, mem, net)
@@ -471,7 +472,7 @@ mod tests {
         MmioTransport,
         Arc<IrqTrigger>,
         GuestMemoryMmap,
-        Arc<Mutex<Vsock<VsockUnixBackend>>>,
+        Arc<DeviceMutex<Vsock<VsockUnixBackend>>>,
     ) {
         let mem = default_mem();
         let interrupt = Arc::new(IrqTrigger::new());
@@ -483,7 +484,7 @@ mod tests {
         let uds_path = String::from(temp_uds_path.as_path().to_str().unwrap());
         let backend = VsockUnixBackend::new(guest_cid, uds_path).unwrap();
         let vsock = Vsock::new(guest_cid, backend).unwrap();
-        let vsock = Arc::new(Mutex::new(vsock));
+        let vsock = Arc::new(DeviceMutex::new(vsock));
         let mmio_transport =
             MmioTransport::new(mem.clone(), interrupt.clone(), vsock.clone(), false);
 

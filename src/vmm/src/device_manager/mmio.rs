@@ -31,6 +31,7 @@ use crate::vstate::bus::{Bus, BusError};
 use crate::vstate::memory::GuestAddress;
 use crate::vstate::resources::ResourceAllocator;
 use crate::Vm;
+use crate::DeviceMutex;
 
 /// Errors for MMIO device manager.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -181,7 +182,7 @@ impl MMIODeviceManager {
         let gsi = device.resources.gsi.ok_or(MmioError::InvalidIrqConfig)?;
         let identifier;
         {
-            let mmio_device = device.inner.lock().expect("Poisoned lock");
+            let mmio_device = device.inner.lock().unwrap();
             let locked_device = mmio_device.locked_device();
             identifier = (locked_device.device_type(), device_id);
             for (i, queue_evt) in locked_device.queue_events().iter().enumerate() {
@@ -404,8 +405,8 @@ impl MMIODeviceManager {
 
     pub fn for_each_virtio_device(&self, mut f: impl FnMut(VirtioDeviceType, &dyn VirtioDevice)) {
         for ((device_type, _), virtio_device) in &self.virtio_devices {
-            let device_arc = virtio_device.inner.lock().expect("Poisoned lock").device();
-            let virtio_device = device_arc.lock().expect("Poisoned lock");
+            let device_arc = virtio_device.inner.lock().unwrap().device();
+            let virtio_device = device_arc.blocking_lock();
             f(*device_type, &*virtio_device);
         }
     }
@@ -456,7 +457,7 @@ pub(crate) mod tests {
             &mut self,
             vm: &Vm,
             guest_mem: GuestMemoryMmap,
-            device: Arc<Mutex<dyn VirtioDevice>>,
+            device: Arc<DeviceMutex<dyn VirtioDevice>>,
             cmdline: &mut kernel_cmdline::Cmdline,
             dev_id: &str,
         ) -> Result<u64, MmioError> {
@@ -469,7 +470,7 @@ pub(crate) mod tests {
                 cmdline,
             )?;
             Ok(self
-                .get_virtio_device(device.lock().unwrap().device_type(), dev_id)
+                .get_virtio_device(device.lock().expect("Poisoned lock").device_type(), dev_id)
                 .unwrap()
                 .resources
                 .addr)
@@ -690,7 +691,7 @@ pub(crate) mod tests {
         let mut cmdline = kernel_cmdline::Cmdline::new(4096).unwrap();
         let dummy = Arc::new(Mutex::new(DummyDevice::new()));
 
-        let type_id = dummy.lock().unwrap().device_type();
+        let type_id = dummy.lock().expect("Poisoned lock").device_type();
         let id = String::from("foo");
         let addr = device_manager
             .register_virtio_test_device(

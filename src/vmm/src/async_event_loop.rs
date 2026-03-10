@@ -18,10 +18,12 @@ use tokio::io::Interest;
 
 use crate::devices::virtio::device::VirtioDevice;
 use crate::logger::{METRICS, info, warn};
+use crate::mmio_proxy::MmioRequest;
 use crate::rpc_interface::{ApiRequest, ApiResponse, RuntimeApiController, VmmAction};
 use crate::vstate::bus::BusDevice;
 use crate::devices::legacy::SerialDevice;
 use crate::{FcExitCode, Vmm};
+use crate::DeviceMutex;
 
 // ---------------------------------------------------------------------------
 // Latency stats
@@ -65,7 +67,7 @@ impl LatencyStats {
 pub struct FdHandler {
     pub fd: RawFd,
     pub tag: u32,
-    pub device: Arc<Mutex<dyn VirtioDevice>>,
+    pub device: Arc<DeviceMutex<dyn VirtioDevice>>,
 }
 
 impl std::fmt::Debug for FdHandler {
@@ -103,7 +105,7 @@ pub fn build_serial_handler(vmm: &Vmm) -> Option<SerialHandler> {
 pub fn build_device_handlers(vmm: &Vmm) -> Vec<FdHandler> {
     let mut handlers = Vec::new();
     for (_dev_type, _id, device) in vmm.device_manager.collect_virtio_devices() {
-        let fd_tags = device.lock().unwrap().async_fd_tags();
+        let fd_tags = device.blocking_lock().async_fd_tags();
         for (fd, tag) in fd_tags {
             handlers.push(FdHandler { fd, tag, device: device.clone() });
         }
@@ -124,7 +126,7 @@ impl AsRawFd for BorrowedFd {
 struct WatchedFd {
     async_fd: AsyncFd<BorrowedFd>,
     tag: u32,
-    device: Arc<Mutex<dyn VirtioDevice>>,
+    device: Arc<DeviceMutex<dyn VirtioDevice>>,
 }
 
 struct AnyReady<'a> {
@@ -231,6 +233,14 @@ pub async fn run_event_loop(
 
     info!("Tokio event loop started: {} device fds", watched.len());
 
+    // Swap MMIO bus devices to channel-based proxies so vCPU MMIO accesses
+    // go through the async event loop instead of locking device mutexes directly.
+    let mut mmio_rx = {
+        let v = vmm.lock().unwrap();
+        v.device_manager.swap_to_mmio_proxies(&v.vm.common.mmio_bus)
+    };
+    info!("MMIO proxies installed on bus");
+
     // Set up serial stdin watching
     let serial_input_afd = serial.as_ref().and_then(|sh| {
         if sh.input_fd >= 0 {
@@ -265,6 +275,21 @@ pub async fn run_event_loop(
                 handle_vcpu_exit(&vmm);
             }
 
+
+            // MMIO request from vCPU thread
+            Some(req) = mmio_rx.recv() => {
+                match req {
+                    MmioRequest::Read { device, base, offset, len, reply } => {
+                        let mut buf = vec![0u8; len];
+                        device.lock().unwrap().read(base, offset, &mut buf);
+                        let _ = reply.send(buf);
+                    }
+                    MmioRequest::Write { device, base, offset, data, reply } => {
+                        let barrier = device.lock().unwrap().write(base, offset, &data);
+                        let _ = reply.send(barrier);
+                    }
+                }
+            }
             // API request
             req = async {
                 match &mut api_rx {
@@ -332,7 +357,7 @@ pub async fn run_event_loop(
             idx = any_device => {
                 let t = Instant::now();
                 let wfd = &watched[idx];
-                wfd.device.lock().unwrap().process_async_event(wfd.tag);
+                wfd.device.lock().await.process_async_event(wfd.tag).await;
                 latency.record_device(t.elapsed().as_nanos() as u64);
             }
         }

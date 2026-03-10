@@ -18,6 +18,7 @@ use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::queue::Queue;
 use crate::devices::virtio::transport::pci::device::VIRTQ_MSI_NO_VECTOR;
 use crate::logger::warn;
+use crate::DeviceMutex;
 
 pub const VIRTIO_PCI_COMMON_CONFIG_ID: &str = "virtio_pci_common_config";
 
@@ -88,11 +89,11 @@ impl VirtioPciCommonConfig {
             driver_feature_select: self.driver_feature_select,
             queue_select: self.queue_select,
             msix_config: self.msix_config.load(Ordering::Acquire),
-            msix_queues: self.msix_queues.lock().unwrap().clone(),
+            msix_queues: self.msix_queues.lock().expect("Poisoned lock").clone(),
         }
     }
 
-    pub fn read(&mut self, offset: u64, data: &mut [u8], device: Arc<Mutex<dyn VirtioDevice>>) {
+    pub fn read(&mut self, offset: u64, data: &mut [u8], device: Arc<DeviceMutex<dyn VirtioDevice>>) {
         assert!(data.len() <= 8);
 
         match data.len() {
@@ -101,7 +102,7 @@ impl VirtioPciCommonConfig {
                 data[0] = v;
             }
             2 => {
-                let v = self.read_common_config_word(offset, device.lock().unwrap().queues());
+                let v = self.read_common_config_word(offset, device.try_lock().expect("device lock contention").queues());
                 LittleEndian::write_u16(data, v);
             }
             4 => {
@@ -115,7 +116,7 @@ impl VirtioPciCommonConfig {
         }
     }
 
-    pub fn write(&mut self, offset: u64, data: &[u8], device: Arc<Mutex<dyn VirtioDevice>>) {
+    pub fn write(&mut self, offset: u64, data: &[u8], device: Arc<DeviceMutex<dyn VirtioDevice>>) {
         assert!(data.len() <= 8);
 
         match data.len() {
@@ -123,7 +124,7 @@ impl VirtioPciCommonConfig {
             2 => self.write_common_config_word(
                 offset,
                 LittleEndian::read_u16(data),
-                device.lock().unwrap().queues_mut(),
+                device.try_lock().expect("device lock contention").queues_mut(),
             ),
             4 => self.write_common_config_dword(offset, LittleEndian::read_u32(data), device),
             _ => warn!(
@@ -227,11 +228,11 @@ impl VirtioPciCommonConfig {
         }
     }
 
-    fn read_common_config_dword(&self, offset: u64, device: Arc<Mutex<dyn VirtioDevice>>) -> u32 {
+    fn read_common_config_dword(&self, offset: u64, device: Arc<DeviceMutex<dyn VirtioDevice>>) -> u32 {
         match offset {
             0x00 => self.device_feature_select,
             0x04 => {
-                let locked_device = device.lock().unwrap();
+                let locked_device = device.try_lock().expect("device lock contention");
                 // Only 64 bits of features (2 pages) are defined for now, so limit
                 // device_feature_select to avoid shifting by 64 or more bits.
                 if self.device_feature_select < 2 {
@@ -243,42 +244,42 @@ impl VirtioPciCommonConfig {
             }
             0x08 => self.driver_feature_select,
             0x20 => {
-                let locked_device = device.lock().unwrap();
+                let locked_device = device.try_lock().expect("device lock contention");
                 self.with_queue(locked_device.queues(), |q| {
                     (q.desc_table_address.0 & 0xffff_ffff) as u32
                 })
                 .unwrap_or_default()
             }
             0x24 => {
-                let locked_device = device.lock().unwrap();
+                let locked_device = device.try_lock().expect("device lock contention");
                 self.with_queue(locked_device.queues(), |q| {
                     (q.desc_table_address.0 >> 32) as u32
                 })
                 .unwrap_or_default()
             }
             0x28 => {
-                let locked_device = device.lock().unwrap();
+                let locked_device = device.try_lock().expect("device lock contention");
                 self.with_queue(locked_device.queues(), |q| {
                     (q.avail_ring_address.0 & 0xffff_ffff) as u32
                 })
                 .unwrap_or_default()
             }
             0x2c => {
-                let locked_device = device.lock().unwrap();
+                let locked_device = device.try_lock().expect("device lock contention");
                 self.with_queue(locked_device.queues(), |q| {
                     (q.avail_ring_address.0 >> 32) as u32
                 })
                 .unwrap_or_default()
             }
             0x30 => {
-                let locked_device = device.lock().unwrap();
+                let locked_device = device.try_lock().expect("device lock contention");
                 self.with_queue(locked_device.queues(), |q| {
                     (q.used_ring_address.0 & 0xffff_ffff) as u32
                 })
                 .unwrap_or_default()
             }
             0x34 => {
-                let locked_device = device.lock().unwrap();
+                let locked_device = device.try_lock().expect("device lock contention");
                 self.with_queue(locked_device.queues(), |q| {
                     (q.used_ring_address.0 >> 32) as u32
                 })
@@ -295,7 +296,7 @@ impl VirtioPciCommonConfig {
         &mut self,
         offset: u64,
         value: u32,
-        device: Arc<Mutex<dyn VirtioDevice>>,
+        device: Arc<DeviceMutex<dyn VirtioDevice>>,
     ) {
         fn hi(v: &mut GuestAddress, x: u32) {
             *v = (*v & 0xffff_ffff) | (u64::from(x) << 32)
@@ -305,7 +306,7 @@ impl VirtioPciCommonConfig {
             *v = (*v & !0xffff_ffff) | u64::from(x)
         }
 
-        let mut locked_device = device.lock().unwrap();
+        let mut locked_device = device.try_lock().expect("device lock contention");
 
         match offset {
             0x00 => self.device_feature_select = value,
@@ -470,12 +471,12 @@ mod tests {
 
         // ACK some features of the first page
         config.write(0x0c, 0x1100u32.as_slice(), device.clone());
-        assert_eq!(device.lock().unwrap().acked_features(), 0x1100);
+        assert_eq!(device.lock().expect("Poisoned lock").acked_features(), 0x1100);
         // ACK some features of the second page
         config.write(0x08, 1u32.as_slice(), device.clone());
         config.write(0x0c, 0x0000_1310u32.as_slice(), device.clone());
         assert_eq!(
-            device.lock().unwrap().acked_features(),
+            device.lock().expect("Poisoned lock").acked_features(),
             0x0000_1310_0000_1100
         );
     }
@@ -540,7 +541,7 @@ mod tests {
             config.read(0x18, len.as_mut_slice(), device.clone());
             assert_eq!(
                 len,
-                device.lock().unwrap().queues()[queue_id as usize].max_size
+                device.lock().expect("Poisoned lock").queues()[queue_id as usize].max_size
             );
             max_size[queue_id as usize] = len;
         }
@@ -694,7 +695,7 @@ mod tests {
         // > MAY access each of the high and low 32-bit parts of the field independently.
 
         // 64-bit fields
-        device.lock().unwrap().queues_mut()[0].desc_table_address =
+        device.lock().expect("Poisoned lock").queues_mut()[0].desc_table_address =
             GuestAddress(0x0000_1312_0000_1110);
         let mut buffer = [0u8; 8];
         config.read(0x20, &mut buffer[..1], device.clone());

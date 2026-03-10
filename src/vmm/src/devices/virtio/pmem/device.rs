@@ -414,10 +414,12 @@ impl VirtioDevice for Pmem {
         vec![(self.queue_events()[0].as_raw_fd(), 1)]
     }
 
-    fn process_async_event(&mut self, _tag: u32) {
+    fn process_async_event(&mut self, _tag: u32) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+
         if self.is_activated() {
             self.process_queue();
         }
+        Box::pin(async {})
     }
 }
 

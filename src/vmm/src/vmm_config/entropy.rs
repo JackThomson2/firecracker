@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::RateLimiterConfig;
 use crate::devices::virtio::rng::{Entropy, EntropyError};
+use crate::DeviceMutex;
 
 /// This struct represents the strongly typed equivalent of the json body from entropy device
 /// related requests.
@@ -39,7 +40,7 @@ pub enum EntropyDeviceError {
 
 /// A builder type used to construct an Entropy device
 #[derive(Debug, Default)]
-pub struct EntropyDeviceBuilder(Option<Arc<Mutex<Entropy>>>);
+pub struct EntropyDeviceBuilder(Option<Arc<DeviceMutex<Entropy>>>);
 
 impl EntropyDeviceBuilder {
     /// Create a new instance for the builder
@@ -51,12 +52,12 @@ impl EntropyDeviceBuilder {
     pub fn build(
         &mut self,
         config: EntropyDeviceConfig,
-    ) -> Result<Arc<Mutex<Entropy>>, EntropyDeviceError> {
+    ) -> Result<Arc<DeviceMutex<Entropy>>, EntropyDeviceError> {
         let rate_limiter = config
             .rate_limiter
             .map(RateLimiterConfig::try_into)
             .transpose()?;
-        let dev = Arc::new(Mutex::new(Entropy::new(rate_limiter.unwrap_or_default())?));
+        let dev = Arc::new(DeviceMutex::new(Entropy::new(rate_limiter.unwrap_or_default())?));
         self.0 = Some(dev.clone());
 
         Ok(dev)
@@ -69,7 +70,7 @@ impl EntropyDeviceBuilder {
     }
 
     /// Get a reference to the entropy device, if present
-    pub fn get(&self) -> Option<&Arc<Mutex<Entropy>>> {
+    pub fn get(&self) -> Option<&Arc<DeviceMutex<Entropy>>> {
         self.0.as_ref()
     }
 
@@ -77,11 +78,11 @@ impl EntropyDeviceBuilder {
     pub fn config(&self) -> Option<EntropyDeviceConfig> {
         self.0
             .as_ref()
-            .map(|dev| EntropyDeviceConfig::from(dev.lock().unwrap().deref()))
+            .map(|dev| EntropyDeviceConfig::from(dev.blocking_lock().deref()))
     }
 
     /// Set the entropy device from an already created object
-    pub fn set_device(&mut self, device: Arc<Mutex<Entropy>>) {
+    pub fn set_device(&mut self, device: Arc<DeviceMutex<Entropy>>) {
         self.0 = Some(device);
     }
 }

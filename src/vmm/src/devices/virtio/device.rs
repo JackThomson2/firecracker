@@ -220,7 +220,10 @@ pub trait VirtioDevice: AsAny + Send {
     }
 
     /// Process an async event identified by tag. Called when the fd becomes readable.
-    fn process_async_event(&mut self, _tag: u32) {}
+    /// Returns a boxed future to allow async I/O while remaining dyn-compatible.
+    fn process_async_event(&mut self, _tag: u32) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
 }
 
 impl fmt::Debug for dyn VirtioDevice {

@@ -44,6 +44,7 @@ use crate::snapshot::Persist;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vstate::memory::GuestMemoryMmap;
 use crate::Vm;
+use crate::DeviceMutex;
 
 /// Holds the state of a MMIO VirtIO device
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,7 +179,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
         }
 
         let _: Result<(), ()> = self.for_each_virtio_mmio_device(|_, devid, device| {
-            let mmio_transport_locked = device.inner.lock().expect("Poisoned lock");
+            let mmio_transport_locked = device.inner.lock().unwrap();
             let mut locked_device = mmio_transport_locked.locked_device();
             // We need to call `prepare_save()` on the device before saving the transport
             // so that, if we modify the transport state while preparing the device, e.g. sending
@@ -329,7 +330,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
             }
         }
 
-        let mut restore_helper = |device: Arc<Mutex<dyn VirtioDevice>>,
+        let mut restore_helper = |device: Arc<DeviceMutex<dyn VirtioDevice>>,
                                   activated: bool,
                                   is_vhost_user: bool,
                                   id: &String,
@@ -359,8 +360,8 @@ impl<'a> Persist<'a> for MMIODeviceManager {
 
             if activated {
                 device
-                    .lock()
-                    .expect("Poisoned lock")
+                    .blocking_lock()
+
                     .activate(mem.clone(), interrupt)?;
             }
 
@@ -368,7 +369,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
         };
 
         if let Some(balloon_state) = &state.balloon_device {
-            let device = Arc::new(Mutex::new(Balloon::restore(
+            let device = Arc::new(DeviceMutex::new(Balloon::restore(
                 BalloonConstructorArgs { mem: mem.clone() },
                 &balloon_state.device_state,
             )?));
@@ -389,7 +390,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
         }
 
         for block_state in &state.block_devices {
-            let device = Arc::new(Mutex::new(Block::restore(
+            let device = Arc::new(DeviceMutex::new(Block::restore(
                 BlockConstructorArgs { mem: mem.clone() },
                 &block_state.device_state,
             )?));
@@ -419,7 +420,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
         }
 
         for net_state in &state.net_devices {
-            let device = Arc::new(Mutex::new(Net::restore(
+            let device = Arc::new(DeviceMutex::new(Net::restore(
                 NetConstructorArgs {
                     mem: mem.clone(),
                     mmds: constructor_args
@@ -452,7 +453,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 cid: vsock_state.device_state.frontend.cid,
             };
             let backend = VsockUnixBackend::restore(ctor_args, &vsock_state.device_state.backend)?;
-            let device = Arc::new(Mutex::new(Vsock::restore(
+            let device = Arc::new(DeviceMutex::new(Vsock::restore(
                 VsockConstructorArgs {
                     mem: mem.clone(),
                     backend,
@@ -478,7 +479,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
         if let Some(entropy_state) = &state.entropy_device {
             let ctor_args = EntropyConstructorArgs { mem: mem.clone() };
 
-            let device = Arc::new(Mutex::new(Entropy::restore(
+            let device = Arc::new(DeviceMutex::new(Entropy::restore(
                 ctor_args,
                 &entropy_state.device_state,
             )?));
@@ -499,7 +500,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
         }
 
         for pmem_state in &state.pmem_devices {
-            let device = Arc::new(Mutex::new(Pmem::restore(
+            let device = Arc::new(DeviceMutex::new(Pmem::restore(
                 PmemConstructorArgs {
                     mem,
                     vm: vm.as_ref(),
@@ -532,7 +533,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 slot_size_mib: device.slot_size_mib(),
             });
 
-            let arcd_device = Arc::new(Mutex::new(device));
+            let arcd_device = Arc::new(DeviceMutex::new(device));
 
             restore_helper(
                 arcd_device,

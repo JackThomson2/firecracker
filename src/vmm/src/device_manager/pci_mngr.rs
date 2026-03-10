@@ -40,6 +40,7 @@ use crate::vstate::bus::BusError;
 use crate::vstate::interrupts::InterruptError;
 use crate::vstate::memory::GuestMemoryMmap;
 use crate::Vm;
+use crate::DeviceMutex;
 use pci::PciBdf;
 
 #[derive(Debug, Default)]
@@ -88,7 +89,7 @@ impl PciDevices {
         vm: &Vm,
         virtio_device: &Arc<Mutex<VirtioPciDevice>>,
     ) -> Result<(), PciManagerError> {
-        let virtio_device_locked = virtio_device.lock().expect("Poisoned lock");
+        let virtio_device_locked = virtio_device.lock().unwrap();
 
         debug!(
             "Inserting MMIO BAR region: {:#x}:{:#x}",
@@ -125,7 +126,7 @@ impl PciDevices {
 
         Self::register_bars_with_bus(vm, &virtio_device)?;
 
-        let mut device = virtio_device.lock().expect("Poisoned lock");
+        let mut device = virtio_device.lock().unwrap();
         device.register_notification_ioevent(vm)?;
 
 
@@ -138,7 +139,7 @@ impl PciDevices {
         &mut self,
         vm: &Arc<Vm>,
         id: String,
-        device: Arc<Mutex<T>>,
+        device: Arc<DeviceMutex<T>>,
     ) -> Result<(), PciManagerError> {
         // We should only be reaching this point if PCI is enabled
         let pci_segment = self.pci_segment.as_ref().unwrap();
@@ -146,11 +147,11 @@ impl PciDevices {
         debug!("Allocating BDF: {pci_device_bdf:?} for device");
         let mem = vm.guest_memory().clone();
 
-        let device_type = device.lock().expect("Poisoned lock").device_type();
+        let device_type = device.blocking_lock().device_type();
 
         // Allocate one MSI vector per queue, plus one for configuration
         let msix_num =
-            u16::try_from(device.lock().expect("Poisoned lock").queues().len() + 1).unwrap();
+            u16::try_from(device.blocking_lock().queues().len() + 1).unwrap();
 
         let msix_vectors = Vm::create_msix_group(vm.clone(), msix_num)?;
 
@@ -183,11 +184,11 @@ impl PciDevices {
     fn restore_pci_device<T: 'static + VirtioDevice + Debug>(
         &mut self,
         vm: &Arc<Vm>,
-        device: Arc<Mutex<T>>,
+        device: Arc<DeviceMutex<T>>,
         device_id: &str,
         transport_state: &VirtioPciDeviceState,
     ) -> Result<(), PciManagerError> {
-        let device_type = device.lock().expect("Poisoned lock").device_type();
+        let device_type = device.blocking_lock().device_type();
 
         let virtio_device = Arc::new(Mutex::new(VirtioPciDevice::new_from_state(
             device_id.to_string(),
@@ -219,8 +220,8 @@ impl PciDevices {
 
     pub fn for_each_virtio_device(&self, mut f: impl FnMut(VirtioDeviceType, &dyn VirtioDevice)) {
         for ((device_type, _), pci_device) in &self.virtio_devices {
-            let device_arc = pci_device.lock().expect("Poisoned lock").virtio_device();
-            let device = device_arc.lock().expect("Poisoned lock");
+            let device_arc = pci_device.lock().unwrap().virtio_device();
+            let device = device_arc.blocking_lock();
             f(*device_type, &*device);
         }
     }
@@ -297,7 +298,7 @@ impl<'a> Persist<'a> for PciDevices {
             // We need to call `prepare_save()` on the device before saving the transport
             // so that, if we modify the transport state while preparing the device, e.g. sending
             // an interrupt to the guest, this is correctly captured in the saved transport state.
-            let mut locked_virtio_dev = virtio_dev.lock().expect("Poisoned lock");
+            let mut locked_virtio_dev = virtio_dev.blocking_lock();
             locked_virtio_dev.prepare_save();
             let transport_state = locked_pci_dev.state();
 
@@ -441,7 +442,7 @@ impl<'a> Persist<'a> for PciDevices {
         pci_devices.attach_pci_segment(constructor_args.vm)?;
 
         if let Some(balloon_state) = &state.balloon_device {
-            let device = Arc::new(Mutex::new(Balloon::restore(
+            let device = Arc::new(DeviceMutex::new(Balloon::restore(
                 BalloonConstructorArgs { mem: mem.clone() },
                 &balloon_state.device_state,
             )?));
@@ -460,7 +461,7 @@ impl<'a> Persist<'a> for PciDevices {
         }
 
         for block_state in &state.block_devices {
-            let device = Arc::new(Mutex::new(Block::restore(
+            let device = Arc::new(DeviceMutex::new(Block::restore(
                 BlockConstructorArgs { mem: mem.clone() },
                 &block_state.device_state,
             )?));
@@ -497,7 +498,7 @@ impl<'a> Persist<'a> for PciDevices {
         }
 
         for net_state in &state.net_devices {
-            let device = Arc::new(Mutex::new(Net::restore(
+            let device = Arc::new(DeviceMutex::new(Net::restore(
                 NetConstructorArgs {
                     mem: mem.clone(),
                     mmds: constructor_args
@@ -528,7 +529,7 @@ impl<'a> Persist<'a> for PciDevices {
                 cid: vsock_state.device_state.frontend.cid,
             };
             let backend = VsockUnixBackend::restore(ctor_args, &vsock_state.device_state.backend)?;
-            let device = Arc::new(Mutex::new(Vsock::restore(
+            let device = Arc::new(DeviceMutex::new(Vsock::restore(
                 VsockConstructorArgs {
                     mem: mem.clone(),
                     backend,
@@ -552,7 +553,7 @@ impl<'a> Persist<'a> for PciDevices {
         if let Some(entropy_state) = &state.entropy_device {
             let ctor_args = EntropyConstructorArgs { mem: mem.clone() };
 
-            let device = Arc::new(Mutex::new(Entropy::restore(
+            let device = Arc::new(DeviceMutex::new(Entropy::restore(
                 ctor_args,
                 &entropy_state.device_state,
             )?));
@@ -571,7 +572,7 @@ impl<'a> Persist<'a> for PciDevices {
         }
 
         for pmem_state in &state.pmem_devices {
-            let device = Arc::new(Mutex::new(Pmem::restore(
+            let device = Arc::new(DeviceMutex::new(Pmem::restore(
                 PmemConstructorArgs {
                     mem,
                     vm: constructor_args.vm.as_ref(),
@@ -602,7 +603,7 @@ impl<'a> Persist<'a> for PciDevices {
                 slot_size_mib: device.slot_size_mib(),
             });
 
-            let arcd_device = Arc::new(Mutex::new(device));
+            let arcd_device = Arc::new(DeviceMutex::new(device));
             pci_devices.restore_pci_device(
                 constructor_args.vm,
                 arcd_device,

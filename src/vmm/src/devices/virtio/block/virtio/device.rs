@@ -40,7 +40,7 @@ use crate::rate_limiter::{BucketUpdate, RateLimiter};
 use crate::utils::u64_to_usize;
 use crate::vmm_config::RateLimiterConfig;
 use crate::vmm_config::drive::BlockDeviceConfig;
-use crate::vstate::memory::GuestMemoryMmap;
+use crate::vstate::memory::{Bytes, GuestMemoryMmap};
 
 /// The engine file type, either Sync or Async (through io_uring).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -50,6 +50,8 @@ pub enum FileEngineType {
     /// Use a Sync engine, based on blocking system calls.
     #[default]
     Sync,
+    /// Use a Tokio engine, based on spawn_blocking + pread/pwrite.
+    Tokio,
 }
 
 /// Helper object for setting up all `Block` fields derived from its backing file.
@@ -272,7 +274,7 @@ macro_rules! unwrap_async_file_engine_or_return {
     ($file_engine: expr) => {
         match $file_engine {
             FileEngine::Async(engine) => engine,
-            FileEngine::Sync(_) => {
+            FileEngine::Sync(_) | FileEngine::Tokio(_) => {
                 error!("The block device doesn't use an async IO engine");
                 return;
             }
@@ -372,6 +374,102 @@ impl VirtioBlock {
         }
     }
 
+    /// Async version of process_queue_event for the Tokio file engine.
+    /// Parses requests synchronously, then awaits each I/O operation directly.
+    pub async fn process_queue_event_async(&mut self) {
+        self.metrics.queue_event_count.inc();
+        if let Err(err) = self.queue_evts[0].read() {
+            error!("Failed to get queue event: {:?}", err);
+            self.metrics.event_fails.inc();
+            return;
+        }
+        if self.rate_limiter.is_blocked() {
+            self.metrics.rate_limiter_throttled_events.inc();
+            return;
+        }
+
+        let active_state = self.device_state.active_state().unwrap().clone();
+        let queue = &mut self.queues[0];
+        let mut used_any = false;
+
+        loop {
+            // Pop descriptor and parse — all sync, no .await while DescriptorChain is alive.
+            let (head_index, request) = {
+                let Some(head) = queue.pop_or_enable_notification().unwrap() else {
+                    break;
+                };
+                self.metrics.remaining_reqs_count.add(queue.len().into());
+                let idx = head.index;
+                let parsed = Request::parse(&head, &active_state.mem, self.disk.nsectors);
+                // head (DescriptorChain with raw pointers) is dropped here
+                match parsed {
+                    Ok(req) => (idx, req),
+                    Err(err) => {
+                        error!("Failed to parse available descriptor chain: {:?}", err);
+                        self.metrics.execute_fails.inc();
+                        queue.add_used(idx, 0).unwrap_or_else(|e| {
+                            error!("Failed to add used descriptor {}: {}", idx, e)
+                        });
+                        used_any = true;
+                        continue;
+                    }
+                }
+            };
+
+            if request.rate_limit(&mut self.rate_limiter) {
+                queue.undo_pop();
+                self.metrics.rate_limiter_throttled_events.inc();
+                break;
+            }
+
+            let pending = request.to_pending_request(head_index);
+            let io_result = match request.r#type {
+                RequestType::In => {
+                    let _m = self.metrics.read_agg.record_latency_metrics();
+                    self.disk.file_engine
+                        .async_read(request.offset(), &active_state.mem, request.data_addr, request.data_len)
+                        .await
+                }
+                RequestType::Out => {
+                    let _m = self.metrics.write_agg.record_latency_metrics();
+                    self.disk.file_engine
+                        .async_write(request.offset(), &active_state.mem, request.data_addr, request.data_len)
+                        .await
+                }
+                RequestType::Flush => {
+                    self.disk.file_engine.async_flush().await.map(|()| 0)
+                }
+                RequestType::GetDeviceID => {
+                    match active_state.mem.write_slice(&self.disk.image_id, request.data_addr) {
+                        Ok(()) => Ok(VIRTIO_BLK_ID_BYTES),
+                        Err(_) => Ok(0),
+                    }
+                }
+                RequestType::Unsupported(_) => Ok(0),
+            };
+
+            let res = io_result.map_err(|e| IoErr::FileEngine(e));
+            let finished = pending.finish(&active_state.mem, res, &self.metrics);
+            used_any = true;
+            queue.add_used(finished.desc_idx, finished.num_bytes_to_mem)
+                .unwrap_or_else(|e| {
+                    error!("Failed to add used descriptor {}: {}", finished.desc_idx, e)
+                });
+        }
+
+        let queue = &mut self.queues[0];
+        queue.advance_used_ring_idx();
+        if used_any && queue.prepare_kick() {
+            active_state
+                .interrupt
+                .trigger(VirtioInterruptType::Queue(0))
+                .unwrap_or_else(|_| { self.metrics.event_fails.inc(); });
+        }
+        if !used_any {
+            self.metrics.no_avail_buffer.inc();
+        }
+    }
+
     /// Process device virtio queue(s).
     pub fn process_virtio_queues(&mut self) -> Result<(), InvalidAvailIdx> {
         self.process_queue(0)
@@ -468,6 +566,7 @@ impl VirtioBlock {
         Ok(())
     }
 
+
     fn process_async_completion_queue(&mut self) {
         let engine = unwrap_async_file_engine_or_return!(&mut self.disk.file_engine);
 
@@ -521,10 +620,9 @@ impl VirtioBlock {
 
     /// Get the async completion fd, if using async IO engine.
     pub fn async_completion_fd(&self) -> Option<std::os::unix::io::RawFd> {
-        if let super::io::FileEngine::Async(ref engine) = self.disk.file_engine {
-            Some(engine.completion_evt().as_raw_fd())
-        } else {
-            None
+        match &self.disk.file_engine {
+            super::io::FileEngine::Async(engine) => Some(engine.completion_evt().as_raw_fd()),
+            _ => None,
         }
     }
 
@@ -569,6 +667,7 @@ impl VirtioBlock {
         match self.disk.file_engine {
             FileEngine::Sync(_) => FileEngineType::Sync,
             FileEngine::Async(_) => FileEngineType::Async,
+            FileEngine::Tokio(_) => FileEngineType::Tokio,
         }
     }
 

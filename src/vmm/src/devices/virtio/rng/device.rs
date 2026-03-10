@@ -321,15 +321,17 @@ impl VirtioDevice for Entropy {
         ]
     }
 
-    fn process_async_event(&mut self, tag: u32) {
+    fn process_async_event(&mut self, tag: u32) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+
         if !self.is_activated() {
-            return;
+            return Box::pin(async {});
         }
         match tag {
             1 => self.process_entropy_queue_event(),
             2 => self.process_rate_limiter_event(),
             _ => {}
         }
+        Box::pin(async {})
     }
 }
 
