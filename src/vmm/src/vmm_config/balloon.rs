@@ -116,7 +116,7 @@ impl BalloonBuilder {
     pub fn get_config(&self) -> Result<BalloonDeviceConfig, BalloonConfigError> {
         self.get()
             .ok_or(BalloonConfigError::DeviceNotFound)
-            .map(|balloon_mutex| balloon_mutex.blocking_lock().config())
+            .map(|balloon_mutex| balloon_mutex.try_lock().expect("device lock").config())
             .map(BalloonDeviceConfig::from)
     }
 }

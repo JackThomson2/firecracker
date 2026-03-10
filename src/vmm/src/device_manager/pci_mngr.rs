@@ -147,11 +147,11 @@ impl PciDevices {
         debug!("Allocating BDF: {pci_device_bdf:?} for device");
         let mem = vm.guest_memory().clone();
 
-        let device_type = device.blocking_lock().device_type();
+        let device_type = device.try_lock().expect("device lock").device_type();
 
         // Allocate one MSI vector per queue, plus one for configuration
         let msix_num =
-            u16::try_from(device.blocking_lock().queues().len() + 1).unwrap();
+            u16::try_from(device.try_lock().expect("device lock").queues().len() + 1).unwrap();
 
         let msix_vectors = Vm::create_msix_group(vm.clone(), msix_num)?;
 
@@ -188,7 +188,7 @@ impl PciDevices {
         device_id: &str,
         transport_state: &VirtioPciDeviceState,
     ) -> Result<(), PciManagerError> {
-        let device_type = device.blocking_lock().device_type();
+        let device_type = device.try_lock().expect("device lock").device_type();
 
         let virtio_device = Arc::new(Mutex::new(VirtioPciDevice::new_from_state(
             device_id.to_string(),
@@ -221,7 +221,7 @@ impl PciDevices {
     pub fn for_each_virtio_device(&self, mut f: impl FnMut(VirtioDeviceType, &dyn VirtioDevice)) {
         for ((device_type, _), pci_device) in &self.virtio_devices {
             let device_arc = pci_device.lock().unwrap().virtio_device();
-            let device = device_arc.blocking_lock();
+            let device = device_arc.try_lock().expect("device lock");
             f(*device_type, &*device);
         }
     }
@@ -298,7 +298,7 @@ impl<'a> Persist<'a> for PciDevices {
             // We need to call `prepare_save()` on the device before saving the transport
             // so that, if we modify the transport state while preparing the device, e.g. sending
             // an interrupt to the guest, this is correctly captured in the saved transport state.
-            let mut locked_virtio_dev = virtio_dev.blocking_lock();
+            let mut locked_virtio_dev = virtio_dev.try_lock().expect("device lock");
             locked_virtio_dev.prepare_save();
             let transport_state = locked_pci_dev.state();
 

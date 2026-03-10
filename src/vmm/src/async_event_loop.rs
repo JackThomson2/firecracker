@@ -105,7 +105,7 @@ pub fn build_serial_handler(vmm: &Vmm) -> Option<SerialHandler> {
 pub fn build_device_handlers(vmm: &Vmm) -> Vec<FdHandler> {
     let mut handlers = Vec::new();
     for (_dev_type, _id, device) in vmm.device_manager.collect_virtio_devices() {
-        let fd_tags = device.blocking_lock().async_fd_tags();
+        let fd_tags = device.try_lock().expect("device lock").async_fd_tags();
         for (fd, tag) in fd_tags {
             handlers.push(FdHandler { fd, tag, device: device.clone() });
         }

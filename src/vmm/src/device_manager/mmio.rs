@@ -406,7 +406,7 @@ impl MMIODeviceManager {
     pub fn for_each_virtio_device(&self, mut f: impl FnMut(VirtioDeviceType, &dyn VirtioDevice)) {
         for ((device_type, _), virtio_device) in &self.virtio_devices {
             let device_arc = virtio_device.inner.lock().unwrap().device();
-            let virtio_device = device_arc.blocking_lock();
+            let virtio_device = device_arc.try_lock().expect("device lock");
             f(*device_type, &*virtio_device);
         }
     }

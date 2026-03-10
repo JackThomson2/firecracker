@@ -106,7 +106,7 @@ impl BlockBuilder {
     pub fn has_root_device(&self) -> bool {
         // If there is a root device, it would be at the top of the list.
         if let Some(block) = self.devices.front() {
-            block.blocking_lock().root_device()
+            block.try_lock().expect("device lock").root_device()
         } else {
             false
         }
@@ -116,12 +116,12 @@ impl BlockBuilder {
     fn get_index_of_drive_id(&self, drive_id: &str) -> Option<usize> {
         self.devices
             .iter()
-            .position(|b| b.blocking_lock().id().eq(drive_id))
+            .position(|b| b.try_lock().expect("device lock").id().eq(drive_id))
     }
 
     /// Inserts an existing block device.
     pub fn add_virtio_device(&mut self, block_device: Arc<DeviceMutex<Block>>) {
-        if block_device.blocking_lock().root_device() {
+        if block_device.try_lock().expect("device lock").root_device() {
             self.devices.push_front(block_device);
         } else {
             self.devices.push_back(block_device);
@@ -182,7 +182,7 @@ impl BlockBuilder {
     pub fn configs(&self) -> Vec<BlockDeviceConfig> {
         self.devices
             .iter()
-            .map(|b| b.blocking_lock().config())
+            .map(|b| b.try_lock().expect("device lock").config())
             .collect()
     }
 }

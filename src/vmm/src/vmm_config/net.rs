@@ -108,7 +108,7 @@ impl NetBuilder {
     ) -> Result<Arc<DeviceMutex<Net>>, NetworkInterfaceError> {
         if let Some(ref mac_address) = netif_config.guest_mac {
             let mac_conflict = |net: &Arc<DeviceMutex<Net>>| {
-                let net = net.blocking_lock();
+                let net = net.try_lock().expect("device lock");
                 // Check if another net dev has same MAC.
                 Some(mac_address) == net.guest_mac() && netif_config.iface_id != net.id()
             };
@@ -126,7 +126,7 @@ impl NetBuilder {
         if let Some(index) = self
             .net_devices
             .iter()
-            .position(|net| net.blocking_lock().id() == netif_config.iface_id)
+            .position(|net| net.try_lock().expect("device lock").id() == netif_config.iface_id)
         {
             self.net_devices.swap_remove(index);
         }
@@ -166,7 +166,7 @@ impl NetBuilder {
     pub fn configs(&self) -> Vec<NetworkInterfaceConfig> {
         let mut ret = vec![];
         for net in &self.net_devices {
-            ret.push(NetworkInterfaceConfig::from(net.blocking_lock().deref()));
+            ret.push(NetworkInterfaceConfig::from(net.try_lock().expect("device lock").deref()));
         }
         ret
     }

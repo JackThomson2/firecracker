@@ -78,7 +78,7 @@ impl EntropyDeviceBuilder {
     pub fn config(&self) -> Option<EntropyDeviceConfig> {
         self.0
             .as_ref()
-            .map(|dev| EntropyDeviceConfig::from(dev.blocking_lock().deref()))
+            .map(|dev| EntropyDeviceConfig::from(dev.try_lock().expect("device lock").deref()))
     }
 
     /// Set the entropy device from an already created object

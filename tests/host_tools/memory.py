@@ -46,9 +46,9 @@ class MemoryMonitor(Thread):
     def __init__(
         self,
         vm,
-        threshold_booted=5 << 20,
-        threshold_snapshot=6 << 20,
-        threshold_restored=5 << 20,
+        threshold_booted=8 << 20,
+        threshold_snapshot=9 << 20,
+        threshold_restored=8 << 20,
         period_s=0.01,
     ):
         """Initialize monitor attributes."""

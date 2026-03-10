@@ -360,7 +360,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
 
             if activated {
                 device
-                    .blocking_lock()
+                    .try_lock().expect("device lock")
 
                     .activate(mem.clone(), interrupt)?;
             }

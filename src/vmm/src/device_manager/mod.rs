@@ -291,7 +291,7 @@ impl DeviceManager {
                     let mmio_transport_locked = device.inner.lock().unwrap();
                     mmio_transport_locked
                         .device()
-                        .blocking_lock()
+                        .try_lock().expect("device lock")
 
                         .kick();
                     Ok(())
@@ -302,7 +302,7 @@ impl DeviceManager {
                 .lock()
                 .expect("Poisoned lock")
                 .virtio_device()
-                .blocking_lock()
+                .try_lock().expect("device lock")
 
                 .kick();
         }
@@ -315,7 +315,7 @@ impl DeviceManager {
         // SAFETY:
         // This should never fail as we mark pages only if device has already been activated,
         // and the address validation was already performed on device activation.
-        let mut locked_device = device.blocking_lock();
+        let mut locked_device = device.try_lock().expect("device lock");
         if locked_device.is_activated() {
             locked_device.mark_queue_memory_dirty(mem).unwrap()
         }
@@ -376,7 +376,7 @@ impl DeviceManager {
         F: FnOnce(&mut T) -> R,
     {
         if let Some(device) = self.get_virtio_device(T::const_device_type(), id) {
-            let mut dev = device.blocking_lock();
+            let mut dev = device.try_lock().expect("device lock");
             Ok(f(dev
                 .as_mut_any()
                 .downcast_mut::<T>()

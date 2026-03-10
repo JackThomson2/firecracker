@@ -43,7 +43,7 @@ struct VsockAndUnixPath {
 
 impl From<&VsockAndUnixPath> for VsockDeviceConfig {
     fn from(vsock: &VsockAndUnixPath) -> Self {
-        let vsock_lock = vsock.vsock.blocking_lock();
+        let vsock_lock = vsock.vsock.try_lock().expect("device lock");
         VsockDeviceConfig {
             vsock_id: None,
             guest_cid: u32::try_from(vsock_lock.cid()).unwrap(),
@@ -78,7 +78,7 @@ impl VsockBuilder {
     pub fn set_device(&mut self, device: Arc<DeviceMutex<Vsock<VsockUnixBackend>>>) {
         self.inner = Some(VsockAndUnixPath {
             uds_path: device
-                .blocking_lock()
+                .try_lock().expect("device lock")
 
                 .backend()
                 .host_sock_path()

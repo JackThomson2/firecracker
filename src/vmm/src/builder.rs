@@ -592,7 +592,7 @@ fn attach_entropy_device(
     entropy_device: &Arc<DeviceMutex<Entropy>>,
 ) -> Result<(), AttachDeviceError> {
     let id = entropy_device
-        .blocking_lock()
+        .try_lock().expect("device lock")
         .id()
         .to_string();
 
@@ -639,7 +639,7 @@ fn attach_virtio_mem_device(
         .map_err(|e| StartMicrovmError::Internal(VmmError::VirtioMem(e)))?,
     ));
 
-    let id = virtio_mem.blocking_lock().id().to_string();
+    let id = virtio_mem.try_lock().expect("device lock").id().to_string();
     device_manager.attach_virtio_device(
         vm,
         id,
@@ -658,7 +658,7 @@ fn attach_block_devices<'a, I: Iterator<Item = &'a Arc<DeviceMutex<Block>>> + De
 ) -> Result<(), StartMicrovmError> {
     for block in blocks {
         let (id, is_vhost_user) = {
-            let locked = block.blocking_lock();
+            let locked = block.try_lock().expect("device lock");
             if locked.root_device() {
                 match locked.partuuid() {
                     Some(partuuid) => cmdline.insert_str(format!("root=PARTUUID={}", partuuid))?,
@@ -690,7 +690,7 @@ fn attach_net_devices<'a, I: Iterator<Item = &'a Arc<DeviceMutex<Net>>> + Debug>
     net_devices: I,
 ) -> Result<(), StartMicrovmError> {
     for net_device in net_devices {
-        let id = net_device.blocking_lock().id().to_string();
+        let id = net_device.try_lock().expect("device lock").id().to_string();
         // The device mutex mustn't be locked here otherwise it will deadlock.
         device_manager.attach_virtio_device(
             vm,
@@ -711,7 +711,7 @@ fn attach_pmem_devices<'a, I: Iterator<Item = &'a Arc<DeviceMutex<Pmem>>> + Debu
 ) -> Result<(), StartMicrovmError> {
     for (i, device) in pmem_devices.enumerate() {
         let id = {
-            let mut locked_dev = device.blocking_lock();
+            let mut locked_dev = device.try_lock().expect("device lock");
             if locked_dev.config.root_device {
                 cmdline.insert_str(format!("root=/dev/pmem{i}"))?;
                 match locked_dev.config.read_only {
@@ -741,7 +741,7 @@ fn attach_unixsock_vsock_device(
     cmdline: &mut LoaderKernelCmdline,
     unix_vsock: &Arc<DeviceMutex<Vsock<VsockUnixBackend>>>,
 ) -> Result<(), AttachDeviceError> {
-    let id = String::from(unix_vsock.blocking_lock().id());
+    let id = String::from(unix_vsock.try_lock().expect("device lock").id());
     // The device mutex mustn't be locked here otherwise it will deadlock.
     device_manager.attach_virtio_device(vm, id, unix_vsock.clone(), cmdline, false)
 }
@@ -752,7 +752,7 @@ fn attach_balloon_device(
     cmdline: &mut LoaderKernelCmdline,
     balloon: &Arc<DeviceMutex<Balloon>>,
 ) -> Result<(), AttachDeviceError> {
-    let id = String::from(balloon.blocking_lock().id());
+    let id = String::from(balloon.try_lock().expect("device lock").id());
     // The device mutex mustn't be locked here otherwise it will deadlock.
     device_manager.attach_virtio_device(vm, id, balloon.clone(), cmdline, false)
 }

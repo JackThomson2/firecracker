@@ -49,7 +49,7 @@ impl PmemBuilder {
     pub fn has_root_device(&self) -> bool {
         self.devices
             .iter()
-            .any(|d| d.blocking_lock().config.root_device)
+            .any(|d| d.try_lock().expect("device lock").config.root_device)
     }
 
     /// Build a device from the config
@@ -64,9 +64,9 @@ impl PmemBuilder {
         let position = self
             .devices
             .iter()
-            .position(|d| d.blocking_lock().config.id == config.id);
+            .position(|d| d.try_lock().expect("device lock").config.id == config.id);
         if let Some(index) = position {
-            if !self.devices[index].blocking_lock().config.root_device
+            if !self.devices[index].try_lock().expect("device lock").config.root_device
                 && config.root_device
                 && self.has_root_device()
             {
@@ -97,7 +97,7 @@ impl PmemBuilder {
     pub fn configs(&self) -> Vec<PmemConfig> {
         self.devices
             .iter()
-            .map(|b| b.blocking_lock().config.clone())
+            .map(|b| b.try_lock().expect("device lock").config.clone())
             .collect()
     }
 }
