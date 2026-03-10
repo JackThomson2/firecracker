@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod device;
-pub mod event_handler;
 pub mod persist;
 
 use self::device::VhostUserBlock;

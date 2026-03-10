@@ -23,8 +23,11 @@ pub enum DumpError {
 }
 
 pub fn dump(vmm: Arc<Mutex<Vmm>>) -> Result<CustomCpuTemplate, DumpError> {
-    // Get CPU configuration.
-    let cpu_configs = vmm.lock().unwrap().dump_cpu_config()?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let cpu_configs = rt.block_on(vmm.lock().unwrap().dump_cpu_config())?;
 
     // Convert CPU config to CPU template.
     Ok(config_to_template(&cpu_configs[0]))

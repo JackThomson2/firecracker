@@ -12,13 +12,11 @@ use std::io::{self, Read, Stdin, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::{Arc, Barrier};
 
-use event_manager::{EventOps, Events, MutEventSubscriber};
 use libc::EFD_NONBLOCK;
 use log::{error, warn};
 use serde::Serialize;
 use vm_superio::serial::{Error as SerialError, SerialEvents};
 use vm_superio::{Serial, Trigger};
-use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::devices::legacy::EventFdTrigger;
@@ -160,29 +158,8 @@ pub struct SerialWrapper<T: Trigger, EV: SerialEvents, I: Read + AsRawFd + Send>
 }
 
 impl<I: Read + AsRawFd + Send + Debug> SerialWrapper<EventFdTrigger, SerialEventsWrapper, I> {
-    fn handle_ewouldblock(&self, ops: &mut EventOps) {
-        let buffer_ready_fd = self.buffer_ready_evt_fd();
-        let input_fd = self.serial_input_fd();
-        if input_fd < 0 || buffer_ready_fd < 0 {
-            error!("Serial does not have a configured input source.");
-            return;
-        }
-        match ops.add(Events::new(&input_fd, EventSet::IN)) {
-            Err(event_manager::Error::FdAlreadyRegistered) => (),
-            Err(err) => {
-                error!(
-                    "Could not register the serial input to the event manager: {:?}",
-                    err
-                );
-            }
-            Ok(()) => {
-                // Bytes might had come on the unregistered stdin. Try to consume any.
-                self.serial.events().in_buffer_empty()
-            }
-        };
-    }
 
-    fn recv_bytes(&mut self) -> io::Result<usize> {
+    pub fn recv_bytes(&mut self) -> io::Result<usize> {
         let avail_cap = self.serial.fifo_capacity();
         if avail_cap == 0 {
             return Err(io::Error::from_raw_os_error(libc::ENOBUFS));
@@ -204,7 +181,7 @@ impl<I: Read + AsRawFd + Send + Debug> SerialWrapper<EventFdTrigger, SerialEvent
     }
 
     #[inline]
-    fn buffer_ready_evt_fd(&self) -> RawFd {
+    pub fn buffer_ready_evt_fd(&self) -> RawFd {
         self.serial
             .events()
             .buffer_ready_event_fd
@@ -213,11 +190,11 @@ impl<I: Read + AsRawFd + Send + Debug> SerialWrapper<EventFdTrigger, SerialEvent
     }
 
     #[inline]
-    fn serial_input_fd(&self) -> RawFd {
+    pub fn serial_input_fd(&self) -> RawFd {
         self.input.as_ref().map_or(-1, |input| input.as_raw_fd())
     }
 
-    fn consume_buffer_ready_event(&self) -> io::Result<u64> {
+    pub fn consume_buffer_ready_event(&self) -> io::Result<u64> {
         self.serial
             .events()
             .buffer_ready_event_fd
@@ -249,102 +226,6 @@ impl SerialDevice {
     }
 }
 
-impl<I: Read + AsRawFd + Send + Debug> MutEventSubscriber
-    for SerialWrapper<EventFdTrigger, SerialEventsWrapper, I>
-{
-    /// Handle events on the serial input fd.
-    fn process(&mut self, event: Events, ops: &mut EventOps) {
-        #[inline]
-        fn unregister_source<T: AsRawFd + Debug>(ops: &mut EventOps, source: &T) {
-            match ops.remove(Events::new(source, EventSet::IN)) {
-                Ok(_) => (),
-                Err(_) => error!("Could not unregister source fd: {}", source.as_raw_fd()),
-            }
-        }
-
-        let input_fd = self.serial_input_fd();
-        let buffer_ready_fd = self.buffer_ready_evt_fd();
-        if input_fd < 0 || buffer_ready_fd < 0 {
-            error!("Serial does not have a configured input source.");
-            return;
-        }
-
-        if buffer_ready_fd == event.fd() {
-            match self.consume_buffer_ready_event() {
-                Ok(_) => (),
-                Err(err) => {
-                    error!(
-                        "Detach serial device input source due to error in consuming the buffer \
-                         ready event: {:?}",
-                        err
-                    );
-                    unregister_source(ops, &input_fd);
-                    unregister_source(ops, &buffer_ready_fd);
-                    return;
-                }
-            }
-        }
-
-        // We expect to receive: `EventSet::IN`, `EventSet::HANG_UP` or
-        // `EventSet::ERROR`. To process all these events we just have to
-        // read from the serial input.
-        match self.recv_bytes() {
-            Ok(count) => {
-                // Handle EOF if the event came from the input source.
-                if input_fd == event.fd() && count == 0 {
-                    unregister_source(ops, &input_fd);
-                    unregister_source(ops, &buffer_ready_fd);
-                    warn!("Detached the serial input due to peer close/error.");
-                }
-            }
-            Err(err) => {
-                match err.raw_os_error() {
-                    Some(errno) if errno == libc::ENOBUFS => {
-                        unregister_source(ops, &input_fd);
-                    }
-                    Some(errno) if errno == libc::EWOULDBLOCK => {
-                        self.handle_ewouldblock(ops);
-                    }
-                    Some(errno) if errno == libc::ENOTTY => {
-                        error!("The serial device does not have the input source attached.");
-                        unregister_source(ops, &input_fd);
-                        unregister_source(ops, &buffer_ready_fd);
-                    }
-                    Some(_) | None => {
-                        // Unknown error, detach the serial input source.
-                        unregister_source(ops, &input_fd);
-                        unregister_source(ops, &buffer_ready_fd);
-                        warn!("Detached the serial input due to peer close/error.");
-                    }
-                }
-            }
-        }
-    }
-
-    /// Initial registration of pollable objects.
-    /// If serial input is present, register the serial input FD as readable.
-    fn init(&mut self, ops: &mut EventOps) {
-        if self.input.is_some() && self.serial.events().buffer_ready_event_fd.is_some() {
-            let serial_fd = self.serial_input_fd();
-            let buf_ready_evt = self.buffer_ready_evt_fd();
-
-            // If the jailer is instructed to daemonize before exec-ing into firecracker, we set
-            // stdin, stdout and stderr to be open('/dev/null'). However, if stdin is redirected
-            // from /dev/null then trying to register FILENO_STDIN to epoll will fail with EPERM.
-            // Therefore, only try to register stdin to epoll if it is a terminal or a FIFO pipe.
-            // SAFETY: isatty has no invariants that need to be upheld. If serial_fd is an invalid
-            // argument, it will return 0 and set errno to EBADF.
-            if (unsafe { libc::isatty(serial_fd) } == 1 || is_fifo(serial_fd))
-                && let Err(err) = ops.add(Events::new(&serial_fd, EventSet::IN))
-            {
-                warn!("Failed to register serial input fd: {}", err);
-            }
-            if let Err(err) = ops.add(Events::new(&buf_ready_evt, EventSet::IN)) {
-                warn!("Failed to register serial buffer ready event: {}", err);
-            }
-        }
-    }
-}
 
 /// Checks whether the given file descriptor is a FIFO pipe.
 fn is_fifo(fd: RawFd) -> bool {

@@ -326,7 +326,6 @@ pub(crate) mod test {
     use std::fmt::{self, Debug};
     use std::sync::{Arc, Mutex, MutexGuard};
 
-    use event_manager::{EventManager, MutEventSubscriber, SubscriberId, SubscriberOps};
 
     use crate::devices::virtio::device::VirtioDevice;
     use crate::devices::virtio::net::MAX_BUFFER_SIZE;
@@ -359,19 +358,15 @@ pub(crate) mod test {
     /// that the guest would pass to the device during normal operation
     pub struct VirtioTestHelper<'a, T>
     where
-        T: VirtioTestDevice + MutEventSubscriber,
+        T: VirtioTestDevice,
     {
-        event_manager: EventManager<Arc<Mutex<T>>>,
-        _subscriber_id: SubscriberId,
         device: Arc<Mutex<T>>,
         virtqueues: Vec<VirtQueue<'a>>,
     }
 
-    impl<T: VirtioTestDevice + MutEventSubscriber + Debug> fmt::Debug for VirtioTestHelper<'_, T> {
+    impl<T: VirtioTestDevice + Debug> fmt::Debug for VirtioTestHelper<'_, T> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("VirtioTestHelper")
-                .field("event_manager", &"?")
-                .field("_subscriber_id", &self._subscriber_id)
                 .field("device", &self.device)
                 .field("virtqueues", &self.virtqueues)
                 .finish()
@@ -380,7 +375,7 @@ pub(crate) mod test {
 
     impl<'a, T> VirtioTestHelper<'a, T>
     where
-        T: VirtioTestDevice + MutEventSubscriber + Debug,
+        T: VirtioTestDevice + Debug,
     {
         const QUEUE_SIZE: u16 = 16;
 
@@ -399,17 +394,12 @@ pub(crate) mod test {
 
         /// Create a new Virtio Device test helper
         pub fn new(mem: &'a GuestMemoryMmap, mut device: T) -> VirtioTestHelper<'a, T> {
-            let mut event_manager = EventManager::new().unwrap();
-
             let virtqueues = Self::create_virtqueues(mem, device.num_queues());
             let queues = virtqueues.iter().map(|vq| vq.create_queue()).collect();
             device.set_queues(queues);
             let device = Arc::new(Mutex::new(device));
-            let _subscriber_id = event_manager.add_subscriber(device.clone());
 
             Self {
-                event_manager,
-                _subscriber_id,
                 device,
                 virtqueues,
             }
@@ -428,9 +418,6 @@ pub(crate) mod test {
                 .unwrap()
                 .activate(mem.clone(), interrupt)
                 .unwrap();
-            // Process the activate event
-            let ev_count = self.event_manager.run_with_timeout(100).unwrap();
-            assert_eq!(ev_count, 1);
         }
 
         /// Get the start of the data region
@@ -550,8 +537,14 @@ pub(crate) mod test {
         /// # Arguments
         ///
         /// * `msec` - The amount pf time in milliseconds for which to Emulate
-        pub fn emulate_for_msec(&mut self, msec: i32) -> Result<usize, event_manager::Error> {
-            self.event_manager.run_with_timeout(msec)
+        /// Process pending device events by calling process_async_event for each fd tag.
+        pub fn emulate_for_msec(&mut self, _msec: i32) -> Result<usize, std::io::Error> {
+            let mut device = self.device.lock().unwrap();
+            let tags: Vec<(_, u32)> = device.async_fd_tags();
+            for (_fd, tag) in &tags {
+                device.process_async_event(*tag);
+            }
+            Ok(tags.len())
         }
     }
 }

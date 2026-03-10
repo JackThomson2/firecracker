@@ -18,7 +18,6 @@ pub const RX_INDEX: usize = 0;
 pub const TX_INDEX: usize = 1;
 
 pub mod device;
-mod event_handler;
 pub mod metrics;
 pub mod persist;
 mod tap;

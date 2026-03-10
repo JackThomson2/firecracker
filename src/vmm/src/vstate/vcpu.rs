@@ -7,7 +7,7 @@
 
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{Ordering, fence};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use tokio::sync::mpsc::{self as tokio_mpsc};
 use std::sync::{Arc, Barrier};
 use std::{fmt, io, thread};
 
@@ -94,15 +94,15 @@ pub struct Vcpu {
     exit_evt: EventFd,
     /// Debugger emitter for gdb events
     #[cfg(feature = "gdb")]
-    gdb_event: Option<Sender<usize>>,
+    gdb_event: Option<std::sync::mpsc::Sender<usize>>,
     /// The receiving end of events channel owned by the vcpu side.
-    event_receiver: Receiver<VcpuEvent>,
+    event_receiver: tokio_mpsc::Receiver<VcpuEvent>,
     /// The transmitting end of the events channel which will be given to the handler.
-    event_sender: Option<Sender<VcpuEvent>>,
+    event_sender: Option<tokio_mpsc::Sender<VcpuEvent>>,
     /// The receiving end of the responses channel which will be given to the handler.
-    response_receiver: Option<Receiver<VcpuResponse>>,
+    response_receiver: Option<tokio_mpsc::Receiver<VcpuResponse>>,
     /// The transmitting end of the responses channel owned by the vcpu side.
-    response_sender: Sender<VcpuResponse>,
+    response_sender: tokio_mpsc::Sender<VcpuResponse>,
 }
 
 impl Vcpu {
@@ -126,8 +126,8 @@ impl Vcpu {
     /// * `vm` - The vm to which this vcpu will get attached.
     /// * `exit_evt` - An `EventFd` that will be written into when this vcpu exits.
     pub fn new(index: u8, vm: &Vm, exit_evt: EventFd) -> Result<Self, VcpuError> {
-        let (event_sender, event_receiver) = channel();
-        let (response_sender, response_receiver) = channel();
+        let (event_sender, event_receiver) = tokio_mpsc::channel(16);
+        let (response_sender, response_receiver) = tokio_mpsc::channel(16);
         let kvm_vcpu = KvmVcpu::new(index, vm).unwrap();
 
         Ok(Vcpu {
@@ -149,7 +149,7 @@ impl Vcpu {
 
     /// Attaches the fields required for debugging
     #[cfg(feature = "gdb")]
-    pub fn attach_debug_info(&mut self, gdb_event: Sender<usize>) {
+    pub fn attach_debug_info(&mut self, gdb_event: std::sync::mpsc::Sender<usize>) {
         self.gdb_event = Some(gdb_event);
     }
 
@@ -251,7 +251,7 @@ impl Vcpu {
             Ok(VcpuEvent::Pause) => {
                 // Nothing special to do.
                 self.response_sender
-                    .send(VcpuResponse::Paused)
+                    .blocking_send(VcpuResponse::Paused)
                     .expect("vcpu channel unexpectedly closed");
 
                 #[cfg(target_arch = "x86_64")]
@@ -262,13 +262,13 @@ impl Vcpu {
             }
             Ok(VcpuEvent::Resume) => {
                 self.response_sender
-                    .send(VcpuResponse::Resumed)
+                    .blocking_send(VcpuResponse::Resumed)
                     .expect("vcpu channel unexpectedly closed");
             }
             // SaveState cannot be performed on a running Vcpu.
             Ok(VcpuEvent::SaveState) => {
                 self.response_sender
-                    .send(VcpuResponse::NotAllowed(String::from(
+                    .blocking_send(VcpuResponse::NotAllowed(String::from(
                         "save/restore unavailable while running",
                     )))
                     .expect("vcpu channel unexpectedly closed");
@@ -276,19 +276,19 @@ impl Vcpu {
             // DumpCpuConfig cannot be performed on a running Vcpu.
             Ok(VcpuEvent::DumpCpuConfig) => {
                 self.response_sender
-                    .send(VcpuResponse::NotAllowed(String::from(
+                    .blocking_send(VcpuResponse::NotAllowed(String::from(
                         "cpu config dump is unavailable while running",
                     )))
                     .expect("vcpu channel unexpectedly closed");
             }
             Ok(VcpuEvent::Finish) => return StateMachine::finish(),
             // Unhandled exit of the other end.
-            Err(TryRecvError::Disconnected) => {
+            Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
                 // Move to 'exited' state.
                 state = self.exit(FcExitCode::GenericError);
             }
             // All other events or lack thereof have no effect on current 'running' state.
-            Err(TryRecvError::Empty) => (),
+            Err(tokio_mpsc::error::TryRecvError::Empty) => (),
         }
 
         state
@@ -296,9 +296,9 @@ impl Vcpu {
 
     // This is the main loop of the `Paused` state.
     fn paused(&mut self) -> StateMachine<Self> {
-        match self.event_receiver.recv() {
+        match self.event_receiver.blocking_recv() {
             // Paused ---- Resume ----> Running
-            Ok(VcpuEvent::Resume) => {
+            Some(VcpuEvent::Resume) => {
                 if self.kvm_vcpu.fd.get_kvm_run().immediate_exit == 1u8 {
                     warn!(
                         "Received a VcpuEvent::Resume message with immediate_exit enabled. \
@@ -307,53 +307,53 @@ impl Vcpu {
                     self.kvm_vcpu.fd.set_kvm_immediate_exit(0);
                 }
                 self.response_sender
-                    .send(VcpuResponse::Resumed)
+                    .blocking_send(VcpuResponse::Resumed)
                     .expect("vcpu channel unexpectedly closed");
                 // Move to 'running' state.
                 StateMachine::next(Self::running)
             }
-            Ok(VcpuEvent::Pause) => {
+            Some(VcpuEvent::Pause) => {
                 self.response_sender
-                    .send(VcpuResponse::Paused)
+                    .blocking_send(VcpuResponse::Paused)
                     .expect("vcpu channel unexpectedly closed");
                 StateMachine::next(Self::paused)
             }
-            Ok(VcpuEvent::SaveState) => {
+            Some(VcpuEvent::SaveState) => {
                 // Save vcpu state.
                 self.kvm_vcpu
                     .save_state()
                     .map(|vcpu_state| {
                         self.response_sender
-                            .send(VcpuResponse::SavedState(Box::new(vcpu_state)))
+                            .blocking_send(VcpuResponse::SavedState(Box::new(vcpu_state)))
                             .expect("vcpu channel unexpectedly closed");
                     })
                     .unwrap_or_else(|err| {
                         self.response_sender
-                            .send(VcpuResponse::Error(VcpuError::VcpuResponse(err)))
+                            .blocking_send(VcpuResponse::Error(VcpuError::VcpuResponse(err)))
                             .expect("vcpu channel unexpectedly closed");
                     });
 
                 StateMachine::next(Self::paused)
             }
-            Ok(VcpuEvent::DumpCpuConfig) => {
+            Some(VcpuEvent::DumpCpuConfig) => {
                 self.kvm_vcpu
                     .dump_cpu_config()
                     .map(|cpu_config| {
                         self.response_sender
-                            .send(VcpuResponse::DumpedCpuConfig(Box::new(cpu_config)))
+                            .blocking_send(VcpuResponse::DumpedCpuConfig(Box::new(cpu_config)))
                             .expect("vcpu channel unexpectedly closed");
                     })
                     .unwrap_or_else(|err| {
                         self.response_sender
-                            .send(VcpuResponse::Error(VcpuError::VcpuResponse(err)))
+                            .blocking_send(VcpuResponse::Error(VcpuError::VcpuResponse(err)))
                             .expect("vcpu channel unexpectedly closed");
                     });
 
                 StateMachine::next(Self::paused)
             }
-            Ok(VcpuEvent::Finish) => StateMachine::finish(),
+            Some(VcpuEvent::Finish) => StateMachine::finish(),
             // Unhandled exit of the other end.
-            Err(_) => {
+            None => {
                 // Move to 'exited' state.
                 self.exit(FcExitCode::GenericError)
             }
@@ -371,10 +371,10 @@ impl Vcpu {
         // From this state we only accept going to finished.
         loop {
             self.response_sender
-                .send(VcpuResponse::Exited(exit_code))
+                .blocking_send(VcpuResponse::Exited(exit_code))
                 .expect("vcpu channel unexpectedly closed");
             // Wait for and only accept 'VcpuEvent::Finish'.
-            if let Ok(VcpuEvent::Finish) = self.event_receiver.recv() {
+            if let Some(VcpuEvent::Finish) = self.event_receiver.blocking_recv() {
                 break;
             }
         }
@@ -559,8 +559,8 @@ impl fmt::Debug for VcpuResponse {
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
 #[derive(Debug)]
 pub struct VcpuHandle {
-    event_sender: Sender<VcpuEvent>,
-    response_receiver: Receiver<VcpuResponse>,
+    event_sender: tokio_mpsc::Sender<VcpuEvent>,
+    response_receiver: tokio_mpsc::Receiver<VcpuResponse>,
     /// VcpuFd
     pub vcpu_fd: VcpuFd,
     // Rust JoinHandles have to be wrapped in Option if you ever plan on 'join()'ing them.
@@ -581,8 +581,8 @@ impl VcpuHandle {
     /// + `response_received`: [`Received`] from which the vcpu's responses can be read.
     /// + `vcpu_thread`: A [`JoinHandle`] for the vcpu thread.
     pub fn new(
-        event_sender: Sender<VcpuEvent>,
-        response_receiver: Receiver<VcpuResponse>,
+        event_sender: tokio_mpsc::Sender<VcpuEvent>,
+        response_receiver: tokio_mpsc::Receiver<VcpuResponse>,
         vcpu_fd: VcpuFd,
         vcpu_thread: thread::JoinHandle<()>,
     ) -> Self {
@@ -599,10 +599,11 @@ impl VcpuHandle {
     ///
     /// When [`vmm_sys_util::linux::signal::Killable::kill`] errors.
     pub fn send_event(&mut self, event: VcpuEvent) -> Result<(), VcpuSendEventError> {
-        // Use expect() to crash if the other thread closed this channel.
+        // Use try_send instead of blocking_send because this may be called from
+        // within the tokio runtime (e.g. during pause/resume from the async event loop).
         self.event_sender
-            .send(event)
-            .expect("event sender channel closed on vcpu end.");
+            .try_send(event)
+            .expect("event sender channel closed or full on vcpu end.");
         // Kick the vcpu so it picks up the message.
         // Add a fence to ensure the write is visible to the vpu thread
         self.vcpu_fd.set_kvm_immediate_exit(1);
@@ -616,8 +617,14 @@ impl VcpuHandle {
     }
 
     /// Returns a reference to the [`Received`] from which the vcpu's responses can be read.
-    pub fn response_receiver(&self) -> &Receiver<VcpuResponse> {
+    /// Returns a reference to the response receiver.
+    pub fn response_receiver(&self) -> &tokio_mpsc::Receiver<VcpuResponse> {
         &self.response_receiver
+    }
+
+    /// Returns a mutable reference to the response receiver.
+    pub fn response_receiver_mut(&mut self) -> &mut tokio_mpsc::Receiver<VcpuResponse> {
+        &mut self.response_receiver
     }
 }
 

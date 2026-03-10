@@ -41,7 +41,7 @@ use crate::vstate::memory::{
 };
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::{VmError, VmState};
-use crate::{EventManager, Vmm, vstate};
+use crate::{Vmm, vstate};
 
 /// Holds information related to the VM that is not part of VmState.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -163,13 +163,14 @@ pub enum CreateSnapshotError {
 pub const SNAPSHOT_VERSION: Version = Version::new(9, 0, 0);
 
 /// Creates a Microvm snapshot.
-pub fn create_snapshot(
+pub async fn create_snapshot(
     vmm: &mut Vmm,
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
     let microvm_state = vmm
         .save_state(vm_info)
+        .await
         .map_err(CreateSnapshotError::MicrovmState)?;
 
     snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
@@ -357,7 +358,6 @@ pub enum RestoreFromSnapshotGuestMemoryError {
 /// Loads a Microvm snapshot producing a 'paused' Microvm.
 pub fn restore_from_snapshot(
     instance_info: &InstanceInfo,
-    event_manager: &mut EventManager,
     seccomp_filters: &BpfThreadMap,
     params: &LoadSnapshotParams,
     vm_resources: &mut VmResources,
@@ -434,7 +434,6 @@ pub fn restore_from_snapshot(
     };
     builder::build_microvm_from_snapshot(
         instance_info,
-        event_manager,
         microvm_state,
         guest_memory,
         uffd,
@@ -636,7 +635,6 @@ mod tests {
     use crate::vstate::memory::{GuestMemoryRegionState, GuestRegionType};
 
     fn default_vmm_with_devices() -> Vmm {
-        let mut event_manager = EventManager::new().expect("Cannot create EventManager");
         let mut vmm = default_vmm();
         let mut cmdline = default_kernel_cmdline();
 
@@ -648,7 +646,7 @@ mod tests {
             free_page_hinting: false,
             free_page_reporting: false,
         };
-        insert_balloon_device(&mut vmm, &mut cmdline, &mut event_manager, balloon_config);
+        insert_balloon_device(&mut vmm, &mut cmdline, balloon_config);
 
         // Add a block device.
         let drive_id = String::from("root");
@@ -659,7 +657,7 @@ mod tests {
             true,
             CacheType::Unsafe,
         )];
-        insert_block_devices(&mut vmm, &mut cmdline, &mut event_manager, block_configs);
+        insert_block_devices(&mut vmm, &mut cmdline, block_configs);
 
         // Add net device.
         let network_interface = NetworkInterfaceConfig {
@@ -672,7 +670,6 @@ mod tests {
         insert_net_device(
             &mut vmm,
             &mut cmdline,
-            &mut event_manager,
             network_interface,
         );
 
@@ -681,7 +678,7 @@ mod tests {
         tmp_sock_file.remove().unwrap();
         let vsock_config = default_config(&tmp_sock_file);
 
-        insert_vsock_device(&mut vmm, &mut cmdline, &mut event_manager, vsock_config);
+        insert_vsock_device(&mut vmm, &mut cmdline, vsock_config);
 
         #[cfg(target_arch = "x86_64")]
         insert_vmgenid_device(&mut vmm);

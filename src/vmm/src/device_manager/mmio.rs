@@ -11,7 +11,6 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(target_arch = "x86_64")]
 use acpi_tables::{Aml, aml};
-use event_manager::SubscriberOps;
 use kvm_ioctls::IoEventAddress;
 use linux_loader::cmdline as kernel_cmdline;
 #[cfg(target_arch = "x86_64")]
@@ -31,7 +30,7 @@ use crate::vstate::bus::{Bus, BusError};
 #[cfg(target_arch = "x86_64")]
 use crate::vstate::memory::GuestAddress;
 use crate::vstate::resources::ResourceAllocator;
-use crate::{EventManager, Vm};
+use crate::Vm;
 
 /// Errors for MMIO device manager.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -114,8 +113,6 @@ pub struct MMIODevice<T> {
     pub(crate) resources: MMIODeviceInfo,
     /// The actual device
     pub(crate) inner: Arc<Mutex<T>>,
-    /// The subscriber ID returned by the EventManager
-    pub(crate) sub_id: Option<event_manager::SubscriberId>,
 }
 
 /// Manages the complexities of registering a MMIO device.
@@ -178,7 +175,6 @@ impl MMIODeviceManager {
         vm: &Vm,
         device_id: String,
         mut device: MMIODevice<MmioTransport>,
-        event_manager: &mut EventManager,
     ) -> Result<(), MmioError> {
         // Our virtio devices are currently hardcoded to use a single IRQ.
         // Validate that requirement.
@@ -205,10 +201,6 @@ impl MMIODeviceManager {
             device.resources.addr,
             device.resources.len,
         )?;
-
-        let sub_id =
-            event_manager.add_subscriber(device.inner.lock().expect("Poisoned lock").device());
-        device.sub_id = Some(sub_id);
 
         self.virtio_devices.insert(identifier, device);
 
@@ -243,13 +235,11 @@ impl MMIODeviceManager {
         vm: &Vm,
         device_id: String,
         mmio_device: MmioTransport,
-        event_manager: &mut EventManager,
         _cmdline: &mut kernel_cmdline::Cmdline,
     ) -> Result<(), MmioError> {
         let device = MMIODevice {
             resources: self.allocate_mmio_resources(&mut vm.resource_allocator(), 1)?,
             inner: Arc::new(Mutex::new(mmio_device)),
-            sub_id: None,
         };
 
         #[cfg(target_arch = "x86_64")]
@@ -264,7 +254,7 @@ impl MMIODeviceManager {
                 device.resources.gsi.unwrap(),
             )?;
         }
-        self.register_mmio_virtio(vm, device_id, device, event_manager)?;
+        self.register_mmio_virtio(vm, device_id, device)?;
         Ok(())
     }
 
@@ -299,7 +289,6 @@ impl MMIODeviceManager {
         let device = MMIODevice {
             resources: device_info,
             inner: serial,
-            sub_id: None,
         };
 
         vm.common.mmio_bus.insert(
@@ -353,7 +342,6 @@ impl MMIODeviceManager {
         let device = MMIODevice {
             resources: device_info,
             inner: rtc,
-            sub_id: None,
         };
 
         vm.common.mmio_bus.insert(
@@ -381,7 +369,6 @@ impl MMIODeviceManager {
         let device = MMIODevice {
             resources: device_info,
             inner: boot_timer,
-            sub_id: None,
         };
 
         mmio_bus.insert(
@@ -449,7 +436,6 @@ pub(crate) mod tests {
     use std::ops::Deref;
     use std::sync::Arc;
 
-    use event_manager::{EventOps, Events, MutEventSubscriber};
     use vmm_sys_util::eventfd::EventFd;
 
     use super::*;
@@ -471,7 +457,6 @@ pub(crate) mod tests {
             vm: &Vm,
             guest_mem: GuestMemoryMmap,
             device: Arc<Mutex<dyn VirtioDevice>>,
-            event_manager: &mut EventManager,
             cmdline: &mut kernel_cmdline::Cmdline,
             dev_id: &str,
         ) -> Result<u64, MmioError> {
@@ -481,7 +466,6 @@ pub(crate) mod tests {
                 vm,
                 dev_id.to_string(),
                 mmio_device,
-                event_manager,
                 cmdline,
             )?;
             Ok(self
@@ -519,11 +503,6 @@ pub(crate) mod tests {
                 interrupt_trigger: None,
             }
         }
-    }
-
-    impl MutEventSubscriber for DummyDevice {
-        fn process(&mut self, _: Events, _: &mut EventOps) {}
-        fn init(&mut self, _: &mut EventOps) {}
     }
 
     impl VirtioDevice for DummyDevice {
@@ -605,13 +584,11 @@ pub(crate) mod tests {
         #[cfg(target_arch = "aarch64")]
         vm.setup_irqchip(1).unwrap();
 
-        let mut event_manager = EventManager::new().unwrap();
         device_manager
             .register_virtio_test_device(
                 &vm,
                 vm.guest_memory().clone(),
                 dummy,
-                &mut event_manager,
                 &mut cmdline,
                 "dummy",
             )
@@ -658,14 +635,12 @@ pub(crate) mod tests {
         #[cfg(target_arch = "aarch64")]
         vm.setup_irqchip(1).unwrap();
 
-        let mut event_manager = EventManager::new().unwrap();
         for _i in crate::arch::GSI_LEGACY_START..=crate::arch::GSI_LEGACY_END {
             device_manager
                 .register_virtio_test_device(
                     &vm,
                     vm.guest_memory().clone(),
                     Arc::new(Mutex::new(DummyDevice::new())),
-                    &mut event_manager,
                     &mut cmdline,
                     "dummy1",
                 )
@@ -679,8 +654,7 @@ pub(crate) mod tests {
                         &vm,
                         vm.guest_memory().clone(),
                         Arc::new(Mutex::new(DummyDevice::new())),
-                        &mut event_manager,
-                        &mut cmdline,
+                            &mut cmdline,
                         "dummy2"
                     )
                     .unwrap_err()
@@ -718,13 +692,11 @@ pub(crate) mod tests {
 
         let type_id = dummy.lock().unwrap().device_type();
         let id = String::from("foo");
-        let mut event_manager = EventManager::new().unwrap();
         let addr = device_manager
             .register_virtio_test_device(
                 &vm,
                 vm.guest_memory().clone(),
                 dummy,
-                &mut event_manager,
                 &mut cmdline,
                 &id,
             )
@@ -754,7 +726,6 @@ pub(crate) mod tests {
                 &vm,
                 vm.guest_memory().clone(),
                 dummy2,
-                &mut event_manager,
                 &mut cmdline,
                 &id2,
             )

@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod device;
-mod event_handler;
 pub mod metrics;
 pub mod persist;
 mod request;

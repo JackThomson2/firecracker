@@ -6,7 +6,6 @@ use std::fmt::Debug;
 use std::ops::DerefMut;
 use std::sync::{Arc, Mutex};
 
-use event_manager::{MutEventSubscriber, SubscriberOps};
 use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 
@@ -40,7 +39,7 @@ use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vstate::bus::BusError;
 use crate::vstate::interrupts::InterruptError;
 use crate::vstate::memory::GuestMemoryMmap;
-use crate::{EventManager, Vm};
+use crate::Vm;
 use pci::PciBdf;
 
 #[derive(Debug, Default)]
@@ -111,7 +110,6 @@ impl PciDevices {
         id: String,
         bdf: PciBdf,
         virtio_device: Arc<Mutex<VirtioPciDevice>>,
-        event_manager: &mut EventManager,
     ) -> Result<(), PciManagerError> {
         // We should only be reaching this point if PCI is enabled
         let pci_segment = self.pci_segment.as_ref().unwrap();
@@ -130,20 +128,17 @@ impl PciDevices {
         let mut device = virtio_device.lock().expect("Poisoned lock");
         device.register_notification_ioevent(vm)?;
 
-        let sub_id = event_manager.add_subscriber(device.virtio_device());
-        device.sub_id = Some(sub_id);
 
         Ok(())
     }
 
     pub(crate) fn attach_pci_virtio_device<
-        T: 'static + VirtioDevice + MutEventSubscriber + Debug,
+        T: 'static + VirtioDevice + Debug,
     >(
         &mut self,
         vm: &Arc<Vm>,
         id: String,
         device: Arc<Mutex<T>>,
-        event_manager: &mut EventManager,
     ) -> Result<(), PciManagerError> {
         // We should only be reaching this point if PCI is enabled
         let pci_segment = self.pci_segment.as_ref().unwrap();
@@ -182,17 +177,15 @@ impl PciDevices {
             id,
             pci_device_bdf,
             virtio_device,
-            event_manager,
         )
     }
 
-    fn restore_pci_device<T: 'static + VirtioDevice + MutEventSubscriber + Debug>(
+    fn restore_pci_device<T: 'static + VirtioDevice + Debug>(
         &mut self,
         vm: &Arc<Vm>,
         device: Arc<Mutex<T>>,
         device_id: &str,
         transport_state: &VirtioPciDeviceState,
-        event_manager: &mut EventManager,
     ) -> Result<(), PciManagerError> {
         let device_type = device.lock().expect("Poisoned lock").device_type();
 
@@ -209,7 +202,6 @@ impl PciDevices {
             device_id.to_string(),
             transport_state.pci_device_bdf,
             virtio_device,
-            event_manager,
         )?;
 
         Ok(())
@@ -273,7 +265,6 @@ pub struct PciDevicesConstructorArgs<'a> {
     pub mem: &'a GuestMemoryMmap,
     pub vm_resources: &'a mut VmResources,
     pub instance_id: &'a str,
-    pub event_manager: &'a mut EventManager,
 }
 
 impl<'a> Debug for PciDevicesConstructorArgs<'a> {
@@ -465,7 +456,6 @@ impl<'a> Persist<'a> for PciDevices {
                 device,
                 &balloon_state.device_id,
                 &balloon_state.transport_state,
-                constructor_args.event_manager,
             )?
         }
 
@@ -485,7 +475,6 @@ impl<'a> Persist<'a> for PciDevices {
                 device,
                 &block_state.device_id,
                 &block_state.transport_state,
-                constructor_args.event_manager,
             )?
         }
 
@@ -531,7 +520,6 @@ impl<'a> Persist<'a> for PciDevices {
                 device,
                 &net_state.device_id,
                 &net_state.transport_state,
-                constructor_args.event_manager,
             )?
         }
 
@@ -558,7 +546,6 @@ impl<'a> Persist<'a> for PciDevices {
                 device,
                 &vsock_state.device_id,
                 &vsock_state.transport_state,
-                constructor_args.event_manager,
             )?
         }
 
@@ -580,7 +567,6 @@ impl<'a> Persist<'a> for PciDevices {
                 device,
                 &entropy_state.device_id,
                 &entropy_state.transport_state,
-                constructor_args.event_manager,
             )?
         }
 
@@ -603,7 +589,6 @@ impl<'a> Persist<'a> for PciDevices {
                 device,
                 &pmem_state.device_id,
                 &pmem_state.transport_state,
-                constructor_args.event_manager,
             )?
         }
 
@@ -623,7 +608,6 @@ impl<'a> Persist<'a> for PciDevices {
                 arcd_device,
                 &memory_device.device_id,
                 &memory_device.transport_state,
-                constructor_args.event_manager,
             )?
         }
 
@@ -659,7 +643,6 @@ mod tests {
         let serialized_data;
         // Set up a vmm with one of each device, and get the serialized DeviceStates.
         {
-            let mut event_manager = EventManager::new().expect("Unable to create EventManager");
             let mut vmm = default_vmm();
             vmm.device_manager.enable_pci(&vmm.vm).unwrap();
             let mut cmdline = default_kernel_cmdline();
@@ -695,8 +678,7 @@ mod tests {
             insert_net_device_with_mmds(
                 &mut vmm,
                 &mut cmdline,
-                &mut event_manager,
-                network_interface,
+                    network_interface,
                 MmdsVersion::V2,
             );
             // Add a vsock device.
@@ -729,8 +711,7 @@ mod tests {
             insert_virtio_mem_device(
                 &mut vmm,
                 &mut cmdline,
-                &mut event_manager,
-                memory_hotplug_config,
+                    memory_hotplug_config,
             );
 
             let device_state = vmm.device_manager.save();
@@ -753,7 +734,6 @@ mod tests {
             mem: vmm.vm.guest_memory(),
             vm_resources,
             instance_id: "microvm-id",
-            event_manager: &mut event_manager,
         };
         let _restored_dev_manager =
             PciDevices::restore(restore_args, &device_manager_state.pci_state).unwrap();

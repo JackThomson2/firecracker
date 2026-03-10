@@ -17,7 +17,7 @@ use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::HugePageConfig;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vstate::memory::{self, GuestMemoryMmap, GuestRegionMmap, GuestRegionMmapExt};
-use crate::{EventManager, Vmm};
+use crate::Vmm;
 
 pub mod mock_resources;
 
@@ -74,8 +74,7 @@ pub fn create_vmm(
     boot_microvm: bool,
     pci_enabled: bool,
     memory_hotplug_enabled: bool,
-) -> (Arc<Mutex<Vmm>>, EventManager) {
-    let mut event_manager = EventManager::new().unwrap();
+) -> Arc<Mutex<Vmm>> {
     let empty_seccomp_filters = get_empty_filters();
 
     let boot_source_cfg = MockBootSourceConfig::new().with_default_boot_args();
@@ -108,27 +107,30 @@ pub fn create_vmm(
     let vmm = build_microvm_for_boot(
         &InstanceInfo::default(),
         &resources,
-        &mut event_manager,
         &empty_seccomp_filters,
     )
     .unwrap();
 
     if boot_microvm {
-        vmm.lock().unwrap().resume_vm().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(vmm.lock().unwrap().resume_vm()).unwrap();
     }
 
-    (vmm, event_manager)
+    vmm
 }
 
-pub fn default_vmm(kernel_image: Option<&str>) -> (Arc<Mutex<Vmm>>, EventManager) {
+pub fn default_vmm(kernel_image: Option<&str>) -> Arc<Mutex<Vmm>> {
     create_vmm(kernel_image, false, true, false, false)
 }
 
-pub fn default_vmm_no_boot(kernel_image: Option<&str>) -> (Arc<Mutex<Vmm>>, EventManager) {
+pub fn default_vmm_no_boot(kernel_image: Option<&str>) -> Arc<Mutex<Vmm>> {
     create_vmm(kernel_image, false, false, false, false)
 }
 
-pub fn dirty_tracking_vmm(kernel_image: Option<&str>) -> (Arc<Mutex<Vmm>>, EventManager) {
+pub fn dirty_tracking_vmm(kernel_image: Option<&str>) -> Arc<Mutex<Vmm>> {
     create_vmm(kernel_image, true, true, false, false)
 }
 

@@ -259,7 +259,6 @@ pub struct VirtioPciDevice {
     id: String,
 
     // The subscriber ID returned by the EventManager
-    pub sub_id: Option<event_manager::SubscriberId>,
 
     // BDF assigned to the device
     pci_device_bdf: PciBdf,
@@ -401,7 +400,6 @@ impl VirtioPciDevice {
 
         let virtio_pci_device = VirtioPciDevice {
             id,
-            sub_id: None,
             pci_device_bdf: pci_device_bdf.into(),
             configuration: pci_config,
             common_config: virtio_common_config,
@@ -446,7 +444,6 @@ impl VirtioPciDevice {
 
         let virtio_pci_device = VirtioPciDevice {
             id,
-            sub_id: None,
             pci_device_bdf: state.pci_device_bdf,
             configuration: pci_config,
             common_config: virtio_common_config,
@@ -956,7 +953,6 @@ impl BusDevice for VirtioPciDevice {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use event_manager::MutEventSubscriber;
     use linux_loader::loader::Cmdline;
     use pci::{PciCapabilityId, PciClassCode, PciSubclass};
     use vm_memory::{ByteValued, Le32};
@@ -984,14 +980,12 @@ mod tests {
         let mut vmm = default_vmm();
         vmm.device_manager.enable_pci(&vmm.vm);
         let entropy = Arc::new(Mutex::new(Entropy::new(RateLimiter::default()).unwrap()));
-        let mut event_manager = crate::EventManager::new().unwrap();
         vmm.device_manager
             .attach_virtio_device(
                 &vmm.vm,
                 "rng".to_string(),
                 entropy.clone(),
                 &mut Cmdline::new(1024).unwrap(),
-                &mut event_manager,
                 false,
             )
             .unwrap();

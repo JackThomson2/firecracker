@@ -9,7 +9,6 @@ use std::io;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use event_manager::SubscriberOps;
 use linux_loader::cmdline::Cmdline as LoaderKernelCmdline;
 use userfaultfd::Uffd;
 use utils::time::TimestampUs;
@@ -55,7 +54,7 @@ use crate::vstate::memory::GuestRegionMmap;
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::VcpuError;
 use crate::vstate::vm::{Vm, VmError};
-use crate::{EventManager, Vmm, VmmError};
+use crate::{Vmm, VmmError};
 
 /// Errors associated with starting the instance.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -142,7 +141,6 @@ impl std::convert::From<linux_loader::cmdline::Error> for StartMicrovmError {
 pub fn build_microvm_for_boot(
     instance_info: &InstanceInfo,
     vm_resources: &super::resources::VmResources,
-    event_manager: &mut EventManager,
     seccomp_filters: &BpfThreadMap,
 ) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     // Timestamp for measuring microVM boot duration.
@@ -191,7 +189,6 @@ pub fn build_microvm_for_boot(
     };
 
     let mut device_manager = DeviceManager::new(
-        event_manager,
         &vcpus_exit_evt,
         &vm,
         vm_resources.serial_out_path.as_ref(),
@@ -221,7 +218,6 @@ pub fn build_microvm_for_boot(
             &vm,
             &mut boot_cmdline,
             balloon,
-            event_manager,
         )?;
     }
 
@@ -230,21 +226,18 @@ pub fn build_microvm_for_boot(
         &vm,
         &mut boot_cmdline,
         vm_resources.block.devices.iter(),
-        event_manager,
     )?;
     attach_net_devices(
         &mut device_manager,
         &vm,
         &mut boot_cmdline,
         vm_resources.net_builder.iter(),
-        event_manager,
     )?;
     attach_pmem_devices(
         &mut device_manager,
         &vm,
         &mut boot_cmdline,
         vm_resources.pmem.devices.iter(),
-        event_manager,
     )?;
 
     if let Some(unix_vsock) = vm_resources.vsock.get() {
@@ -253,7 +246,6 @@ pub fn build_microvm_for_boot(
             &vm,
             &mut boot_cmdline,
             unix_vsock,
-            event_manager,
         )?;
     }
 
@@ -263,7 +255,6 @@ pub fn build_microvm_for_boot(
             &vm,
             &mut boot_cmdline,
             entropy,
-            event_manager,
         )?;
     }
 
@@ -274,7 +265,6 @@ pub fn build_microvm_for_boot(
             &vm,
             &mut boot_cmdline,
             memory_hotplug,
-            event_manager,
             virtio_mem_addr.expect("address should be allocated"),
         )?;
     }
@@ -282,7 +272,6 @@ pub fn build_microvm_for_boot(
     #[cfg(target_arch = "aarch64")]
     device_manager.attach_legacy_devices_aarch64(
         &vm,
-        event_manager,
         &mut boot_cmdline,
         vm_resources.serial_out_path.as_ref(),
     )?;
@@ -369,7 +358,6 @@ pub fn build_microvm_for_boot(
     )
     .map_err(VmmError::SeccompFilters)?;
 
-    event_manager.add_subscriber(vmm.clone());
 
     Ok(vmm)
 }
@@ -379,20 +367,17 @@ pub fn build_microvm_for_boot(
 /// This is the default build recipe, one could build other microVM flavors by using the
 /// independent functions in this module instead of calling this recipe.
 ///
-/// An `Arc` reference of the built `Vmm` is also plugged in the `EventManager`, while another
-/// is returned.
-pub fn build_and_boot_microvm(
+pub async fn build_and_boot_microvm(
     instance_info: &InstanceInfo,
     vm_resources: &super::resources::VmResources,
-    event_manager: &mut EventManager,
     seccomp_filters: &BpfThreadMap,
 ) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     debug!("event_start: build microvm for boot");
-    let vmm = build_microvm_for_boot(instance_info, vm_resources, event_manager, seccomp_filters)?;
+    let vmm = build_microvm_for_boot(instance_info, vm_resources, seccomp_filters)?;
     debug!("event_end: build microvm for boot");
     // The vcpus start off in the `Paused` state, let them run.
     debug!("event_start: boot microvm");
-    vmm.lock().unwrap().resume_vm()?;
+    vmm.lock().unwrap().resume_vm().await?;
     debug!("event_end: boot microvm");
     Ok(vmm)
 }
@@ -436,12 +421,9 @@ pub enum BuildMicrovmFromSnapshotError {
 
 /// Builds and starts a microVM based on the provided MicrovmState.
 ///
-/// An `Arc` reference of the built `Vmm` is also plugged in the `EventManager`, while another
-/// is returned.
 #[allow(clippy::too_many_arguments)]
 pub fn build_microvm_from_snapshot(
     instance_info: &InstanceInfo,
-    event_manager: &mut EventManager,
     microvm_state: MicrovmState,
     guest_memory: Vec<GuestRegionMmap>,
     uffd: Option<Uffd>,
@@ -509,7 +491,6 @@ pub fn build_microvm_from_snapshot(
     let device_ctor_args = DeviceRestoreArgs {
         mem: vm.guest_memory(),
         vm: &vm,
-        event_manager,
         vm_resources,
         instance_id: &instance_info.id,
         vcpus_exit_evt: &vcpus_exit_evt,
@@ -542,7 +523,6 @@ pub fn build_microvm_from_snapshot(
     )?;
 
     let vmm = Arc::new(Mutex::new(vmm));
-    event_manager.add_subscriber(vmm.clone());
 
     // Load seccomp filters for the VMM thread.
     // Keep this as the last step of the building process.
@@ -604,7 +584,6 @@ fn attach_entropy_device(
     vm: &Arc<Vm>,
     cmdline: &mut LoaderKernelCmdline,
     entropy_device: &Arc<Mutex<Entropy>>,
-    event_manager: &mut EventManager,
 ) -> Result<(), AttachDeviceError> {
     let id = entropy_device
         .lock()
@@ -617,7 +596,6 @@ fn attach_entropy_device(
         id,
         entropy_device.clone(),
         cmdline,
-        event_manager,
         false,
     )
 }
@@ -643,7 +621,6 @@ fn attach_virtio_mem_device(
     vm: &Arc<Vm>,
     cmdline: &mut LoaderKernelCmdline,
     config: &MemoryHotplugConfig,
-    event_manager: &mut EventManager,
     addr: GuestAddress,
 ) -> Result<(), StartMicrovmError> {
     let virtio_mem = Arc::new(Mutex::new(
@@ -663,7 +640,6 @@ fn attach_virtio_mem_device(
         id,
         virtio_mem.clone(),
         cmdline,
-        event_manager,
         false,
     )?;
     Ok(())
@@ -674,7 +650,6 @@ fn attach_block_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Block>>> + Debug>(
     vm: &Arc<Vm>,
     cmdline: &mut LoaderKernelCmdline,
     blocks: I,
-    event_manager: &mut EventManager,
 ) -> Result<(), StartMicrovmError> {
     for block in blocks {
         let (id, is_vhost_user) = {
@@ -697,7 +672,6 @@ fn attach_block_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Block>>> + Debug>(
             id,
             block.clone(),
             cmdline,
-            event_manager,
             is_vhost_user,
         )?;
     }
@@ -709,7 +683,6 @@ fn attach_net_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Net>>> + Debug>(
     vm: &Arc<Vm>,
     cmdline: &mut LoaderKernelCmdline,
     net_devices: I,
-    event_manager: &mut EventManager,
 ) -> Result<(), StartMicrovmError> {
     for net_device in net_devices {
         let id = net_device.lock().expect("Poisoned lock").id().to_string();
@@ -719,7 +692,6 @@ fn attach_net_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Net>>> + Debug>(
             id,
             net_device.clone(),
             cmdline,
-            event_manager,
             false,
         )?;
     }
@@ -731,7 +703,6 @@ fn attach_pmem_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Pmem>>> + Debug>(
     vm: &Arc<Vm>,
     cmdline: &mut LoaderKernelCmdline,
     pmem_devices: I,
-    event_manager: &mut EventManager,
 ) -> Result<(), StartMicrovmError> {
     for (i, device) in pmem_devices.enumerate() {
         let id = {
@@ -753,7 +724,6 @@ fn attach_pmem_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Pmem>>> + Debug>(
             id,
             device.clone(),
             cmdline,
-            event_manager,
             false,
         )?;
     }
@@ -765,11 +735,10 @@ fn attach_unixsock_vsock_device(
     vm: &Arc<Vm>,
     cmdline: &mut LoaderKernelCmdline,
     unix_vsock: &Arc<Mutex<Vsock<VsockUnixBackend>>>,
-    event_manager: &mut EventManager,
 ) -> Result<(), AttachDeviceError> {
     let id = String::from(unix_vsock.lock().expect("Poisoned lock").id());
     // The device mutex mustn't be locked here otherwise it will deadlock.
-    device_manager.attach_virtio_device(vm, id, unix_vsock.clone(), cmdline, event_manager, false)
+    device_manager.attach_virtio_device(vm, id, unix_vsock.clone(), cmdline, false)
 }
 
 fn attach_balloon_device(
@@ -777,11 +746,10 @@ fn attach_balloon_device(
     vm: &Arc<Vm>,
     cmdline: &mut LoaderKernelCmdline,
     balloon: &Arc<Mutex<Balloon>>,
-    event_manager: &mut EventManager,
 ) -> Result<(), AttachDeviceError> {
     let id = String::from(balloon.lock().expect("Poisoned lock").id());
     // The device mutex mustn't be locked here otherwise it will deadlock.
-    device_manager.attach_virtio_device(vm, id, balloon.clone(), cmdline, event_manager, false)
+    device_manager.attach_virtio_device(vm, id, balloon.clone(), cmdline, false)
 }
 
 #[cfg(test)]
@@ -886,7 +854,6 @@ pub(crate) mod tests {
     pub(crate) fn insert_block_devices(
         vmm: &mut Vmm,
         cmdline: &mut Cmdline,
-        event_manager: &mut EventManager,
         custom_block_cfgs: Vec<CustomBlockConfig>,
     ) -> Vec<TempFile> {
         let mut block_dev_configs = BlockBuilder::new();
@@ -926,7 +893,6 @@ pub(crate) mod tests {
             &vmm.vm,
             cmdline,
             block_dev_configs.devices.iter(),
-            event_manager,
         )
         .unwrap();
         block_files
@@ -935,7 +901,6 @@ pub(crate) mod tests {
     pub(crate) fn insert_net_device(
         vmm: &mut Vmm,
         cmdline: &mut Cmdline,
-        event_manager: &mut EventManager,
         net_config: NetworkInterfaceConfig,
     ) {
         let mut net_builder = NetBuilder::new();
@@ -946,7 +911,6 @@ pub(crate) mod tests {
             &vmm.vm,
             cmdline,
             net_builder.iter(),
-            event_manager,
         );
         res.unwrap();
     }
@@ -954,7 +918,6 @@ pub(crate) mod tests {
     pub(crate) fn insert_net_device_with_mmds(
         vmm: &mut Vmm,
         cmdline: &mut Cmdline,
-        event_manager: &mut EventManager,
         net_config: NetworkInterfaceConfig,
         mmds_version: MmdsVersion,
     ) {
@@ -973,7 +936,6 @@ pub(crate) mod tests {
             &vmm.vm,
             cmdline,
             net_builder.iter(),
-            event_manager,
         )
         .unwrap();
     }
@@ -981,7 +943,6 @@ pub(crate) mod tests {
     pub(crate) fn insert_vsock_device(
         vmm: &mut Vmm,
         cmdline: &mut Cmdline,
-        event_manager: &mut EventManager,
         vsock_config: VsockDeviceConfig,
     ) {
         let vsock_dev_id = VSOCK_DEV_ID.to_owned();
@@ -993,7 +954,6 @@ pub(crate) mod tests {
             &vmm.vm,
             cmdline,
             &vsock,
-            event_manager,
         )
         .unwrap();
 
@@ -1007,7 +967,6 @@ pub(crate) mod tests {
     pub(crate) fn insert_entropy_device(
         vmm: &mut Vmm,
         cmdline: &mut Cmdline,
-        event_manager: &mut EventManager,
         entropy_config: EntropyDeviceConfig,
     ) {
         let mut builder = EntropyDeviceBuilder::new();
@@ -1018,7 +977,6 @@ pub(crate) mod tests {
             &vmm.vm,
             cmdline,
             &entropy,
-            event_manager,
         )
         .unwrap();
 
@@ -1032,7 +990,6 @@ pub(crate) mod tests {
     pub(crate) fn insert_pmem_devices(
         vmm: &mut Vmm,
         cmdline: &mut Cmdline,
-        event_manager: &mut EventManager,
         configs: Vec<PmemConfig>,
     ) -> Vec<TempFile> {
         let mut builder = PmemBuilder::default();
@@ -1051,7 +1008,6 @@ pub(crate) mod tests {
             &vmm.vm,
             cmdline,
             builder.devices.iter(),
-            event_manager,
         )
         .unwrap();
         files
@@ -1070,7 +1026,6 @@ pub(crate) mod tests {
     pub(crate) fn insert_balloon_device(
         vmm: &mut Vmm,
         cmdline: &mut Cmdline,
-        event_manager: &mut EventManager,
         balloon_config: BalloonDeviceConfig,
     ) {
         let mut builder = BalloonBuilder::new();
@@ -1082,7 +1037,6 @@ pub(crate) mod tests {
             &vmm.vm,
             cmdline,
             balloon,
-            event_manager,
         )
         .unwrap();
 
@@ -1095,7 +1049,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_attach_net_devices() {
-        let mut event_manager = EventManager::new().expect("Unable to create EventManager");
         let mut vmm = default_vmm();
 
         let network_interface = NetworkInterfaceConfig {
@@ -1110,7 +1063,6 @@ pub(crate) mod tests {
         insert_net_device(
             &mut vmm,
             &mut cmdline,
-            &mut event_manager,
             network_interface.clone(),
         );
 
@@ -1121,7 +1073,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_attach_block_devices() {
-        let mut event_manager = EventManager::new().expect("Unable to create EventManager");
 
         // Use case 1: root block device is not specified through PARTUUID.
         {
@@ -1135,7 +1086,7 @@ pub(crate) mod tests {
             )];
             let mut vmm = default_vmm();
             let mut cmdline = default_kernel_cmdline();
-            insert_block_devices(&mut vmm, &mut cmdline, &mut event_manager, block_configs);
+            insert_block_devices(&mut vmm, &mut cmdline, block_configs);
             assert!(cmdline_contains(&cmdline, "root=/dev/vda ro"));
             assert!(
                 vmm.device_manager
@@ -1156,7 +1107,7 @@ pub(crate) mod tests {
             )];
             let mut vmm = default_vmm();
             let mut cmdline = default_kernel_cmdline();
-            insert_block_devices(&mut vmm, &mut cmdline, &mut event_manager, block_configs);
+            insert_block_devices(&mut vmm, &mut cmdline, block_configs);
             assert!(cmdline_contains(&cmdline, "root=PARTUUID=0eaa91a0-01 rw"));
             assert!(
                 vmm.device_manager
@@ -1177,7 +1128,7 @@ pub(crate) mod tests {
             )];
             let mut vmm = default_vmm();
             let mut cmdline = default_kernel_cmdline();
-            insert_block_devices(&mut vmm, &mut cmdline, &mut event_manager, block_configs);
+            insert_block_devices(&mut vmm, &mut cmdline, block_configs);
             assert!(!cmdline_contains(&cmdline, "root=PARTUUID="));
             assert!(!cmdline_contains(&cmdline, "root=/dev/vda"));
             assert!(
@@ -1214,7 +1165,7 @@ pub(crate) mod tests {
             ];
             let mut vmm = default_vmm();
             let mut cmdline = default_kernel_cmdline();
-            insert_block_devices(&mut vmm, &mut cmdline, &mut event_manager, block_configs);
+            insert_block_devices(&mut vmm, &mut cmdline, block_configs);
 
             assert!(cmdline_contains(&cmdline, "root=PARTUUID=0eaa91a0-01 rw"));
             assert!(
@@ -1254,7 +1205,7 @@ pub(crate) mod tests {
             )];
             let mut vmm = default_vmm();
             let mut cmdline = default_kernel_cmdline();
-            insert_block_devices(&mut vmm, &mut cmdline, &mut event_manager, block_configs);
+            insert_block_devices(&mut vmm, &mut cmdline, block_configs);
             assert!(cmdline_contains(&cmdline, "root=/dev/vda rw"));
             assert!(
                 vmm.device_manager
@@ -1275,7 +1226,7 @@ pub(crate) mod tests {
             )];
             let mut vmm = default_vmm();
             let mut cmdline = default_kernel_cmdline();
-            insert_block_devices(&mut vmm, &mut cmdline, &mut event_manager, block_configs);
+            insert_block_devices(&mut vmm, &mut cmdline, block_configs);
             assert!(cmdline_contains(&cmdline, "root=PARTUUID=0eaa91a0-01 ro"));
             assert!(
                 vmm.device_manager
@@ -1296,7 +1247,7 @@ pub(crate) mod tests {
             )];
             let mut vmm = default_vmm();
             let mut cmdline = default_kernel_cmdline();
-            insert_block_devices(&mut vmm, &mut cmdline, &mut event_manager, block_configs);
+            insert_block_devices(&mut vmm, &mut cmdline, block_configs);
             assert!(cmdline_contains(&cmdline, "root=/dev/vda rw"));
             assert!(
                 vmm.device_manager
@@ -1308,7 +1259,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_attach_pmem_devices() {
-        let mut event_manager = EventManager::new().expect("Unable to create EventManager");
 
         let id = String::from("root");
         let configs = vec![PmemConfig {
@@ -1319,7 +1269,7 @@ pub(crate) mod tests {
         }];
         let mut vmm = default_vmm();
         let mut cmdline = default_kernel_cmdline();
-        _ = insert_pmem_devices(&mut vmm, &mut cmdline, &mut event_manager, configs);
+        _ = insert_pmem_devices(&mut vmm, &mut cmdline, configs);
         assert!(cmdline_contains(&cmdline, "root=/dev/pmem0 ro"));
         assert!(
             vmm.device_manager
@@ -1342,7 +1292,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_attach_balloon_device() {
-        let mut event_manager = EventManager::new().expect("Unable to create EventManager");
         let mut vmm = default_vmm();
 
         let balloon_config = BalloonDeviceConfig {
@@ -1354,7 +1303,7 @@ pub(crate) mod tests {
         };
 
         let mut cmdline = default_kernel_cmdline();
-        insert_balloon_device(&mut vmm, &mut cmdline, &mut event_manager, balloon_config);
+        insert_balloon_device(&mut vmm, &mut cmdline, balloon_config);
         // Check if the vsock device is described in kernel_cmdline.
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         assert!(cmdline_contains(
@@ -1365,13 +1314,12 @@ pub(crate) mod tests {
 
     #[test]
     fn test_attach_entropy_device() {
-        let mut event_manager = EventManager::new().expect("Unable to create EventManager");
         let mut vmm = default_vmm();
 
         let entropy_config = EntropyDeviceConfig::default();
 
         let mut cmdline = default_kernel_cmdline();
-        insert_entropy_device(&mut vmm, &mut cmdline, &mut event_manager, entropy_config);
+        insert_entropy_device(&mut vmm, &mut cmdline, entropy_config);
         // Check if the vsock device is described in kernel_cmdline.
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         assert!(cmdline_contains(
@@ -1382,7 +1330,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_attach_vsock_device() {
-        let mut event_manager = EventManager::new().expect("Unable to create EventManager");
         let mut vmm = default_vmm();
 
         let mut tmp_sock_file = TempFile::new().unwrap();
@@ -1390,7 +1337,7 @@ pub(crate) mod tests {
         let vsock_config = default_config(&tmp_sock_file);
 
         let mut cmdline = default_kernel_cmdline();
-        insert_vsock_device(&mut vmm, &mut cmdline, &mut event_manager, vsock_config);
+        insert_vsock_device(&mut vmm, &mut cmdline, vsock_config);
         // Check if the vsock device is described in kernel_cmdline.
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         assert!(cmdline_contains(
@@ -1402,7 +1349,6 @@ pub(crate) mod tests {
     pub(crate) fn insert_virtio_mem_device(
         vmm: &mut Vmm,
         cmdline: &mut Cmdline,
-        event_manager: &mut EventManager,
         config: MemoryHotplugConfig,
     ) {
         attach_virtio_mem_device(
@@ -1410,7 +1356,6 @@ pub(crate) mod tests {
             &vmm.vm,
             cmdline,
             &config,
-            event_manager,
             GuestAddress(512 << 30),
         )
         .unwrap();
@@ -1418,7 +1363,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_attach_virtio_mem_device() {
-        let mut event_manager = EventManager::new().expect("Unable to create EventManager");
         let mut vmm = default_vmm();
 
         let config = MemoryHotplugConfig {
@@ -1428,7 +1372,7 @@ pub(crate) mod tests {
         };
 
         let mut cmdline = default_kernel_cmdline();
-        insert_virtio_mem_device(&mut vmm, &mut cmdline, &mut event_manager, config);
+        insert_virtio_mem_device(&mut vmm, &mut cmdline, config);
 
         // Check if the vsock device is described in kernel_cmdline.
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]

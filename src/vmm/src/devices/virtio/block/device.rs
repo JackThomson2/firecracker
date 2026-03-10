@@ -4,7 +4,6 @@
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 
-use event_manager::{EventOps, Events, MutEventSubscriber};
 use log::info;
 use vmm_sys_util::eventfd::EventFd;
 
@@ -278,21 +277,6 @@ impl VirtioDevice for Block {
     }
 }
 
-impl MutEventSubscriber for Block {
-    fn process(&mut self, event: Events, ops: &mut EventOps) {
-        match self {
-            Self::Virtio(b) => b.process(event, ops),
-            Self::VhostUser(b) => b.process(event, ops),
-        }
-    }
-
-    fn init(&mut self, ops: &mut EventOps) {
-        match self {
-            Self::Virtio(b) => b.init(ops),
-            Self::VhostUser(b) => b.init(ops),
-        }
-    }
-}
 
 impl Persist<'_> for Block {
     type State = BlockState;

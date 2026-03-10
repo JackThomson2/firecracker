@@ -15,7 +15,6 @@ use std::sync::{Arc, Mutex};
 use std::{io, panic};
 
 use api_server_adapter::ApiServerError;
-use event_manager::SubscriberOps;
 use seccomp::FilterError;
 use utils::arg_parser::{ArgParser, Argument};
 use utils::validators::validate_instance_id;
@@ -31,7 +30,7 @@ use vmm::signal_handler::register_signal_handlers;
 use vmm::snapshot::{SnapshotError, get_format_version};
 use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
 use vmm::vmm_config::metrics::{MetricsConfig, MetricsConfigError, init_metrics};
-use vmm::{EventManager, FcExitCode, HTTP_MAX_PAYLOAD_SIZE};
+use vmm::{FcExitCode, HTTP_MAX_PAYLOAD_SIZE};
 use vmm_sys_util::terminal::Terminal;
 
 use crate::seccomp::SeccompConfig;
@@ -563,9 +562,8 @@ pub enum BuildFromJsonError {
 
 // Configure and start a microVM as described by the command-line JSON.
 #[allow(clippy::too_many_arguments)]
-fn build_microvm_from_json(
+async fn build_microvm_from_json(
     seccomp_filters: &BpfThreadMap,
-    event_manager: &mut EventManager,
     config_json: String,
     instance_info: InstanceInfo,
     boot_timer_enabled: bool,
@@ -581,9 +579,9 @@ fn build_microvm_from_json(
     let vmm = vmm::builder::build_and_boot_microvm(
         &instance_info,
         &vm_resources,
-        event_manager,
         seccomp_filters,
     )
+    .await
     .map_err(BuildFromJsonError::StartMicroVM)?;
 
     info!("Successfully started microvm that was configured from one single json");
@@ -610,20 +608,17 @@ fn run_without_api(
 ) -> Result<(), RunWithoutApiError> {
     let tokio_rt = vmm::async_event_loop::create_runtime();
 
-    let mut event_manager = EventManager::new().expect("Unable to create EventManager");
-    let firecracker_metrics = Arc::new(Mutex::new(metrics::PeriodicMetrics::new()));
-    event_manager.add_subscriber(firecracker_metrics.clone());
+    tokio_rt.rt.block_on(async {
+        let vmm = build_microvm_from_json(
+            seccomp_filters, config_json.unwrap(), instance_info,
+            bool_timer_enabled, pci_enabled, mmds_size_limit, metadata_json,
+        ).await.map_err(RunWithoutApiError::BuildMicroVMFromJson)?;
 
-    let vmm = build_microvm_from_json(
-        seccomp_filters, &mut event_manager, config_json.unwrap(), instance_info,
-        bool_timer_enabled, pci_enabled, mmds_size_limit, metadata_json,
-    ).map_err(RunWithoutApiError::BuildMicroVMFromJson)?;
+        let handlers = vmm.lock().unwrap().device_handlers.take().unwrap_or_default();
+        let serial = vmm::async_event_loop::build_serial_handler(&vmm.lock().unwrap());
 
-    firecracker_metrics.lock().expect("Poisoned lock")
-        .start(metrics::WRITE_METRICS_PERIOD_MS);
-
-    let handlers = vmm.lock().unwrap().device_handlers.take().unwrap_or_default();
-
-    vmm::async_event_loop::run_no_api(&tokio_rt, vmm, handlers)
-        .map_err(RunWithoutApiError::Shutdown)
+        vmm::async_event_loop::run_event_loop(vmm, handlers, serial, None)
+            .await
+            .map_err(RunWithoutApiError::Shutdown)
+    })
 }

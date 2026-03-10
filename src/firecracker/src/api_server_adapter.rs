@@ -2,17 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::path::PathBuf;
-use std::sync::mpsc::channel;
-use std::sync::{Arc, Mutex};
 use std::thread;
 
-use event_manager::SubscriberOps;
 use vmm::async_event_loop;
 use vmm::logger::{ProcessTimeReporter, info};
 use vmm::rpc_interface::{BuildMicrovmFromRequestsError, PrebootApiController};
 use vmm::seccomp::BpfThreadMap;
 use vmm::vmm_config::instance_info::InstanceInfo;
-use vmm::{EventManager, FcExitCode};
+use vmm::FcExitCode;
 
 use super::api_server::{ApiServer, HttpServer, ServerError};
 
@@ -44,7 +41,7 @@ pub(crate) fn run_with_api(
     metadata_json: Option<&str>,
 ) -> Result<(), ApiServerError> {
     let (to_vmm, mut from_api) = tokio::sync::mpsc::channel(1);
-    let (to_api, from_vmm) = channel();
+    let (to_api, from_vmm) = tokio::sync::mpsc::channel(1);
 
     let api_seccomp_filter = seccomp_filters
         .remove("api")
@@ -75,30 +72,30 @@ pub(crate) fn run_with_api(
 
     let tokio_rt = async_event_loop::create_runtime();
 
-    let mut event_manager = EventManager::new().expect("Unable to create EventManager");
-    let firecracker_metrics = Arc::new(Mutex::new(super::metrics::PeriodicMetrics::new()));
-    event_manager.add_subscriber(firecracker_metrics.clone());
+    let result: Result<(), ApiServerError> = tokio_rt.rt.block_on(async {
+        let build_result = match config_json {
+            Some(json) => super::build_microvm_from_json(
+                seccomp_filters, json, instance_info,
+                boot_timer_enabled, pci_enabled, mmds_size_limit, metadata_json,
+            ).await.map_err(ApiServerError::BuildFromJson),
+            None => PrebootApiController::build_microvm_from_requests(
+                seccomp_filters, instance_info,
+                &mut from_api, &to_api, boot_timer_enabled, pci_enabled,
+                mmds_size_limit, metadata_json,
+            ).await.map_err(ApiServerError::BuildMicroVmError),
+        };
 
-    let build_result = match config_json {
-        Some(json) => super::build_microvm_from_json(
-            seccomp_filters, &mut event_manager, json, instance_info,
-            boot_timer_enabled, pci_enabled, mmds_size_limit, metadata_json,
-        ).map_err(ApiServerError::BuildFromJson),
-        None => PrebootApiController::build_microvm_from_requests(
-            seccomp_filters, &mut event_manager, instance_info,
-            &mut from_api, &to_api, boot_timer_enabled, pci_enabled,
-            mmds_size_limit, metadata_json,
-        ).map_err(ApiServerError::BuildMicroVmError),
-    };
+        match build_result {
+            Ok(vmm) => {
+                let handlers = vmm.lock().unwrap().device_handlers.take().unwrap_or_default();
+                let serial = async_event_loop::build_serial_handler(&vmm.lock().unwrap());
 
-    let result = build_result.and_then(|vmm| {
-        firecracker_metrics.lock().expect("Poisoned lock")
-            .start(super::metrics::WRITE_METRICS_PERIOD_MS);
-
-        let handlers = vmm.lock().unwrap().device_handlers.take().unwrap_or_default();
-
-        async_event_loop::run_with_api(&tokio_rt, vmm, handlers, from_api, to_api)
-            .map_err(ApiServerError::MicroVMStoppedWithError)
+                async_event_loop::run_event_loop(vmm, handlers, serial, Some((from_api, to_api)))
+                    .await
+                    .map_err(ApiServerError::MicroVMStoppedWithError)
+            }
+            Err(e) => Err(e),
+        }
     });
 
     api_kill_switch.write(1).unwrap();

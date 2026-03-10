@@ -11,7 +11,6 @@ use super::builder::build_and_boot_microvm;
 use super::persist::{create_snapshot, restore_from_snapshot};
 use super::resources::VmResources;
 use super::{Vmm, VmmError};
-use crate::EventManager;
 use crate::builder::StartMicrovmError;
 use crate::cpu_config::templates::{CustomCpuTemplate, GuestConfigError};
 use crate::devices::virtio::balloon::device::{HintingStatus, StartHintingCmd};
@@ -267,7 +266,6 @@ pub struct PrebootApiController<'a> {
     seccomp_filters: &'a BpfThreadMap,
     instance_info: InstanceInfo,
     vm_resources: &'a mut VmResources,
-    event_manager: &'a mut EventManager,
     /// The [`Vmm`] object constructed through requests
     pub built_vmm: Option<Arc<Mutex<Vmm>>>,
     // Configuring boot specific resources will set this to true.
@@ -285,7 +283,6 @@ impl fmt::Debug for PrebootApiController<'_> {
             .field("seccomp_filters", &self.seccomp_filters)
             .field("instance_info", &self.instance_info)
             .field("vm_resources", &self.vm_resources)
-            .field("event_manager", &"?")
             .field("built_vmm", &self.built_vmm)
             .field("boot_path", &self.boot_path)
             .field("fatal_error", &self.fatal_error)
@@ -328,13 +325,11 @@ impl<'a> PrebootApiController<'a> {
         seccomp_filters: &'a BpfThreadMap,
         instance_info: InstanceInfo,
         vm_resources: &'a mut VmResources,
-        event_manager: &'a mut EventManager,
     ) -> Self {
         Self {
             seccomp_filters,
             instance_info,
             vm_resources,
-            event_manager,
             built_vmm: None,
             boot_path: false,
             fatal_error: None,
@@ -345,12 +340,11 @@ impl<'a> PrebootApiController<'a> {
     ///
     /// Returns a populated `VmResources` object and a running `Vmm` object.
     #[allow(clippy::too_many_arguments)]
-    pub fn build_microvm_from_requests(
+    pub async fn build_microvm_from_requests(
         seccomp_filters: &BpfThreadMap,
-        event_manager: &mut EventManager,
         instance_info: InstanceInfo,
         from_api: &mut tokio::sync::mpsc::Receiver<ApiRequest>,
-        to_api: &std::sync::mpsc::Sender<ApiResponse>,
+        to_api: &tokio::sync::mpsc::Sender<ApiResponse>,
         boot_timer_enabled: bool,
         pci_enabled: bool,
         mmds_size_limit: usize,
@@ -376,7 +370,6 @@ impl<'a> PrebootApiController<'a> {
             seccomp_filters,
             instance_info,
             &mut vm_resources,
-            event_manager,
         );
 
         // Configure and start microVM through successive API calls.
@@ -385,14 +378,15 @@ impl<'a> PrebootApiController<'a> {
         while preboot_controller.built_vmm.is_none() {
             // Get request
             let req = from_api
-                .blocking_recv()
+                .recv()
+                .await
                 .expect("The channel's sending half was disconnected. Cannot receive data.");
 
             // Process the request.
-            let res = preboot_controller.handle_preboot_request(*req);
+            let res = preboot_controller.handle_preboot_request(*req).await;
 
             // Send back the response.
-            to_api.send(Box::new(res)).expect("one-shot channel closed");
+            to_api.send(Box::new(res)).await.expect("one-shot channel closed");
 
             // If any fatal errors were encountered, break the loop.
             if let Some(preboot_error) = preboot_controller.fatal_error {
@@ -407,7 +401,7 @@ impl<'a> PrebootApiController<'a> {
 
     /// Handles the incoming preboot request and provides a response for it.
     /// Returns a built/running `Vmm` after handling a successful `StartMicroVm` request.
-    pub fn handle_preboot_request(
+    pub async fn handle_preboot_request(
         &mut self,
         request: VmmAction,
     ) -> Result<VmmData, VmmActionError> {
@@ -451,6 +445,7 @@ impl<'a> PrebootApiController<'a> {
             InsertNetworkDevice(config) => self.insert_net_device(config),
             LoadSnapshot(config) => self
                 .load_snapshot(&config)
+                .await
                 .map_err(VmmActionError::LoadSnapshot),
             PatchMMDS(value) => mmds_patch_data(
                 self.vm_resources
@@ -470,7 +465,7 @@ impl<'a> PrebootApiController<'a> {
             SetBalloonDevice(config) => self.set_balloon_device(config),
             SetVsockDevice(config) => self.set_vsock_device(config),
             SetMmdsConfiguration(config) => self.set_mmds_config(config),
-            StartMicroVm => self.start_microvm(),
+            StartMicroVm => self.start_microvm().await,
             UpdateMachineConfiguration(config) => self.update_machine_config(config),
             SetEntropyDevice(config) => self.set_entropy_device(config),
             SetMemoryHotplugDevice(config) => self.set_memory_hotplug_device(config),
@@ -597,13 +592,13 @@ impl<'a> PrebootApiController<'a> {
 
     // On success, this command will end the pre-boot stage and this controller
     // will be replaced by a runtime controller.
-    fn start_microvm(&mut self) -> Result<VmmData, VmmActionError> {
+    async fn start_microvm(&mut self) -> Result<VmmData, VmmActionError> {
         build_and_boot_microvm(
             &self.instance_info,
             self.vm_resources,
-            self.event_manager,
             self.seccomp_filters,
         )
+        .await
         .map(|vmm| {
             self.built_vmm = Some(vmm);
             VmmData::Empty
@@ -613,7 +608,7 @@ impl<'a> PrebootApiController<'a> {
 
     // On success, this command will end the pre-boot stage and this controller
     // will be replaced by a runtime controller.
-    fn load_snapshot(
+    async fn load_snapshot(
         &mut self,
         load_params: &LoadSnapshotParams,
     ) -> Result<VmmData, LoadSnapshotError> {
@@ -628,7 +623,6 @@ impl<'a> PrebootApiController<'a> {
         // Restore VM from snapshot
         let vmm = restore_from_snapshot(
             &self.instance_info,
-            self.event_manager,
             self.seccomp_filters,
             load_params,
             self.vm_resources,
@@ -642,6 +636,7 @@ impl<'a> PrebootApiController<'a> {
             vmm.lock()
                 .expect("Poisoned lock")
                 .resume_vm()
+                .await
                 .inspect_err(|_| {
                     // If resume fails, we consider the process is too dirty to recover.
                     self.fatal_error = Some(BuildMicrovmFromRequestsError::Resume);
@@ -667,11 +662,11 @@ pub struct RuntimeApiController {
 
 impl RuntimeApiController {
     /// Handles the incoming runtime `VmmAction` request and provides a response for it.
-    pub fn handle_request(&mut self, request: VmmAction) -> Result<VmmData, VmmActionError> {
+    pub async fn handle_request(&mut self, request: VmmAction) -> Result<VmmData, VmmActionError> {
         use self::VmmAction::*;
         match request {
             // Supported operations allowed post-boot.
-            CreateSnapshot(snapshot_create_cfg) => self.create_snapshot(&snapshot_create_cfg),
+            CreateSnapshot(snapshot_create_cfg) => self.create_snapshot(&snapshot_create_cfg).await,
             FlushMetrics => self.flush_metrics(),
             GetBalloonConfig => self
                 .vmm
@@ -730,7 +725,7 @@ impl RuntimeApiController {
                     .expect("Poisoned lock"),
                 value,
             ),
-            Pause => self.pause(),
+            Pause => self.pause().await,
             PutMMDS(value) => mmds_put_data(
                 self.vmm
                     .lock()
@@ -741,7 +736,7 @@ impl RuntimeApiController {
                     .expect("Poisoned lock"),
                 value,
             ),
-            Resume => self.resume(),
+            Resume => self.resume().await,
             #[cfg(target_arch = "x86_64")]
             SendCtrlAltDel => self.send_ctrl_alt_del(),
             UpdateBalloon(balloon_update) => self
@@ -814,10 +809,10 @@ impl RuntimeApiController {
     }
 
     /// Pauses the microVM by pausing the vCPUs.
-    pub fn pause(&mut self) -> Result<VmmData, VmmActionError> {
+    pub async fn pause(&mut self) -> Result<VmmData, VmmActionError> {
         let pause_start_us = get_time_us(ClockType::Monotonic);
 
-        self.vmm.lock().expect("Poisoned lock").pause_vm()?;
+        self.vmm.lock().expect("Poisoned lock").pause_vm().await?;
 
         let elapsed_time_us =
             update_metric_with_elapsed_time(&METRICS.latencies_us.vmm_pause_vm, pause_start_us);
@@ -827,10 +822,10 @@ impl RuntimeApiController {
     }
 
     /// Resumes the microVM by resuming the vCPUs.
-    pub fn resume(&mut self) -> Result<VmmData, VmmActionError> {
+    pub async fn resume(&mut self) -> Result<VmmData, VmmActionError> {
         let resume_start_us = get_time_us(ClockType::Monotonic);
 
-        self.vmm.lock().expect("Poisoned lock").resume_vm()?;
+        self.vmm.lock().expect("Poisoned lock").resume_vm().await?;
 
         let elapsed_time_us =
             update_metric_with_elapsed_time(&METRICS.latencies_us.vmm_resume_vm, resume_start_us);
@@ -864,7 +859,7 @@ impl RuntimeApiController {
             .map_err(VmmActionError::InternalVmm)
     }
 
-    fn create_snapshot(
+    async fn create_snapshot(
         &mut self,
         create_params: &CreateSnapshotParams,
     ) -> Result<VmmData, VmmActionError> {
@@ -876,7 +871,7 @@ impl RuntimeApiController {
         let vm_info = VmInfo::from(&*locked_vmm);
         let create_start_us = get_time_us(ClockType::Monotonic);
 
-        create_snapshot(&mut locked_vmm, &vm_info, create_params)?;
+        create_snapshot(&mut locked_vmm, &vm_info, create_params).await?;
 
         match create_params.snapshot_type {
             SnapshotType::Full => {
@@ -970,18 +965,16 @@ mod tests {
 
     fn default_preboot<'a>(
         vm_resources: &'a mut VmResources,
-        event_manager: &'a mut EventManager,
         seccomp_filters: &'a BpfThreadMap,
     ) -> PrebootApiController<'a> {
         let instance_info = InstanceInfo::default();
-        PrebootApiController::new(seccomp_filters, instance_info, vm_resources, event_manager)
+        PrebootApiController::new(seccomp_filters, instance_info, vm_resources)
     }
 
     fn preboot_request(request: VmmAction) -> Result<VmmData, VmmActionError> {
         let mut vm_resources = VmResources::default();
-        let mut evmgr = EventManager::new().unwrap();
         let seccomp_filters = BpfThreadMap::new();
-        let mut preboot = default_preboot(&mut vm_resources, &mut evmgr, &seccomp_filters);
+        let mut preboot = default_preboot(&mut vm_resources, &seccomp_filters);
         preboot.handle_preboot_request(request)
     }
 
@@ -994,9 +987,8 @@ mod tests {
             mmds_size_limit: HTTP_MAX_PAYLOAD_SIZE,
             ..Default::default()
         };
-        let mut evmgr = EventManager::new().unwrap();
         let seccomp_filters = BpfThreadMap::new();
-        let mut preboot = default_preboot(&mut vm_resources, &mut evmgr, &seccomp_filters);
+        let mut preboot = default_preboot(&mut vm_resources, &seccomp_filters);
         preboot.handle_preboot_request(request)
     }
 

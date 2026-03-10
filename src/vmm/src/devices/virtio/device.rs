@@ -15,7 +15,6 @@ use vmm_sys_util::eventfd::EventFd;
 use super::ActivateError;
 use super::queue::{Queue, QueueError};
 use super::transport::VirtioInterrupt;
-use crate::MutEventSubscriber;
 use crate::devices::virtio::AsAny;
 use crate::devices::virtio::generated::virtio_ids;
 use crate::logger::{error, info, warn};
@@ -76,7 +75,7 @@ pub enum VirtioDeviceType {
 /// device. The virtio devices needs to create queues, events and event fds for interrupts and
 /// expose them to the transport via get_queues/get_queue_events/get_interrupt/get_interrupt_status
 /// fns.
-pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
+pub trait VirtioDevice: AsAny + Send {
     /// Get the available features offered by device.
     fn avail_features(&self) -> u64;
 
@@ -246,7 +245,6 @@ macro_rules! impl_device_type {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use event_manager::{EventOps, Events, MutEventSubscriber};
 
     use super::*;
 
@@ -256,10 +254,6 @@ pub(crate) mod tests {
         acked_features: u64,
     }
 
-    impl MutEventSubscriber for MockVirtioDevice {
-        fn process(&mut self, _: Events, _: &mut EventOps) {}
-        fn init(&mut self, _: &mut EventOps) {}
-    }
 
     impl VirtioDevice for MockVirtioDevice {
         impl_device_type!(VirtioDeviceType::Net);

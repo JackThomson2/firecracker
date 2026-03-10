@@ -14,7 +14,6 @@ use vhost::vhost_user::message::*;
 use vmm_sys_util::eventfd::EventFd;
 
 use super::{NUM_QUEUES, QUEUE_SIZE, VhostUserBlockError};
-use crate::MutEventSubscriber;
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::block::CacheType;
 use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDevice, VirtioDeviceType};
@@ -290,7 +289,7 @@ impl<T: VhostUserHandleBackend> VhostUserBlockImpl<T> {
 
 impl<T: VhostUserHandleBackend + Send + 'static> VirtioDevice for VhostUserBlockImpl<T>
 where
-    VhostUserBlockImpl<T>: MutEventSubscriber,
+
 {
     impl_device_type!(VirtioDeviceType::Block);
 
@@ -390,7 +389,6 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::Ordering;
 
-    use event_manager::{EventOps, Events, MutEventSubscriber};
     use vhost::{VhostUserMemoryRegionInfo, VringConfigData};
     use vmm_sys_util::tempfile::TempFile;
 
@@ -499,10 +497,6 @@ mod tests {
             }
         }
 
-        impl MutEventSubscriber for VhostUserBlockImpl<MockMaster> {
-            fn process(&mut self, _: Events, _: &mut EventOps) {}
-            fn init(&mut self, _: &mut EventOps) {}
-        }
 
         let (_tmp_dir, tmp_socket_path) = create_tmp_socket();
 
@@ -604,10 +598,6 @@ mod tests {
             }
         }
 
-        impl MutEventSubscriber for VhostUserBlockImpl<MockMaster> {
-            fn process(&mut self, _: Events, _: &mut EventOps) {}
-            fn init(&mut self, _: &mut EventOps) {}
-        }
 
         let (_tmp_dir, tmp_socket_path) = create_tmp_socket();
 
@@ -799,10 +789,6 @@ mod tests {
             }
         }
 
-        impl MutEventSubscriber for VhostUserBlockImpl<MockMaster> {
-            fn process(&mut self, _: Events, _: &mut EventOps) {}
-            fn init(&mut self, _: &mut EventOps) {}
-        }
 
         // Block creation
         let (_tmp_dir, tmp_socket_path) = create_tmp_socket();

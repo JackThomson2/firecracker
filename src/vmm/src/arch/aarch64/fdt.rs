@@ -560,7 +560,7 @@ mod tests {
     use crate::device_manager::tests::default_device_manager;
     use crate::test_utils::arch_mem;
     use crate::vstate::memory::GuestAddress;
-    use crate::{EventManager, Kvm, Vm};
+    use crate::{Kvm, Vm};
 
     // The `load` function from the `device_tree` will mistakenly check the actual size
     // of the buffer with the allocated size. This works around that.
@@ -574,7 +574,6 @@ mod tests {
     #[test]
     fn test_create_fdt_with_devices() {
         let mem = arch_mem(layout::FDT_MAX_SIZE + 0x1000);
-        let mut event_manager = EventManager::new().unwrap();
         let mut device_manager = default_device_manager();
         let kvm = Kvm::new(vec![]).unwrap();
         let vm = Vm::new(&kvm).unwrap();
@@ -583,7 +582,7 @@ mod tests {
         cmdline.insert("console", "/dev/tty0").unwrap();
 
         device_manager
-            .attach_legacy_devices_aarch64(&vm, &mut event_manager, &mut cmdline, None)
+            .attach_legacy_devices_aarch64(&vm, &mut cmdline, None)
             .unwrap();
         let dummy = Arc::new(Mutex::new(DummyDevice::new()));
         device_manager
@@ -592,7 +591,6 @@ mod tests {
                 &vm,
                 mem.clone(),
                 dummy,
-                &mut event_manager,
                 &mut cmdline,
                 "dummy",
             )

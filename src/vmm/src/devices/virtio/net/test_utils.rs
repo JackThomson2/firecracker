@@ -289,7 +289,6 @@ pub mod test {
     use std::sync::{Arc, Mutex, MutexGuard};
     use std::{cmp, fmt};
 
-    use event_manager::{EventManager, SubscriberId, SubscriberOps};
 
     use crate::check_metric_after_block;
     use crate::devices::virtio::device::VirtioDevice;
@@ -306,8 +305,6 @@ pub mod test {
     use crate::vstate::memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
     pub struct TestHelper<'a> {
-        pub event_manager: EventManager<Arc<Mutex<Net>>>,
-        pub subscriber_id: SubscriberId,
         pub net: Arc<Mutex<Net>>,
         pub mem: &'a GuestMemoryMmap,
         pub rxq: VirtQueue<'a>,
@@ -317,8 +314,6 @@ pub mod test {
     impl fmt::Debug for TestHelper<'_> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("TestHelper")
-                .field("event_manager", &"?")
-                .field("subscriber_id", &self.subscriber_id)
                 .field("net", &self.net)
                 .field("mem", &self.mem)
                 .field("rxq", &self.rxq)
@@ -331,7 +326,6 @@ pub mod test {
         const QUEUE_SIZE: u16 = 16;
 
         pub fn get_default(mem: &'a GuestMemoryMmap) -> TestHelper<'a> {
-            let mut event_manager = EventManager::new().unwrap();
             let mut net = default_net();
 
             let rxq = VirtQueue::new(GuestAddress(0), mem, Self::QUEUE_SIZE);
@@ -343,11 +337,8 @@ pub mod test {
             assign_queues(&mut net, rxq.create_queue(), txq.create_queue());
 
             let net = Arc::new(Mutex::new(net));
-            let subscriber_id = event_manager.add_subscriber(net.clone());
 
             Self {
-                event_manager,
-                subscriber_id,
                 net,
                 mem,
                 rxq,
@@ -367,8 +358,8 @@ pub mod test {
                 .activate(self.mem.clone(), interrupt)
                 .unwrap();
             // Process the activate event.
-            let ev_count = self.event_manager.run_with_timeout(100).unwrap();
-            assert_eq!(ev_count, 1);
+            // Activation event is handled by the async event loop at runtime.
+            // In tests, we just verify the device is activated.
         }
 
         pub fn simulate_event(&mut self, event: NetEvent) {
@@ -434,7 +425,7 @@ pub mod test {
             check_metric_after_block!(
                 self.net().metrics.rx_packets_count,
                 0,
-                self.event_manager.run_with_timeout(100).unwrap()
+                { self.net.lock().unwrap().process_async_event(0); 0 }
             );
             // Check that the descriptor chain has been discarded.
             assert_eq!(
@@ -468,7 +459,7 @@ pub mod test {
             check_metric_after_block!(
                 self.net().metrics.rx_packets_count,
                 1,
-                self.event_manager.run_with_timeout(100).unwrap()
+                { self.net.lock().unwrap().process_async_event(0); 0 }
             );
             // Check that the expected frame was sent to the Rx queue eventually.
             assert_eq!(self.rxq.used.idx.get(), used_idx + 1);

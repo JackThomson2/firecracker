@@ -404,6 +404,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
  "vmm",
  "vmm-sys-util",
 ]
@@ -545,16 +546,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "event-manager"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13bdac971eb2efaceffca0976058ab80c715945cc565c8a4aa1ed3bb0dc8d0e4"
-dependencies = [
- "libc",
- "vmm-sys-util",
-]
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -566,7 +557,6 @@ version = "1.16.0-dev"
 dependencies = [
  "cargo_toml",
  "displaydoc",
- "event-manager",
  "libc",
  "log-instrument",
  "micro_http",
@@ -1645,7 +1635,6 @@ dependencies = [
  "derive_more",
  "device_tree",
  "displaydoc",
- "event-manager",
  "gdbstub",
  "gdbstub_arch",
  "itertools 0.14.0",

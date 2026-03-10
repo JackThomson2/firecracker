@@ -11,7 +11,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use acpi::ACPIDeviceManager;
-use event_manager::{MutEventSubscriber, SubscriberOps};
 #[cfg(target_arch = "x86_64")]
 use legacy::{LegacyDeviceError, PortIODeviceManager};
 use linux_loader::loader::Cmdline;
@@ -47,7 +46,7 @@ use crate::utils::open_file_nonblock;
 use crate::vmm_config::mmds::MmdsConfigError;
 use crate::vstate::bus::BusError;
 use crate::vstate::memory::GuestMemoryMmap;
-use crate::{EmulateSerialInitError, EventManager, Vm};
+use crate::{EmulateSerialInitError, Vm};
 
 /// ACPI device manager.
 pub mod acpi;
@@ -130,7 +129,6 @@ impl DeviceManager {
 
     /// Sets up the serial device.
     fn setup_serial_device(
-        event_manager: &mut EventManager,
         output: Option<&PathBuf>,
     ) -> Result<Arc<Mutex<SerialDevice>>, std::io::Error> {
         let (serial_in, serial_out) = match output {
@@ -143,19 +141,17 @@ impl DeviceManager {
         };
 
         let serial = Arc::new(Mutex::new(SerialDevice::new(serial_in, serial_out)?));
-        event_manager.add_subscriber(serial.clone());
         Ok(serial)
     }
 
     #[cfg(target_arch = "x86_64")]
     fn create_legacy_devices(
-        event_manager: &mut EventManager,
         vcpus_exit_evt: &EventFd,
         vm: &Vm,
         serial_output: Option<&PathBuf>,
     ) -> Result<PortIODeviceManager, DeviceManagerCreateError> {
         // Create serial device
-        let serial = Self::setup_serial_device(event_manager, serial_output)?;
+        let serial = Self::setup_serial_device(serial_output)?;
         let reset_evt = vcpus_exit_evt
             .try_clone()
             .map_err(DeviceManagerCreateError::EventFd)?;
@@ -170,14 +166,13 @@ impl DeviceManager {
 
     #[cfg_attr(target_arch = "aarch64", allow(unused))]
     pub fn new(
-        event_manager: &mut EventManager,
         vcpus_exit_evt: &EventFd,
         vm: &Vm,
         serial_output: Option<&PathBuf>,
     ) -> Result<Self, DeviceManagerCreateError> {
         #[cfg(target_arch = "x86_64")]
         let legacy_devices =
-            Self::create_legacy_devices(event_manager, vcpus_exit_evt, vm, serial_output)?;
+            Self::create_legacy_devices(vcpus_exit_evt, vm, serial_output)?;
 
         Ok(DeviceManager {
             mmio_devices: MMIODeviceManager::new(),
@@ -190,14 +185,13 @@ impl DeviceManager {
 
     /// Attaches an MMIO VirtioDevice device to the device manager and event manager.
     pub(crate) fn attach_mmio_virtio_device<
-        T: 'static + VirtioDevice + MutEventSubscriber + Debug,
+        T: 'static + VirtioDevice + Debug,
     >(
         &mut self,
         vm: &Vm,
         id: String,
         device: Arc<Mutex<T>>,
         cmdline: &mut Cmdline,
-        event_manager: &mut EventManager,
         is_vhost_user: bool,
     ) -> Result<(), AttachDeviceError> {
         let interrupt = Arc::new(IrqTrigger::new());
@@ -205,26 +199,25 @@ impl DeviceManager {
         let device =
             MmioTransport::new(vm.guest_memory().clone(), interrupt, device, is_vhost_user);
         self.mmio_devices
-            .register_mmio_virtio_for_boot(vm, id, device, event_manager, cmdline)?;
+            .register_mmio_virtio_for_boot(vm, id, device, cmdline)?;
 
         Ok(())
     }
 
     /// Attaches a VirtioDevice device to the device manager and event manager.
-    pub(crate) fn attach_virtio_device<T: 'static + VirtioDevice + MutEventSubscriber + Debug>(
+    pub(crate) fn attach_virtio_device<T: 'static + VirtioDevice + Debug>(
         &mut self,
         vm: &Arc<Vm>,
         id: String,
         device: Arc<Mutex<T>>,
         cmdline: &mut Cmdline,
-        event_manager: &mut EventManager,
         is_vhost_user: bool,
     ) -> Result<(), AttachDeviceError> {
         if self.is_pci_enabled() {
             self.pci_devices
-                .attach_pci_virtio_device(vm, id, device, event_manager)?;
+                .attach_pci_virtio_device(vm, id, device)?;
         } else {
-            self.attach_mmio_virtio_device(vm, id, device, cmdline, event_manager, is_vhost_user)?;
+            self.attach_mmio_virtio_device(vm, id, device, cmdline, is_vhost_user)?;
         }
 
         Ok(())
@@ -260,7 +253,6 @@ impl DeviceManager {
     pub(crate) fn attach_legacy_devices_aarch64(
         &mut self,
         vm: &Vm,
-        event_manager: &mut EventManager,
         cmdline: &mut Cmdline,
         serial_out_path: Option<&PathBuf>,
     ) -> Result<(), AttachDeviceError> {
@@ -273,7 +265,7 @@ impl DeviceManager {
             .contains("console=");
 
         if cmdline_contains_console {
-            let serial = Self::setup_serial_device(event_manager, serial_out_path)?;
+            let serial = Self::setup_serial_device(serial_out_path)?;
             self.mmio_devices.register_mmio_serial(vm, serial, None)?;
             self.mmio_devices.add_mmio_serial_to_cmdline(cmdline)?;
         }
@@ -402,6 +394,18 @@ impl DeviceManager {
         }
     }
 
+    /// Get a reference to the serial device, if any.
+    pub fn get_serial_device(&self) -> Option<Arc<Mutex<SerialDevice>>> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            Some(self.legacy_devices.stdio_serial.clone())
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.mmio_devices.serial.as_ref().map(|s| s.inner.clone())
+        }
+    }
+
     /// Collect all virtio devices as (type, id, Arc<Mutex<dyn VirtioDevice>>).
     pub fn collect_virtio_devices(
         &self,
@@ -524,7 +528,6 @@ pub enum DeviceManagerPersistError {
 pub struct DeviceRestoreArgs<'a> {
     pub mem: &'a GuestMemoryMmap,
     pub vm: &'a Arc<Vm>,
-    pub event_manager: &'a mut EventManager,
     pub vcpus_exit_evt: &'a EventFd,
     pub vm_resources: &'a mut VmResources,
     pub instance_id: &'a str,
@@ -561,7 +564,6 @@ impl<'a> Persist<'a> for DeviceManager {
         // Setup legacy devices in case of x86
         #[cfg(target_arch = "x86_64")]
         let legacy_devices = Self::create_legacy_devices(
-            constructor_args.event_manager,
             constructor_args.vcpus_exit_evt,
             constructor_args.vm,
             constructor_args.vm_resources.serial_out_path.as_ref(),
@@ -571,7 +573,6 @@ impl<'a> Persist<'a> for DeviceManager {
         let mmio_ctor_args = MMIODevManagerConstructorArgs {
             mem: constructor_args.mem,
             vm: constructor_args.vm,
-            event_manager: constructor_args.event_manager,
             vm_resources: constructor_args.vm_resources,
             instance_id: constructor_args.instance_id,
         };
@@ -587,7 +588,6 @@ impl<'a> Persist<'a> for DeviceManager {
             mem: constructor_args.mem,
             vm_resources: constructor_args.vm_resources,
             instance_id: constructor_args.instance_id,
-            event_manager: constructor_args.event_manager,
         };
         let pci_devices = PciDevices::restore(pci_ctor_args, &state.pci_state)
             .map_err(DeviceManagerPersistError::PciRestore)?;
@@ -694,9 +694,8 @@ pub(crate) mod tests {
         assert!(vmm.device_manager.mmio_devices.serial.is_none());
 
         let mut cmdline = Cmdline::new(4096).unwrap();
-        let mut event_manager = EventManager::new().unwrap();
         vmm.device_manager
-            .attach_legacy_devices_aarch64(&vmm.vm, &mut event_manager, &mut cmdline, None)
+            .attach_legacy_devices_aarch64(&vmm.vm, &mut cmdline, None)
             .unwrap();
         assert!(vmm.device_manager.mmio_devices.rtc.is_some());
         assert!(vmm.device_manager.mmio_devices.serial.is_none());
@@ -704,7 +703,7 @@ pub(crate) mod tests {
         let mut vmm = default_vmm();
         cmdline.insert("console", "/dev/blah").unwrap();
         vmm.device_manager
-            .attach_legacy_devices_aarch64(&vmm.vm, &mut event_manager, &mut cmdline, None)
+            .attach_legacy_devices_aarch64(&vmm.vm, &mut cmdline, None)
             .unwrap();
         assert!(vmm.device_manager.mmio_devices.rtc.is_some());
         assert!(vmm.device_manager.mmio_devices.serial.is_some());

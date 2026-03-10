@@ -43,7 +43,7 @@ use crate::resources::VmResources;
 use crate::snapshot::Persist;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vstate::memory::GuestMemoryMmap;
-use crate::{EventManager, Vm};
+use crate::Vm;
 
 /// Holds the state of a MMIO VirtIO device
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,7 +101,6 @@ pub struct DeviceStates {
 pub struct MMIODevManagerConstructorArgs<'a> {
     pub mem: &'a GuestMemoryMmap,
     pub vm: &'a Arc<Vm>,
-    pub event_manager: &'a mut EventManager,
     pub vm_resources: &'a mut VmResources,
     pub instance_id: &'a str,
 }
@@ -110,7 +109,6 @@ impl fmt::Debug for MMIODevManagerConstructorArgs<'_> {
         f.debug_struct("MMIODevManagerConstructorArgs")
             .field("mem", &self.mem)
             .field("vm", &self.vm)
-            .field("event_manager", &"?")
             .field("for_each_restored_device", &"?")
             .field("vm_resources", &self.vm_resources)
             .field("instance_id", &self.instance_id)
@@ -319,7 +317,6 @@ impl<'a> Persist<'a> for MMIODeviceManager {
             for state in &state.legacy_devices {
                 if state.type_ == DeviceType::Serial {
                     let serial = crate::DeviceManager::setup_serial_device(
-                        constructor_args.event_manager,
                         constructor_args.vm_resources.serial_out_path.as_ref(),
                     )?;
 
@@ -337,8 +334,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                                   is_vhost_user: bool,
                                   id: &String,
                                   state: &MmioTransportState,
-                                  device_info: &MMIODeviceInfo,
-                                  event_manager: &mut EventManager|
+                                  device_info: &MMIODeviceInfo|
          -> Result<(), Self::Error> {
             let interrupt = Arc::new(IrqTrigger::new());
             let restore_args = MmioTransportConstructorArgs {
@@ -358,9 +354,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 MMIODevice {
                     resources: *device_info,
                     inner: mmio_transport,
-                    sub_id: None,
                 },
-                event_manager,
             )?;
 
             if activated {
@@ -391,7 +385,6 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 &balloon_state.device_id,
                 &balloon_state.transport_state,
                 &balloon_state.device_info,
-                constructor_args.event_manager,
             )?;
         }
 
@@ -413,7 +406,6 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 &block_state.device_id,
                 &block_state.transport_state,
                 &block_state.device_info,
-                constructor_args.event_manager,
             )?;
         }
 
@@ -452,7 +444,6 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 &net_state.device_id,
                 &net_state.transport_state,
                 &net_state.device_info,
-                constructor_args.event_manager,
             )?;
         }
 
@@ -481,7 +472,6 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 &vsock_state.device_id,
                 &vsock_state.transport_state,
                 &vsock_state.device_info,
-                constructor_args.event_manager,
             )?;
         }
 
@@ -505,7 +495,6 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 &entropy_state.device_id,
                 &entropy_state.transport_state,
                 &entropy_state.device_info,
-                constructor_args.event_manager,
             )?;
         }
 
@@ -530,7 +519,6 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 &pmem_state.device_id,
                 &pmem_state.transport_state,
                 &pmem_state.device_info,
-                constructor_args.event_manager,
             )?;
         }
 
@@ -553,7 +541,6 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 &memory_state.device_id,
                 &memory_state.transport_state,
                 &memory_state.device_info,
-                constructor_args.event_manager,
             )?;
         }
 
@@ -629,7 +616,6 @@ mod tests {
         let serialized_data;
         // Set up a vmm with one of each device, and get the serialized DeviceStates.
         {
-            let mut event_manager = EventManager::new().expect("Unable to create EventManager");
             let mut vmm = default_vmm();
             let mut cmdline = default_kernel_cmdline();
 
@@ -664,8 +650,7 @@ mod tests {
             insert_net_device_with_mmds(
                 &mut vmm,
                 &mut cmdline,
-                &mut event_manager,
-                network_interface,
+                    network_interface,
                 MmdsVersion::V2,
             );
             // Add a vsock device.
@@ -698,8 +683,7 @@ mod tests {
             insert_virtio_mem_device(
                 &mut vmm,
                 &mut cmdline,
-                &mut event_manager,
-                memory_hotplug_config,
+                    memory_hotplug_config,
             );
 
             let device_state = vmm.device_manager.save();
@@ -716,7 +700,6 @@ mod tests {
         let restore_args = MMIODevManagerConstructorArgs {
             mem: vmm.vm.guest_memory(),
             vm: &vmm.vm,
-            event_manager: &mut event_manager,
             vm_resources,
             instance_id: "microvm-id",
         };

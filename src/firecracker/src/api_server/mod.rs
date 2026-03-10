@@ -10,7 +10,6 @@ pub mod parsed_request;
 pub mod request;
 
 use std::fmt::Debug;
-use std::sync::mpsc;
 
 pub use micro_http::{Body, HttpServer, Request, Response, ServerError, StatusCode, Version};
 use parsed_request::{ParsedRequest, RequestAction};
@@ -29,14 +28,14 @@ pub struct ApiServer {
     /// Sender which allows passing messages to the VMM (tokio mpsc).
     api_request_sender: tokio::sync::mpsc::Sender<ApiRequest>,
     /// Receiver which collects messages from the VMM.
-    vmm_response_receiver: mpsc::Receiver<ApiResponse>,
+    vmm_response_receiver: tokio::sync::mpsc::Receiver<ApiResponse>,
 }
 
 impl ApiServer {
     /// Constructor for `ApiServer`.
     pub fn new(
         api_request_sender: tokio::sync::mpsc::Sender<ApiRequest>,
-        vmm_response_receiver: mpsc::Receiver<ApiResponse>,
+        vmm_response_receiver: tokio::sync::mpsc::Receiver<ApiResponse>,
     ) -> Self {
         ApiServer {
             api_request_sender,
@@ -162,7 +161,7 @@ impl ApiServer {
         self.api_request_sender
             .blocking_send(vmm_action)
             .expect("Failed to send VMM message");
-        let vmm_outcome = *(self.vmm_response_receiver.recv().expect("VMM disconnected"));
+        let vmm_outcome = *(self.vmm_response_receiver.blocking_recv().expect("VMM disconnected"));
         let response = ParsedRequest::convert_to_response(&vmm_outcome);
 
         if vmm_outcome.is_ok()
@@ -192,7 +191,6 @@ mod tests {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
-    use std::sync::mpsc::channel;
     use std::thread;
 
     use micro_http::HttpConnection;
@@ -233,7 +231,7 @@ mod tests {
     #[test]
     fn test_serve_vmm_action_request() {
         let (api_request_sender, _from_api) = tokio::sync::mpsc::channel(1);
-        let (to_api, vmm_response_receiver) = channel();
+        let (to_api, vmm_response_receiver) = tokio::sync::mpsc::channel(1);
 
         let mut api_server = ApiServer::new(api_request_sender, vmm_response_receiver);
         to_api
@@ -290,7 +288,7 @@ mod tests {
     #[test]
     fn test_handle_request() {
         let (api_request_sender, _from_api) = tokio::sync::mpsc::channel(1);
-        let (to_api, vmm_response_receiver) = channel();
+        let (to_api, vmm_response_receiver) = tokio::sync::mpsc::channel(1);
 
         let mut api_server = ApiServer::new(api_request_sender, vmm_response_receiver);
 
@@ -369,7 +367,7 @@ mod tests {
         let api_thread_path_to_socket = path_to_socket.clone();
 
         let (api_request_sender, _from_api) = tokio::sync::mpsc::channel(1);
-        let (to_api, vmm_response_receiver) = channel();
+        let (to_api, vmm_response_receiver) = tokio::sync::mpsc::channel(1);
         let seccomp_filters = get_empty_filters();
         let server = HttpServer::new(PathBuf::from(api_thread_path_to_socket)).unwrap();
         thread::Builder::new()

@@ -20,6 +20,7 @@ use crate::devices::virtio::device::VirtioDevice;
 use crate::logger::{METRICS, info, warn};
 use crate::rpc_interface::{ApiRequest, ApiResponse, RuntimeApiController, VmmAction};
 use crate::vstate::bus::BusDevice;
+use crate::devices::legacy::SerialDevice;
 use crate::{FcExitCode, Vmm};
 
 // ---------------------------------------------------------------------------
@@ -71,6 +72,30 @@ impl std::fmt::Debug for FdHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "FdHandler(fd={}, tag={})", self.fd, self.tag)
     }
+}
+
+/// Serial stdin handler for the async event loop.
+#[derive(Debug)]
+pub struct SerialHandler {
+    /// The serial device.
+    pub serial: Arc<Mutex<SerialDevice>>,
+    /// stdin fd (or -1 if none).
+    pub input_fd: i32,
+    /// buffer-ready eventfd (or -1 if none).
+    pub buffer_ready_fd: i32,
+}
+
+/// Build serial handler from the VMM's serial device.
+pub fn build_serial_handler(vmm: &Vmm) -> Option<SerialHandler> {
+    let serial = vmm.device_manager.get_serial_device()?;
+    let locked = serial.lock().unwrap();
+    let input_fd = locked.serial_input_fd();
+    let buffer_ready_fd = locked.buffer_ready_evt_fd();
+    drop(locked);
+    if input_fd < 0 {
+        return None;
+    }
+    Some(SerialHandler { serial, input_fd, buffer_ready_fd })
 }
 
 /// Build fd→handler mappings from all devices.
@@ -145,29 +170,32 @@ pub fn run_with_api(
     rt: &TokioRuntime,
     vmm: Arc<Mutex<Vmm>>,
     handlers: Vec<FdHandler>,
+    serial: Option<SerialHandler>,
     from_api: tokio::sync::mpsc::Receiver<ApiRequest>,
-    to_api: std::sync::mpsc::Sender<ApiResponse>,
+    to_api: tokio::sync::mpsc::Sender<ApiResponse>,
 ) -> Result<(), FcExitCode> {
-    rt.rt.block_on(event_loop(vmm, handlers, Some((from_api, to_api))))
+    rt.rt.block_on(run_event_loop(vmm, handlers, serial, Some((from_api, to_api))))
 }
 
 pub fn run_no_api(
     rt: &TokioRuntime,
     vmm: Arc<Mutex<Vmm>>,
     handlers: Vec<FdHandler>,
+    serial: Option<SerialHandler>,
 ) -> Result<(), FcExitCode> {
-    rt.rt.block_on(event_loop(vmm, handlers, None))
+    rt.rt.block_on(run_event_loop(vmm, handlers, serial, None))
 }
 
 // ---------------------------------------------------------------------------
 // Core event loop
 // ---------------------------------------------------------------------------
 
-type ApiChannel = (tokio::sync::mpsc::Receiver<ApiRequest>, std::sync::mpsc::Sender<ApiResponse>);
+type ApiChannel = (tokio::sync::mpsc::Receiver<ApiRequest>, tokio::sync::mpsc::Sender<ApiResponse>);
 
-async fn event_loop(
+pub async fn run_event_loop(
     vmm: Arc<Mutex<Vmm>>,
     handlers: Vec<FdHandler>,
+    serial: Option<SerialHandler>,
     api: Option<ApiChannel>,
 ) -> Result<(), FcExitCode> {
     let mut controller = api.as_ref().map(|_| RuntimeApiController::new(vmm.clone()));
@@ -203,6 +231,28 @@ async fn event_loop(
 
     info!("Tokio event loop started: {} device fds", watched.len());
 
+    // Set up serial stdin watching
+    let serial_input_afd = serial.as_ref().and_then(|sh| {
+        if sh.input_fd >= 0 {
+            // SAFETY: isatty has no invariants. If fd is invalid, returns 0.
+            let is_tty = unsafe { libc::isatty(sh.input_fd) } == 1;
+            if is_tty || sh.input_fd != 0 {
+                AsyncFd::with_interest(BorrowedFd(sh.input_fd), Interest::READABLE).ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    });
+    let serial_buf_ready_afd = serial.as_ref().and_then(|sh| {
+        if sh.buffer_ready_fd >= 0 {
+            AsyncFd::with_interest(BorrowedFd(sh.buffer_ready_fd), Interest::READABLE).ok()
+        } else {
+            None
+        }
+    });
+
     loop {
         let any_device = AnyReady { fds: &watched };
 
@@ -226,7 +276,7 @@ async fn event_loop(
                     let t = Instant::now();
                     let tx = api_tx.as_ref().unwrap();
                     let ctl = controller.as_mut().unwrap();
-                    handle_api_request(req, tx, ctl, &mut api_rx);
+                    handle_api_request(req, tx, ctl, &mut api_rx).await;
                     latency.record_api(t.elapsed().as_nanos() as u64);
                 }
             }
@@ -235,6 +285,47 @@ async fn event_loop(
             _ = metrics_interval.tick() => {
                 let _ = METRICS.write();
                 latency.maybe_report();
+            }
+
+            // Serial stdin readable
+            r = async {
+                match &serial_input_afd {
+                    Some(afd) => { let g = afd.readable().await; Some(g) },
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(Ok(mut g)) = r { g.clear_ready(); }
+                if let Some(sh) = &serial {
+                    let mut s = sh.serial.lock().unwrap();
+                    match s.recv_bytes() {
+                        Ok(0) => { info!("Serial stdin EOF"); }
+                        Ok(_) => {}
+                        Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => {}
+                        Err(e) if e.raw_os_error() == Some(libc::ENOBUFS) => {}
+                        Err(_) => {}
+                    }
+                }
+            }
+
+            // Serial buffer-ready event
+            r = async {
+                match &serial_buf_ready_afd {
+                    Some(afd) => { let g = afd.readable().await; Some(g) },
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(Ok(mut g)) = r { g.clear_ready(); }
+                if let Some(sh) = &serial {
+                    let mut s = sh.serial.lock().unwrap();
+                    let _ = s.consume_buffer_ready_event();
+                    match s.recv_bytes() {
+                        Ok(0) => { info!("Serial stdin EOF on buffer-ready"); }
+                        Ok(_) => {}
+                        Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => {}
+                        Err(e) if e.raw_os_error() == Some(libc::ENOBUFS) => {}
+                        Err(_) => {}
+                    }
+                }
             }
 
             // Device event
@@ -262,10 +353,12 @@ fn handle_vcpu_exit(vmm: &Arc<Mutex<Vmm>>) {
     let mut v = vmm.lock().unwrap();
     let _ = v.vcpus_exit_evt.read();
     let exit_code = 'ec: {
-        for h in &v.vcpus_handles {
-            for r in h.response_receiver().try_iter() {
-                if let crate::VcpuResponse::Exited(s) = r {
-                    if s != FcExitCode::Ok { break 'ec s; }
+        for h in &mut v.vcpus_handles {
+            loop {
+                match h.response_receiver_mut().try_recv() {
+                    Ok(crate::VcpuResponse::Exited(s)) if s != FcExitCode::Ok => break 'ec s,
+                    Ok(_) => continue,
+                    Err(_) => break,
                 }
             }
         }
@@ -274,23 +367,23 @@ fn handle_vcpu_exit(vmm: &Arc<Mutex<Vmm>>) {
     v.stop(exit_code);
 }
 
-fn handle_api_request(
+async fn handle_api_request(
     req: ApiRequest,
-    tx: &std::sync::mpsc::Sender<ApiResponse>,
+    tx: &tokio::sync::mpsc::Sender<ApiResponse>,
     ctl: &mut RuntimeApiController,
     api_rx: &mut Option<tokio::sync::mpsc::Receiver<ApiRequest>>,
 ) {
     let is_pause = *req == VmmAction::Pause;
-    let resp = ctl.handle_request(*req);
-    tx.send(Box::new(resp)).expect("API tx closed");
+    let resp = ctl.handle_request(*req).await;
+    tx.send(Box::new(resp)).await.expect("API tx closed");
 
     if is_pause {
         let rx = api_rx.as_mut().unwrap();
         loop {
-            let r = rx.blocking_recv().expect("API rx closed in pause");
+            let r = rx.recv().await.expect("API rx closed in pause");
             let is_resume = *r == VmmAction::Resume;
-            let resp = ctl.handle_request(*r);
-            tx.send(Box::new(resp)).expect("API tx closed");
+            let resp = ctl.handle_request(*r).await;
+            tx.send(Box::new(resp)).await.expect("API tx closed");
             if is_resume { break; }
         }
     }

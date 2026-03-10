@@ -125,16 +125,13 @@ pub mod initrd;
 use std::collections::HashMap;
 use std::io;
 use std::os::unix::io::AsRawFd;
-use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
 use device_manager::DeviceManager;
-use event_manager::{EventManager as BaseEventManager, EventOps, Events, MutEventSubscriber};
 use seccomp::BpfProgram;
 use snapshot::Persist;
 use userfaultfd::Uffd;
-use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::terminal::Terminal;
 use vstate::kvm::Kvm;
@@ -173,8 +170,6 @@ use crate::vstate::vcpu::VcpuState;
 pub use crate::vstate::vcpu::{Vcpu, VcpuConfig, VcpuEvent, VcpuHandle, VcpuResponse};
 pub use crate::vstate::vm::Vm;
 
-/// Shorthand type for the EventManager flavour used by Firecracker.
-pub type EventManager = BaseEventManager<Arc<Mutex<dyn MutEventSubscriber>>>;
 
 // Since the exit code names e.g. `SIGBUS` are most appropriate yet trigger a test error with the
 // clippy lint `upper_case_acronyms` we have disabled this lint for this enum.
@@ -511,7 +506,7 @@ impl Vmm {
     }
 
     /// Sends a resume command to the vCPUs.
-    pub fn resume_vm(&mut self) -> Result<(), VmmError> {
+    pub async fn resume_vm(&mut self) -> Result<(), VmmError> {
         self.device_manager.kick_virtio_devices();
 
         // Send the events.
@@ -520,14 +515,17 @@ impl Vmm {
             .try_for_each(|handle| handle.send_event(VcpuEvent::Resume))
             .map_err(|_| VmmError::VcpuMessage)?;
 
-        // Check the responses.
-        if self
-            .vcpus_handles
-            .iter()
-            .map(|handle| handle.response_receiver().recv_timeout(RECV_TIMEOUT_SEC))
-            .any(|response| !matches!(response, Ok(VcpuResponse::Resumed)))
-        {
-            return Err(VmmError::VcpuMessage);
+        // Await all responses.
+        for handle in &mut self.vcpus_handles {
+            match tokio::time::timeout(
+                RECV_TIMEOUT_SEC,
+                handle.response_receiver_mut().recv(),
+            )
+            .await
+            {
+                Ok(Some(VcpuResponse::Resumed)) => {}
+                _ => return Err(VmmError::VcpuMessage),
+            }
         }
 
         self.instance_info.state = VmState::Running;
@@ -535,21 +533,24 @@ impl Vmm {
     }
 
     /// Sends a pause command to the vCPUs.
-    pub fn pause_vm(&mut self) -> Result<(), VmmError> {
+    pub async fn pause_vm(&mut self) -> Result<(), VmmError> {
         // Send the events.
         self.vcpus_handles
             .iter_mut()
             .try_for_each(|handle| handle.send_event(VcpuEvent::Pause))
             .map_err(|_| VmmError::VcpuMessage)?;
 
-        // Check the responses.
-        if self
-            .vcpus_handles
-            .iter()
-            .map(|handle| handle.response_receiver().recv_timeout(RECV_TIMEOUT_SEC))
-            .any(|response| !matches!(response, Ok(VcpuResponse::Paused)))
-        {
-            return Err(VmmError::VcpuMessage);
+        // Await all responses.
+        for handle in &mut self.vcpus_handles {
+            match tokio::time::timeout(
+                RECV_TIMEOUT_SEC,
+                handle.response_receiver_mut().recv(),
+            )
+            .await
+            {
+                Ok(Some(VcpuResponse::Paused)) => {}
+                _ => return Err(VmmError::VcpuMessage),
+            }
         }
 
         self.instance_info.state = VmState::Paused;
@@ -569,15 +570,13 @@ impl Vmm {
     }
 
     /// Saves the state of a paused Microvm.
-    pub fn save_state(&mut self, vm_info: &VmInfo) -> Result<MicrovmState, MicrovmStateError> {
+    pub async fn save_state(
+        &mut self,
+        vm_info: &VmInfo,
+    ) -> Result<MicrovmState, MicrovmStateError> {
         use self::MicrovmStateError::SaveVmState;
-        // We need to save device state before saving KVM state.
-        // Some devices, (at the time of writing this comment block device with async engine)
-        // might modify the VirtIO transport and send an interrupt to the guest. If we save KVM
-        // state before we save device state, that interrupt will never be delivered to the guest
-        // upon resuming from the snapshot.
         let device_states = self.device_manager.save();
-        let vcpu_states = self.save_vcpu_states()?;
+        let vcpu_states = self.save_vcpu_states().await?;
         let kvm_state = self.kvm.save_state();
         let vm_state = {
             #[cfg(target_arch = "x86_64")]
@@ -601,20 +600,25 @@ impl Vmm {
         })
     }
 
-    fn save_vcpu_states(&mut self) -> Result<Vec<VcpuState>, MicrovmStateError> {
+    async fn save_vcpu_states(&mut self) -> Result<Vec<VcpuState>, MicrovmStateError> {
         for handle in self.vcpus_handles.iter_mut() {
             handle
                 .send_event(VcpuEvent::SaveState)
                 .map_err(MicrovmStateError::SignalVcpu)?;
         }
 
-        let vcpu_responses = self
-            .vcpus_handles
-            .iter()
-            // `Iterator::collect` can transform a `Vec<Result>` into a `Result<Vec>`.
-            .map(|handle| handle.response_receiver().recv_timeout(RECV_TIMEOUT_SEC))
-            .collect::<Result<Vec<VcpuResponse>, RecvTimeoutError>>()
-            .map_err(|_| MicrovmStateError::UnexpectedVcpuResponse)?;
+        let mut vcpu_responses = Vec::new();
+        for handle in &mut self.vcpus_handles {
+            match tokio::time::timeout(
+                RECV_TIMEOUT_SEC,
+                handle.response_receiver_mut().recv(),
+            )
+            .await
+            {
+                Ok(Some(resp)) => vcpu_responses.push(resp),
+                _ => return Err(MicrovmStateError::UnexpectedVcpuResponse),
+            }
+        }
 
         let vcpu_states = vcpu_responses
             .into_iter()
@@ -630,19 +634,27 @@ impl Vmm {
     }
 
     /// Dumps CPU configuration.
-    pub fn dump_cpu_config(&mut self) -> Result<Vec<CpuConfiguration>, DumpCpuConfigError> {
+    pub async fn dump_cpu_config(
+        &mut self,
+    ) -> Result<Vec<CpuConfiguration>, DumpCpuConfigError> {
         for handle in self.vcpus_handles.iter_mut() {
             handle
                 .send_event(VcpuEvent::DumpCpuConfig)
                 .map_err(DumpCpuConfigError::SendEvent)?;
         }
 
-        let vcpu_responses = self
-            .vcpus_handles
-            .iter()
-            .map(|handle| handle.response_receiver().recv_timeout(RECV_TIMEOUT_SEC))
-            .collect::<Result<Vec<VcpuResponse>, RecvTimeoutError>>()
-            .map_err(|_| DumpCpuConfigError::UnexpectedResponse)?;
+        let mut vcpu_responses = Vec::new();
+        for handle in &mut self.vcpus_handles {
+            match tokio::time::timeout(
+                RECV_TIMEOUT_SEC,
+                handle.response_receiver_mut().recv(),
+            )
+            .await
+            {
+                Ok(Some(resp)) => vcpu_responses.push(resp),
+                _ => return Err(DumpCpuConfigError::UnexpectedResponse),
+            }
+        }
 
         let cpu_configs = vcpu_responses
             .into_iter()
@@ -853,45 +865,3 @@ impl Drop for Vmm {
     }
 }
 
-impl MutEventSubscriber for Vmm {
-    /// Handle a read event (EPOLLIN).
-    fn process(&mut self, event: Events, _: &mut EventOps) {
-        let source = event.fd();
-        let event_set = event.event_set();
-
-        if source == self.vcpus_exit_evt.as_raw_fd() && event_set == EventSet::IN {
-            // Exit event handling should never do anything more than call 'self.stop()'.
-            let _ = self.vcpus_exit_evt.read();
-
-            let exit_code = 'exit_code: {
-                // Query each vcpu for their exit_code.
-                for handle in &self.vcpus_handles {
-                    // Drain all vcpu responses that are pending from this vcpu until we find an
-                    // exit status.
-                    for response in handle.response_receiver().try_iter() {
-                        if let VcpuResponse::Exited(status) = response {
-                            // It could be that some vcpus exited successfully while others
-                            // errored out. Thus make sure that error exits from one vcpu always
-                            // takes precedence over "ok" exits
-                            if status != FcExitCode::Ok {
-                                break 'exit_code status;
-                            }
-                        }
-                    }
-                }
-
-                // No CPUs exited with error status code, report "Ok"
-                FcExitCode::Ok
-            };
-            self.stop(exit_code);
-        } else {
-            error!("Spurious EventManager event for handler: Vmm");
-        }
-    }
-
-    fn init(&mut self, ops: &mut EventOps) {
-        if let Err(err) = ops.add(Events::new(&self.vcpus_exit_evt, EventSet::IN)) {
-            error!("Failed to register vmm exit event: {}", err);
-        }
-    }
-}

@@ -14,6 +14,7 @@ tracing = ["log-instrument", "vmm/tracing"]
 
 [dependencies]
 clap = { version = "4.5.60", features = ["derive", "string"] }
+tokio = { version = "1", features = ["rt"] }
 displaydoc = "0.2.5"
 libc = "0.2.182"
 log-instrument = { path = "../log-instrument", optional = true }

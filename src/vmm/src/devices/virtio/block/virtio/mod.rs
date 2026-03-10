@@ -4,7 +4,6 @@
 //! Implements a virtio block device.
 
 pub mod device;
-mod event_handler;
 mod io;
 pub mod metrics;
 pub mod persist;

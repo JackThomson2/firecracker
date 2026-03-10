@@ -14,7 +14,7 @@ use vmm::cpu_config::templates::{CustomCpuTemplate, Numeric};
 use vmm::resources::VmResources;
 use vmm::seccomp::get_empty_filters;
 use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
-use vmm::{EventManager, HTTP_MAX_PAYLOAD_SIZE, Vmm};
+use vmm::{HTTP_MAX_PAYLOAD_SIZE, Vmm};
 use vmm_sys_util::tempfile::TempFile;
 
 #[cfg(target_arch = "aarch64")]
@@ -132,14 +132,12 @@ pub fn build_microvm_from_config(
     if let Some(template) = template {
         vm_resources.set_custom_cpu_template(template);
     }
-    let mut event_manager = EventManager::new().unwrap();
     let seccomp_filters = get_empty_filters();
 
     // Build a microVM.
     let vmm = build_microvm_for_boot(
         &instance_info,
         &vm_resources,
-        &mut event_manager,
         &seccomp_filters,
     )?;
 

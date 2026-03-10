@@ -4,7 +4,6 @@
 //! Implements a virtio balloon device.
 
 pub mod device;
-mod event_handler;
 pub mod metrics;
 pub mod persist;
 pub mod test_utils;

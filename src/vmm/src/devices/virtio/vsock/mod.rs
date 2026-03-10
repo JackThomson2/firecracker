@@ -13,7 +13,6 @@
 
 mod csm;
 mod device;
-mod event_handler;
 pub mod metrics;
 mod packet;
 pub mod persist;
