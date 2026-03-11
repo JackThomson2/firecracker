@@ -622,6 +622,13 @@ impl VirtioBlock {
         }
     }
 
+    /// Async drain and flush for use in async contexts (e.g. snapshot).
+    pub async fn async_drain_and_flush(&mut self, discard: bool) {
+        if let Err(err) = self.disk.file_engine.async_drain_and_flush(discard).await {
+            error!("Failed to async drain ops and flush block data: {:?}", err);
+        }
+    }
+
     /// Prepare device for being snapshotted.
     pub fn prepare_save(&mut self) {
         if !self.is_activated() {

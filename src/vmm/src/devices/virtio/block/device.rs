@@ -7,6 +7,7 @@ use std::sync::Arc;
 use log::info;
 use vmm_sys_util::eventfd::EventFd;
 
+use crate::logger::IncMetric;
 use super::BlockError;
 use super::persist::{BlockConstructorArgs, BlockState};
 use super::vhost_user::device::{VhostUserBlock, VhostUserBlockConfig};
@@ -102,27 +103,11 @@ impl Block {
         }
     }
 
-    /// Get the rate limiter fd (for async event loop).
-    pub fn rate_limiter_fd(&self) -> RawFd {
-        match self {
-            Self::Virtio(b) => b.rate_limiter.as_raw_fd(),
-            Self::VhostUser(_) => -1,
-        }
-    }
-
     /// Get the async completion fd if using async IO engine.
     pub fn async_completion_fd(&self) -> Option<RawFd> {
         match self {
             Self::Virtio(b) => b.async_completion_fd(),
             Self::VhostUser(_) => None,
-        }
-    }
-
-    /// Process rate limiter event (for async event loop).
-    pub fn process_rate_limiter_event(&mut self) {
-        match self {
-            Self::Virtio(b) => b.process_rate_limiter_event(),
-            Self::VhostUser(_) => {}
         }
     }
 
@@ -251,7 +236,6 @@ impl VirtioDevice for Block {
         match self {
             Self::Virtio(b) => {
                 let mut fds = vec![(b.queue_evts[0].as_raw_fd(), 1)]; // PROCESS_QUEUE
-                fds.push((b.rate_limiter.as_raw_fd(), 2)); // PROCESS_RATE_LIMITER
                 // Only io_uring (Async) engine uses an fd for completions.
                 // Tokio engine completions come via mpsc channel to the per-device task.
                 if let super::virtio::io::FileEngine::Async(engine) = &b.disk.file_engine {
@@ -270,11 +254,26 @@ impl VirtioDevice for Block {
         match self {
             Self::Virtio(b) => match tag {
                 1 => b.process_queue_event(),
-                2 => b.process_rate_limiter_event(),
                 3 => b.process_async_completion_event(),
                 _ => {}
             },
             Self::VhostUser(_) => {}
+        }
+    }
+
+    fn rate_limiter_deadline(&self) -> Option<tokio::time::Instant> {
+        match self {
+            Self::Virtio(b) => b.rate_limiter.blocked_deadline(),
+            Self::VhostUser(_) => None,
+        }
+    }
+
+    fn process_rate_limiter_unblock(&mut self) {
+        if let Self::Virtio(b) = self {
+            if !b.rate_limiter.is_blocked() {
+                b.metrics.rate_limiter_event_count.inc();
+                let _ = b.process_queue(0);
+            }
         }
     }
 

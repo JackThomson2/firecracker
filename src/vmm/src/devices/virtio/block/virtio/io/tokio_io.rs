@@ -128,7 +128,24 @@ impl TokioFileEngine {
         });
     }
 
-    /// Drain pending completions synchronously (for shutdown/flush).
+    /// Drain pending completions and flush to disk.
+    ///
+    /// Awaits all in-flight completions from the blocking thread pool, then
+    /// performs a sync_all in a blocking task to avoid stalling the tokio runtime.
+    pub async fn async_drain_and_flush(&mut self) -> Result<(), TokioIoError> {
+        if let Some(rx) = &mut self.completion_rx {
+            // Drain all pending completions — these are from spawn_blocking tasks
+            // that have already completed or will complete shortly.
+            while rx.try_recv().is_ok() {}
+        }
+        let file = self.file.clone();
+        tokio::task::spawn_blocking(move || file.sync_all())
+            .await
+            .expect("spawn_blocking panicked")
+            .map_err(TokioIoError::SyncAll)
+    }
+
+    /// Synchronous drain for non-async contexts (e.g. drop, tests).
     pub fn drain_and_flush(&mut self) -> Result<(), TokioIoError> {
         if let Some(rx) = &mut self.completion_rx {
             while rx.try_recv().is_ok() {}

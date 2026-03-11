@@ -4,7 +4,6 @@
 //! Defines the structures needed for saving/restoring a RateLimiter.
 
 use serde::{Deserialize, Serialize};
-use utils::time::TimerFd;
 
 use super::*;
 use crate::snapshot::Persist;
@@ -83,8 +82,7 @@ impl Persist<'_> for RateLimiter {
             } else {
                 None
             },
-            timer_fd: TimerFd::new(),
-            timer_active: false,
+            blocked_until: None,
         };
 
         Ok(rate_limiter)
@@ -144,7 +142,7 @@ mod tests {
                 .unwrap()
                 .partial_eq(restored_rate_limiter.bandwidth().unwrap())
         );
-        assert!(!restored_rate_limiter.timer_fd.is_armed());
+        assert!(!restored_rate_limiter.is_blocked());
 
         // Check that RateLimiter restores correctly after partially consuming tokens.
         rate_limiter.consume(10, TokenType::Bytes);
@@ -164,7 +162,7 @@ mod tests {
                 .unwrap()
                 .partial_eq(restored_rate_limiter.bandwidth().unwrap())
         );
-        assert!(!restored_rate_limiter.timer_fd.is_armed());
+        assert!(!restored_rate_limiter.is_blocked());
 
         // Check that RateLimiter restores correctly after totally consuming tokens.
         rate_limiter.consume(1000, TokenType::Bytes);

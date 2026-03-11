@@ -102,7 +102,7 @@ impl VirtioPciCommonConfig {
                 data[0] = v;
             }
             2 => {
-                let v = self.read_common_config_word(offset, device.try_lock().expect("device lock contention").queues());
+                let v = self.read_common_config_word(offset, device.blocking_lock().queues());
                 LittleEndian::write_u16(data, v);
             }
             4 => {
@@ -124,7 +124,7 @@ impl VirtioPciCommonConfig {
             2 => self.write_common_config_word(
                 offset,
                 LittleEndian::read_u16(data),
-                device.try_lock().expect("device lock contention").queues_mut(),
+                device.blocking_lock().queues_mut(),
             ),
             4 => self.write_common_config_dword(offset, LittleEndian::read_u32(data), device),
             _ => warn!(
@@ -232,7 +232,7 @@ impl VirtioPciCommonConfig {
         match offset {
             0x00 => self.device_feature_select,
             0x04 => {
-                let locked_device = device.try_lock().expect("device lock contention");
+                let locked_device = device.blocking_lock();
                 // Only 64 bits of features (2 pages) are defined for now, so limit
                 // device_feature_select to avoid shifting by 64 or more bits.
                 if self.device_feature_select < 2 {
@@ -244,42 +244,42 @@ impl VirtioPciCommonConfig {
             }
             0x08 => self.driver_feature_select,
             0x20 => {
-                let locked_device = device.try_lock().expect("device lock contention");
+                let locked_device = device.blocking_lock();
                 self.with_queue(locked_device.queues(), |q| {
                     (q.desc_table_address.0 & 0xffff_ffff) as u32
                 })
                 .unwrap_or_default()
             }
             0x24 => {
-                let locked_device = device.try_lock().expect("device lock contention");
+                let locked_device = device.blocking_lock();
                 self.with_queue(locked_device.queues(), |q| {
                     (q.desc_table_address.0 >> 32) as u32
                 })
                 .unwrap_or_default()
             }
             0x28 => {
-                let locked_device = device.try_lock().expect("device lock contention");
+                let locked_device = device.blocking_lock();
                 self.with_queue(locked_device.queues(), |q| {
                     (q.avail_ring_address.0 & 0xffff_ffff) as u32
                 })
                 .unwrap_or_default()
             }
             0x2c => {
-                let locked_device = device.try_lock().expect("device lock contention");
+                let locked_device = device.blocking_lock();
                 self.with_queue(locked_device.queues(), |q| {
                     (q.avail_ring_address.0 >> 32) as u32
                 })
                 .unwrap_or_default()
             }
             0x30 => {
-                let locked_device = device.try_lock().expect("device lock contention");
+                let locked_device = device.blocking_lock();
                 self.with_queue(locked_device.queues(), |q| {
                     (q.used_ring_address.0 & 0xffff_ffff) as u32
                 })
                 .unwrap_or_default()
             }
             0x34 => {
-                let locked_device = device.try_lock().expect("device lock contention");
+                let locked_device = device.blocking_lock();
                 self.with_queue(locked_device.queues(), |q| {
                     (q.used_ring_address.0 >> 32) as u32
                 })
@@ -306,7 +306,7 @@ impl VirtioPciCommonConfig {
             *v = (*v & !0xffff_ffff) | u64::from(x)
         }
 
-        let mut locked_device = device.try_lock().expect("device lock contention");
+        let mut locked_device = device.blocking_lock();
 
         match offset {
             0x00 => self.device_feature_select = value,

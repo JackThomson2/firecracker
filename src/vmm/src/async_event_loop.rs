@@ -221,11 +221,14 @@ fn spawn_device_task(
         return;
     }
 
-    tokio::spawn(async move {
+    tokio::task::spawn_local(async move {
+        // Track whether we already have a spawned unblock task pending,
+        // so we don't spawn duplicates.
+        let mut rl_task_deadline: Option<tokio::time::Instant> = None;
+
         loop {
             let t;
 
-            // Select between device fds and completion channel.
             tokio::select! {
                 biased;
 
@@ -239,12 +242,14 @@ fn spawn_device_task(
                     t = Instant::now();
                     let mut dev = device.lock().await;
                     dev.process_tokio_completion(completion);
-                    // Drain any additional completions that arrived.
                     if let Some(rx) = &mut completion_rx {
                         while let Ok(c) = rx.try_recv() {
                             dev.process_tokio_completion(c);
                         }
                     }
+                    maybe_spawn_rate_limiter_unblock(
+                        &dev, &device, &mut rl_task_deadline,
+                    );
                 }
 
                 // Device fd event
@@ -252,10 +257,8 @@ fn spawn_device_task(
                     t = Instant::now();
                     let mut dev = device.lock().await;
 
-                    // Process the fd that woke us.
                     dev.process_async_event(device_fds[first_idx].tag);
 
-                    // Check remaining fds for readiness and process them too.
                     for (i, dfd) in device_fds.iter().enumerate() {
                         if i == first_idx {
                             continue;
@@ -266,6 +269,9 @@ fn spawn_device_task(
                             dev.process_async_event(dfd.tag);
                         }
                     }
+                    maybe_spawn_rate_limiter_unblock(
+                        &dev, &device, &mut rl_task_deadline,
+                    );
                 }
             }
 
@@ -274,6 +280,30 @@ fn spawn_device_task(
             }
         }
     });
+}
+
+/// If the device has a rate limiter deadline that we haven't already spawned
+/// a task for, spawn a fire-and-forget task that sleeps until the deadline
+/// then locks the device and unblocks the rate limiter.
+fn maybe_spawn_rate_limiter_unblock(
+    dev: &tokio::sync::MutexGuard<'_, dyn VirtioDevice>,
+    device: &Arc<DeviceMutex<dyn VirtioDevice>>,
+    current_task_deadline: &mut Option<tokio::time::Instant>,
+) {
+    let new_deadline = dev.rate_limiter_deadline();
+    // Only spawn if there's a new deadline we don't already have a task for.
+    if new_deadline.is_some() && new_deadline != *current_task_deadline {
+        let deadline = new_deadline.unwrap();
+        let device = device.clone();
+        *current_task_deadline = new_deadline;
+        tokio::task::spawn_local(async move {
+            tokio::time::sleep_until(deadline).await;
+            let mut dev = device.lock().await;
+            dev.process_rate_limiter_unblock();
+        });
+    } else if new_deadline.is_none() {
+        *current_task_deadline = None;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -306,8 +336,11 @@ pub fn run_with_api(
     from_api: tokio::sync::mpsc::Receiver<ApiRequest>,
     to_api: tokio::sync::mpsc::Sender<ApiResponse>,
 ) -> Result<(), FcExitCode> {
-    rt.rt
-        .block_on(run_event_loop(vmm, handlers, serial, Some((from_api, to_api))))
+    let local = tokio::task::LocalSet::new();
+    local.block_on(
+        &rt.rt,
+        run_event_loop(vmm, handlers, serial, Some((from_api, to_api))),
+    )
 }
 
 pub fn run_no_api(
@@ -316,7 +349,8 @@ pub fn run_no_api(
     handlers: Vec<FdHandler>,
     serial: Option<SerialHandler>,
 ) -> Result<(), FcExitCode> {
-    rt.rt.block_on(run_event_loop(vmm, handlers, serial, None))
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt.rt, run_event_loop(vmm, handlers, serial, None))
 }
 
 // ---------------------------------------------------------------------------
@@ -334,19 +368,7 @@ pub async fn run_event_loop(
     serial: Option<SerialHandler>,
     api: Option<ApiChannel>,
 ) -> Result<(), FcExitCode> {
-    let mut controller = api.as_ref().map(|_| RuntimeApiController::new(vmm.clone()));
     let latency = Arc::new(Mutex::new(LatencyStats::default()));
-
-    let mut api_rx = None;
-    let mut api_tx = None;
-    if let Some((rx, tx)) = api {
-        api_rx = Some(rx);
-        api_tx = Some(tx);
-    }
-
-    let exit_fd = vmm.lock().unwrap().vcpus_exit_evt.as_raw_fd();
-    let async_exit = AsyncFd::with_interest(BorrowedFd(exit_fd), Interest::READABLE)
-        .expect("AsyncFd for exit_evt");
 
     // Group handlers by device and spawn one task per device.
     let device_groups = group_handlers_by_device(handlers);
@@ -356,94 +378,105 @@ pub async fn run_event_loop(
         spawn_device_task(device, fd_tags, latency.clone());
     }
 
-    let mut metrics_interval = tokio::time::interval(std::time::Duration::from_secs(60));
     let _ = METRICS.write();
+
+    // Swap MMIO bus devices to channel-based proxies so vCPU MMIO accesses
+    // go through the async event loop instead of locking device mutexes directly.
+    let (mmio_rx, _mmio_proxies) = {
+        let v = vmm.lock().unwrap();
+        v.device_manager.swap_to_mmio_proxies(&v.vm.common.mmio_bus)
+    };
 
     info!(
         "Tokio event loop started: {num_devices} device tasks, {num_fds} device fds"
     );
-
-    // Swap MMIO bus devices to channel-based proxies so vCPU MMIO accesses
-    // go through the async event loop instead of locking device mutexes directly.
-    let (mut mmio_rx, _mmio_proxies) = {
-        let v = vmm.lock().unwrap();
-        v.device_manager.swap_to_mmio_proxies(&v.vm.common.mmio_bus)
-    };
     info!("MMIO proxies installed on bus");
 
-    // Set up serial stdin watching
-    let serial_input_afd = serial.as_ref().and_then(|sh| {
-        if sh.input_fd >= 0 {
-            // SAFETY: isatty has no invariants. If fd is invalid, returns 0.
-            let is_tty = unsafe { libc::isatty(sh.input_fd) } == 1;
-            if is_tty || sh.input_fd != 0 {
-                AsyncFd::with_interest(BorrowedFd(sh.input_fd), Interest::READABLE).ok()
-            } else {
-                None
+    // Use a broadcast-style shutdown signal so all tasks can observe it.
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<FcExitCode>(1);
+
+    // --- Spawn independent tasks ---
+
+    spawn_vcpu_exit_task(vmm.clone(), shutdown_tx.clone());
+    spawn_mmio_task(mmio_rx);
+    spawn_metrics_task(latency.clone());
+
+    if let Some(serial) = serial {
+        spawn_serial_task(serial);
+    }
+
+    if let Some((from_api, to_api)) = api {
+        spawn_api_task(vmm.clone(), from_api, to_api, latency, shutdown_tx.clone());
+    }
+
+    // Wait for shutdown signal from any task.
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    match shutdown_rx.recv().await {
+        Ok(FcExitCode::Ok) => Ok(()),
+        Ok(code) => Err(code),
+        // All senders dropped without signaling — treat as clean exit.
+        Err(_) => Ok(()),
+    }
+}
+
+fn spawn_vcpu_exit_task(vmm: Arc<Mutex<Vmm>>, shutdown_tx: tokio::sync::broadcast::Sender<FcExitCode>) {
+    let exit_fd = vmm.lock().unwrap().vcpus_exit_evt.as_raw_fd();
+    let async_exit = AsyncFd::with_interest(BorrowedFd(exit_fd), Interest::READABLE)
+        .expect("AsyncFd for exit_evt");
+
+    tokio::task::spawn_local(async move {
+        loop {
+            if let Ok(mut g) = async_exit.readable().await {
+                g.clear_ready();
             }
+            handle_vcpu_exit(&vmm);
+            if let Some(code) = vmm.lock().unwrap().shutdown_exit_code() {
+                let _ = shutdown_tx.send(code);
+                return;
+            }
+        }
+    });
+}
+
+fn spawn_mmio_task(mut mmio_rx: tokio::sync::mpsc::Receiver<MmioRequest>) {
+    tokio::task::spawn_local(async move {
+        while let Some(req) = mmio_rx.recv().await {
+            handle_mmio_request(req).await;
+        }
+    });
+}
+
+fn spawn_serial_task(serial: SerialHandler) {
+    // Serial stdin
+    let input_afd = if serial.input_fd >= 0 {
+        let is_tty = unsafe { libc::isatty(serial.input_fd) } == 1;
+        if is_tty || serial.input_fd != 0 {
+            AsyncFd::with_interest(BorrowedFd(serial.input_fd), Interest::READABLE).ok()
         } else {
             None
         }
-    });
-    let serial_buf_ready_afd = serial.as_ref().and_then(|sh| {
-        if sh.buffer_ready_fd >= 0 {
-            AsyncFd::with_interest(BorrowedFd(sh.buffer_ready_fd), Interest::READABLE).ok()
-        } else {
-            None
-        }
-    });
+    } else {
+        None
+    };
 
-    loop {
-        tokio::select! {
-            biased;
+    // Serial buffer-ready
+    let buf_ready_afd = if serial.buffer_ready_fd >= 0 {
+        AsyncFd::with_interest(BorrowedFd(serial.buffer_ready_fd), Interest::READABLE).ok()
+    } else {
+        None
+    };
 
-            // vCPU exit
-            r = async_exit.readable() => {
-                if let Ok(mut g) = r { g.clear_ready(); }
-                handle_vcpu_exit(&vmm);
-            }
-
-            // MMIO request from vCPU thread
-            Some(req) = mmio_rx.recv() => {
-                handle_mmio_request(req).await;
-            }
-
-            // API request
-            req = async {
-                match &mut api_rx {
-                    Some(rx) => rx.recv().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                if let Some(req) = req {
-                    let t = Instant::now();
-                    let tx = api_tx.as_ref().unwrap();
-                    let ctl = controller.as_mut().unwrap();
-                    handle_api_request(req, tx, ctl, &mut api_rx).await;
-                    if let Ok(mut stats) = latency.try_lock() {
-                        stats.record_api(t.elapsed().as_nanos() as u64);
+    tokio::task::spawn_local(async move {
+        loop {
+            tokio::select! {
+                r = async {
+                    match &input_afd {
+                        Some(afd) => { let g = afd.readable().await; Some(g) },
+                        None => std::future::pending().await,
                     }
-                }
-            }
-
-            // Metrics
-            _ = metrics_interval.tick() => {
-                let _ = METRICS.write();
-                if let Ok(mut stats) = latency.try_lock() {
-                    stats.maybe_report();
-                }
-            }
-
-            // Serial stdin readable
-            r = async {
-                match &serial_input_afd {
-                    Some(afd) => { let g = afd.readable().await; Some(g) },
-                    None => std::future::pending().await,
-                }
-            } => {
-                if let Some(Ok(mut g)) = r { g.clear_ready(); }
-                if let Some(sh) = &serial {
-                    let mut s = sh.serial.lock().unwrap();
+                } => {
+                    if let Some(Ok(mut g)) = r { g.clear_ready(); }
+                    let mut s = serial.serial.lock().unwrap();
                     match s.recv_bytes() {
                         Ok(0) => { info!("Serial stdin EOF"); }
                         Ok(_) => {}
@@ -452,18 +485,15 @@ pub async fn run_event_loop(
                         Err(_) => {}
                     }
                 }
-            }
 
-            // Serial buffer-ready event
-            r = async {
-                match &serial_buf_ready_afd {
-                    Some(afd) => { let g = afd.readable().await; Some(g) },
-                    None => std::future::pending().await,
-                }
-            } => {
-                if let Some(Ok(mut g)) = r { g.clear_ready(); }
-                if let Some(sh) = &serial {
-                    let mut s = sh.serial.lock().unwrap();
+                r = async {
+                    match &buf_ready_afd {
+                        Some(afd) => { let g = afd.readable().await; Some(g) },
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(Ok(mut g)) = r { g.clear_ready(); }
+                    let mut s = serial.serial.lock().unwrap();
                     let _ = s.consume_buffer_ready_event();
                     match s.recv_bytes() {
                         Ok(0) => { info!("Serial stdin EOF on buffer-ready"); }
@@ -475,13 +505,61 @@ pub async fn run_event_loop(
                 }
             }
         }
+    });
+}
 
-        match vmm.lock().unwrap().shutdown_exit_code() {
-            Some(FcExitCode::Ok) => return Ok(()),
-            Some(code) => return Err(code),
-            None => {}
+fn spawn_metrics_task(latency: Arc<Mutex<LatencyStats>>) {
+    tokio::task::spawn_local(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let _ = METRICS.write();
+            if let Ok(mut stats) = latency.try_lock() {
+                stats.maybe_report();
+            }
         }
-    }
+    });
+}
+
+fn spawn_api_task(
+    vmm: Arc<Mutex<Vmm>>,
+    mut from_api: tokio::sync::mpsc::Receiver<ApiRequest>,
+    to_api: tokio::sync::mpsc::Sender<ApiResponse>,
+    latency: Arc<Mutex<LatencyStats>>,
+    shutdown_tx: tokio::sync::broadcast::Sender<FcExitCode>,
+) {
+    tokio::task::spawn_local(async move {
+        let mut controller = RuntimeApiController::new(vmm.clone());
+
+        while let Some(req) = from_api.recv().await {
+            let t = Instant::now();
+            let is_pause = *req == VmmAction::Pause;
+            let resp = controller.handle_request(*req).await;
+            to_api.send(Box::new(resp)).await.expect("API tx closed");
+
+            if is_pause {
+                loop {
+                    let r = from_api.recv().await.expect("API rx closed in pause");
+                    let is_resume = *r == VmmAction::Resume;
+                    let resp = controller.handle_request(*r).await;
+                    to_api.send(Box::new(resp)).await.expect("API tx closed");
+                    if is_resume {
+                        break;
+                    }
+                }
+            }
+
+            if let Ok(mut stats) = latency.try_lock() {
+                stats.record_api(t.elapsed().as_nanos() as u64);
+            }
+
+            // Check for shutdown after each API request.
+            if let Some(code) = vmm.lock().unwrap().shutdown_exit_code() {
+                let _ = shutdown_tx.send(code);
+                return;
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -532,26 +610,4 @@ fn handle_vcpu_exit(vmm: &Arc<Mutex<Vmm>>) {
     v.stop(exit_code);
 }
 
-async fn handle_api_request(
-    req: ApiRequest,
-    tx: &tokio::sync::mpsc::Sender<ApiResponse>,
-    ctl: &mut RuntimeApiController,
-    api_rx: &mut Option<tokio::sync::mpsc::Receiver<ApiRequest>>,
-) {
-    let is_pause = *req == VmmAction::Pause;
-    let resp = ctl.handle_request(*req).await;
-    tx.send(Box::new(resp)).await.expect("API tx closed");
 
-    if is_pause {
-        let rx = api_rx.as_mut().unwrap();
-        loop {
-            let r = rx.recv().await.expect("API rx closed in pause");
-            let is_resume = *r == VmmAction::Resume;
-            let resp = ctl.handle_request(*r).await;
-            tx.send(Box::new(resp)).await.expect("API tx closed");
-            if is_resume {
-                break;
-            }
-        }
-    }
-}

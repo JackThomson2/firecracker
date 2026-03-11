@@ -389,16 +389,6 @@ impl Net {
         self.tap.as_raw_fd()
     }
 
-    /// Get rx rate limiter fd for async event loop.
-    pub fn rx_rate_limiter_fd(&self) -> RawFd {
-        self.rx_rate_limiter.as_raw_fd()
-    }
-
-    /// Get tx rate limiter fd for async event loop.
-    pub fn tx_rate_limiter_fd(&self) -> RawFd {
-        self.tx_rate_limiter.as_raw_fd()
-    }
-
     /// Trigger queue notification for the guest if we used enough descriptors
     /// for the notification to be enabled.
     /// https://docs.oasis-open.org/virtio/virtio/v1.1/csprd01/virtio-v1.1-csprd01.html#x1-320005
@@ -1074,13 +1064,11 @@ impl VirtioDevice for Net {
     }
 
     fn async_fd_tags(&self) -> Vec<(RawFd, u32)> {
-        let mut fds = Vec::new();
-        fds.push((self.queue_evts[0].as_raw_fd(), 1)); // RX queue
-        fds.push((self.queue_evts[1].as_raw_fd(), 2)); // TX queue
-        fds.push((self.tap.as_raw_fd(), 3)); // Tap RX
-        fds.push((self.rx_rate_limiter.as_raw_fd(), 4)); // RX rate limiter
-        fds.push((self.tx_rate_limiter.as_raw_fd(), 5)); // TX rate limiter
-        fds
+        vec![
+            (self.queue_evts[0].as_raw_fd(), 1), // RX queue
+            (self.queue_evts[1].as_raw_fd(), 2), // TX queue
+            (self.tap.as_raw_fd(), 3),            // Tap RX
+        ]
     }
 
     fn process_async_event(&mut self, tag: u32) {
@@ -1092,9 +1080,27 @@ impl VirtioDevice for Net {
             1 => self.process_rx_queue_event(),
             2 => self.process_tx_queue_event(),
             3 => self.process_tap_rx_event(),
-            4 => self.process_rx_rate_limiter_event(),
-            5 => self.process_tx_rate_limiter_event(),
             _ => {}
+        }
+    }
+
+    fn rate_limiter_deadline(&self) -> Option<tokio::time::Instant> {
+        let rx = self.rx_rate_limiter.blocked_deadline();
+        let tx = self.tx_rate_limiter.blocked_deadline();
+        match (rx, tx) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    fn process_rate_limiter_unblock(&mut self) {
+        if !self.rx_rate_limiter.is_blocked() {
+            self.resume_rx()
+                .unwrap_or_else(|err| report_net_event_fail(&self.metrics, err));
+        }
+        if !self.tx_rate_limiter.is_blocked() {
+            self.process_tx()
+                .unwrap_or_else(|err| report_net_event_fail(&self.metrics, err));
         }
     }
 }

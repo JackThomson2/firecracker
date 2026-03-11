@@ -44,13 +44,9 @@ pub mod io_uring;
 /// with the values passed in the `RateLimiter::new()` constructor.
 /// All subsequent accounting is done independently for each token bucket based
 /// on the `TokenType` used. If any of the buckets runs out of budget, the limiter
-/// goes in the 'blocked' state. At this point an internal timer is set up which
-/// will later 'wake up' the user in order to retry sending data. The 'wake up'
-/// notification will be dispatched as an event on the FD provided by the `AsRawFD`
-/// trait implementation.
-///
-/// The contract is that the user shall also call the `event_handler()` method on
-/// receipt of such an event.
+/// goes in the 'blocked' state. At this point an internal tokio timer is armed which
+/// will later 'wake up' the user in order to retry sending data. The device task
+/// should poll `wait_unblock()` and call `event_handler()` when it resolves.
 ///
 /// The token buckets are replenished when a called `consume()` doesn't find enough
 /// tokens in the bucket. The amount of tokens replenished is automatically calculated
@@ -63,16 +59,6 @@ pub mod io_uring;
 ///
 /// The granularity for 'wake up' events when the rate limiter is blocked is
 /// currently hardcoded to `100 milliseconds`.
-///
-/// ## Limitations
-///
-/// This rate limiter implementation relies on the *Linux kernel's timerfd* so its
-/// usage is limited to Linux systems.
-///
-/// Another particularity of this implementation is that it is not self-driving.
-/// It is meant to be used in an external event loop and thus implements the `AsRawFd`
-/// trait and provides an *event-handler* as part of its API. This *event-handler*
-/// needs to be called by the user on every event on the rate limiter's `AsRawFd` FD.
 pub mod rate_limiter;
 
 /// Module for handling ACPI tables.

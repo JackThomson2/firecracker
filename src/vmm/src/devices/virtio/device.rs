@@ -223,6 +223,15 @@ pub trait VirtioDevice: AsAny + Send {
     /// Process an async event identified by tag. Called when the fd becomes readable.
     fn process_async_event(&mut self, _tag: u32) {}
 
+    /// Return the earliest rate limiter deadline, if any rate limiter is blocked.
+    /// Returns `None` if no rate limiter is currently blocked.
+    fn rate_limiter_deadline(&self) -> Option<tokio::time::Instant> {
+        None
+    }
+
+    /// Clear expired rate limiter(s) and re-process queues.
+    fn process_rate_limiter_unblock(&mut self) {}
+
     /// Whether this device needs async I/O processing (lock released during I/O).
     fn needs_async_io(&self) -> bool { false }
 

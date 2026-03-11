@@ -88,7 +88,7 @@ impl MmioTransport {
 
     /// Gets the encapsulated locked VirtioDevice.
     pub fn locked_device(&self) -> tokio::sync::MutexGuard<'_, dyn VirtioDevice + 'static> {
-        self.device.try_lock().expect("device lock contention")
+        self.device.blocking_lock()
     }
 
     /// Gets the encapsulated VirtioDevice.
@@ -182,7 +182,7 @@ impl MmioTransport {
             }
             DRIVER_OK if self.device_status == (ACKNOWLEDGE | DRIVER | FEATURES_OK) => {
                 self.device_status = status;
-                let mut locked_device = self.device.try_lock().expect("device lock contention");
+                let mut locked_device = self.device.blocking_lock();
                 let device_activated = locked_device.is_activated();
                 if !device_activated {
                     // temporary variable needed for borrow checker
@@ -205,7 +205,7 @@ impl MmioTransport {
             }
             _ if status == 0 => {
                 {
-                    let mut locked_device = self.device.try_lock().expect("device lock contention");
+                    let mut locked_device = self.device.blocking_lock();
                     if locked_device.is_activated() {
                         let mut device_status = self.device_status;
                         let reset_result = locked_device.reset();
