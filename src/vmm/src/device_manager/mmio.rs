@@ -116,11 +116,21 @@ pub struct MMIODevice<T> {
     pub(crate) inner: Arc<Mutex<T>>,
 }
 
+/// A descriptor for VirtIO MMIO devices using a tokio-aware mutex.
+/// This allows the async event loop to `.lock().await` instead of blocking.
+#[derive(Debug, Clone)]
+pub struct VirtioMmioDevice {
+    /// MMIO resources allocated to the device
+    pub(crate) resources: MMIODeviceInfo,
+    /// The MmioTransport behind a tokio async mutex.
+    pub(crate) inner: Arc<tokio::sync::Mutex<MmioTransport>>,
+}
+
 /// Manages the complexities of registering a MMIO device.
 #[derive(Debug, Default)]
 pub struct MMIODeviceManager {
     /// VirtIO devices using an MMIO transport layer
-    pub(crate) virtio_devices: HashMap<(VirtioDeviceType, String), MMIODevice<MmioTransport>>,
+    pub(crate) virtio_devices: HashMap<(VirtioDeviceType, String), VirtioMmioDevice>,
     /// Boot timer device
     pub(crate) boot_timer: Option<MMIODevice<BootTimer>>,
     #[cfg(target_arch = "aarch64")]
@@ -175,14 +185,14 @@ impl MMIODeviceManager {
         &mut self,
         vm: &Vm,
         device_id: String,
-        mut device: MMIODevice<MmioTransport>,
+        device: VirtioMmioDevice,
     ) -> Result<(), MmioError> {
         // Our virtio devices are currently hardcoded to use a single IRQ.
         // Validate that requirement.
         let gsi = device.resources.gsi.ok_or(MmioError::InvalidIrqConfig)?;
         let identifier;
         {
-            let mmio_device = device.inner.lock().unwrap();
+            let mmio_device = device.inner.try_lock().expect("uncontended");
             let locked_device = mmio_device.locked_device();
             identifier = (locked_device.device_type(), device_id);
             for (i, queue_evt) in locked_device.queue_events().iter().enumerate() {
@@ -238,9 +248,9 @@ impl MMIODeviceManager {
         mmio_device: MmioTransport,
         _cmdline: &mut kernel_cmdline::Cmdline,
     ) -> Result<(), MmioError> {
-        let device = MMIODevice {
+        let device = VirtioMmioDevice {
             resources: self.allocate_mmio_resources(&mut vm.resource_allocator(), 1)?,
-            inner: Arc::new(Mutex::new(mmio_device)),
+            inner: Arc::new(tokio::sync::Mutex::new(mmio_device)),
         };
 
         #[cfg(target_arch = "x86_64")]
@@ -387,7 +397,7 @@ impl MMIODeviceManager {
         &self,
         device_type: VirtioDeviceType,
         device_id: &str,
-    ) -> Option<&MMIODevice<MmioTransport>> {
+    ) -> Option<&VirtioMmioDevice> {
         self.virtio_devices
             .get(&(device_type, device_id.to_string()))
     }
@@ -395,7 +405,7 @@ impl MMIODeviceManager {
     /// Run fn for each registered virtio device.
     pub fn for_each_virtio_mmio_device<F, E: Debug>(&self, mut f: F) -> Result<(), E>
     where
-        F: FnMut(&VirtioDeviceType, &String, &MMIODevice<MmioTransport>) -> Result<(), E>,
+        F: FnMut(&VirtioDeviceType, &String, &VirtioMmioDevice) -> Result<(), E>,
     {
         for ((device_type, device_id), mmio_device) in &self.virtio_devices {
             f(device_type, device_id, mmio_device)?;
@@ -405,7 +415,7 @@ impl MMIODeviceManager {
 
     pub fn for_each_virtio_device(&self, mut f: impl FnMut(VirtioDeviceType, &dyn VirtioDevice)) {
         for ((device_type, _), virtio_device) in &self.virtio_devices {
-            let device_arc = virtio_device.inner.lock().unwrap().device();
+            let device_arc = virtio_device.inner.try_lock().expect("uncontended").device();
             let virtio_device = device_arc.try_lock().expect("device lock");
             f(*device_type, &*virtio_device);
         }
@@ -470,7 +480,7 @@ pub(crate) mod tests {
                 cmdline,
             )?;
             Ok(self
-                .get_virtio_device(device.lock().expect("Poisoned lock").device_type(), dev_id)
+                .get_virtio_device(device.try_lock().expect("uncontended").device_type(), dev_id)
                 .unwrap()
                 .resources
                 .addr)

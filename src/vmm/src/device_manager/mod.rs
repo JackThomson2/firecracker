@@ -288,7 +288,7 @@ impl DeviceManager {
         let _: Result<(), MmioError> =
             self.mmio_devices
                 .for_each_virtio_mmio_device(|_, _, device| {
-                    let mmio_transport_locked = device.inner.lock().unwrap();
+                    let mmio_transport_locked = device.inner.try_lock().expect("uncontended");
                     mmio_transport_locked
                         .device()
                         .try_lock().expect("device lock")
@@ -327,7 +327,7 @@ impl DeviceManager {
         let _: Result<(), Infallible> =
             self.mmio_devices
                 .for_each_virtio_mmio_device(|_, _, device| {
-                    let mmio_transport_locked = device.inner.lock().unwrap();
+                    let mmio_transport_locked = device.inner.try_lock().expect("uncontended");
                     Self::do_mark_virtio_queue_memory_dirty(mmio_transport_locked.device(), mem);
                     Ok(())
                 });
@@ -361,8 +361,8 @@ impl DeviceManager {
             Some(
                 mmio_device
                     .inner
-                    .lock()
-                    .expect("Poisoned lock")
+                    .try_lock()
+                    .expect("uncontended")
                     .device()
                     .clone(),
             )
@@ -419,7 +419,7 @@ impl DeviceManager {
             }
         } else {
             for ((dev_type, dev_id), mmio_dev) in &self.mmio_devices.virtio_devices {
-                let vdev = mmio_dev.inner.lock().unwrap().device().clone();
+                let vdev = mmio_dev.inner.try_lock().expect("uncontended").device().clone();
                 result.push((*dev_type, dev_id.clone(), vdev));
             }
         }
@@ -439,7 +439,7 @@ impl DeviceManager {
         bus: &crate::vstate::bus::Bus,
     ) -> (
         tokio::sync::mpsc::Receiver<crate::mmio_proxy::MmioRequest>,
-        Vec<std::sync::Arc<crate::mmio_proxy::MmioProxy>>,
+        Vec<Arc<crate::mmio_proxy::MmioProxy>>,
     ) {
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let mut proxies = Vec::new();
@@ -453,7 +453,7 @@ impl DeviceManager {
                 let _ = bus.remove(addr, len);
 
                 // Insert proxy that forwards to the event loop
-                let proxy = std::sync::Arc::new(crate::mmio_proxy::MmioProxy::new(
+                let proxy = Arc::new(crate::mmio_proxy::MmioProxy::new(
                     tx.clone(),
                     mmio_dev.inner.clone(),
                 ));

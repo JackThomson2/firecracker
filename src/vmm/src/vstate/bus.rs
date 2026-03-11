@@ -52,6 +52,19 @@ impl<B: BusDevice> BusDeviceSync for Mutex<B> {
     }
 }
 
+impl<B: BusDevice + Send> BusDeviceSync for tokio::sync::Mutex<B> {
+    fn read(&self, base: u64, offset: u64, data: &mut [u8]) {
+        self.try_lock()
+            .expect("tokio device lock contention")
+            .read(base, offset, data)
+    }
+    fn write(&self, base: u64, offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
+        self.try_lock()
+            .expect("tokio device lock contention")
+            .write(base, offset, data)
+    }
+}
+
 /// Error type for [`Bus`]-related operations.
 #[derive(Debug)]
 pub enum BusError {

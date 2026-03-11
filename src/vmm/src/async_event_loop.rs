@@ -278,7 +278,7 @@ pub async fn run_event_loop(
 
             // MMIO request from vCPU thread
             Some(req) = mmio_rx.recv() => {
-                handle_mmio_request(req);
+                handle_mmio_request(req).await;
             }
             // API request
             req = async {
@@ -364,15 +364,15 @@ pub async fn run_event_loop(
 // Handlers
 // ---------------------------------------------------------------------------
 
-fn handle_mmio_request(req: MmioRequest) {
+async fn handle_mmio_request(req: MmioRequest) {
     match req {
         MmioRequest::Read { device, base, offset, len, reply } => {
             let mut buf = vec![0u8; len];
-            device.lock().unwrap().read(base, offset, &mut buf);
+            device.lock().await.read(base, offset, &mut buf);
             let _ = reply.send(buf);
         }
         MmioRequest::Write { device, base, offset, data, reply } => {
-            let barrier = device.lock().unwrap().write(base, offset, &data);
+            let barrier = device.lock().await.write(base, offset, &data);
             let _ = reply.send(barrier);
         }
     }

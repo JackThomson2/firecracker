@@ -179,7 +179,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
         }
 
         let _: Result<(), ()> = self.for_each_virtio_mmio_device(|_, devid, device| {
-            let mmio_transport_locked = device.inner.lock().unwrap();
+            let mmio_transport_locked = device.inner.try_lock().expect("uncontended");
             let mut locked_device = mmio_transport_locked.locked_device();
             // We need to call `prepare_save()` on the device before saving the transport
             // so that, if we modify the transport state while preparing the device, e.g. sending
@@ -344,7 +344,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 device: device.clone(),
                 is_vhost_user,
             };
-            let mmio_transport = Arc::new(Mutex::new(
+            let mmio_transport = Arc::new(tokio::sync::Mutex::new(
                 MmioTransport::restore(restore_args, state)
                     .map_err(|()| DevicePersistError::MmioTransport)?,
             ));
@@ -352,7 +352,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
             dev_manager.register_mmio_virtio(
                 vm,
                 id.clone(),
-                MMIODevice {
+                VirtioMmioDevice {
                     resources: *device_info,
                     inner: mmio_transport,
                 },
@@ -584,6 +584,12 @@ mod tests {
     }
 
     impl<T> PartialEq for MMIODevice<T> {
+        fn eq(&self, other: &Self) -> bool {
+            self.resources == other.resources
+        }
+    }
+
+    impl PartialEq for VirtioMmioDevice {
         fn eq(&self, other: &Self) -> bool {
             self.resources == other.resources
         }

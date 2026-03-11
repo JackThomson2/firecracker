@@ -3,25 +3,27 @@
 
 //! Channel-based MMIO proxy. vCPU threads send MMIO requests through a channel
 //! to the async event loop, which processes them on the actual device.
-//! No shared mutex between vCPU threads and the event loop.
+//! The device is behind a `tokio::sync::Mutex` so the event loop can
+//! `.lock().await` instead of blocking.
 
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::vstate::bus::{BusDevice, BusDeviceSync};
+use crate::devices::virtio::transport::mmio::MmioTransport;
+use crate::vstate::bus::BusDeviceSync;
 
 /// A request from a vCPU thread to the async event loop.
 pub enum MmioRequest {
     Read {
-        device: Arc<Mutex<dyn BusDevice>>,
+        device: Arc<tokio::sync::Mutex<MmioTransport>>,
         base: u64,
         offset: u64,
         len: usize,
         reply: oneshot::Sender<Vec<u8>>,
     },
     Write {
-        device: Arc<Mutex<dyn BusDevice>>,
+        device: Arc<tokio::sync::Mutex<MmioTransport>>,
         base: u64,
         offset: u64,
         data: Vec<u8>,
@@ -36,11 +38,14 @@ pub struct MmioProxy {
     tx: mpsc::Sender<MmioRequest>,
     /// The actual device — shared with the event loop via Arc.
     /// The event loop is the only one that locks it.
-    device: Arc<Mutex<dyn BusDevice>>,
+    device: Arc<tokio::sync::Mutex<MmioTransport>>,
 }
 
 impl MmioProxy {
-    pub fn new(tx: mpsc::Sender<MmioRequest>, device: Arc<Mutex<dyn BusDevice>>) -> Self {
+    pub fn new(
+        tx: mpsc::Sender<MmioRequest>,
+        device: Arc<tokio::sync::Mutex<MmioTransport>>,
+    ) -> Self {
         Self { tx, device }
     }
 }
