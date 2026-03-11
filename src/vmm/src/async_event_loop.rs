@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Async event loop driven by a single-threaded Tokio runtime.
-//! - Device fds registered directly with Tokio's reactor via AsyncFd
-//! - vCPU→device MMIO goes through channels (no shared mutex)
+//! - Each VirtIO device gets its own spawned task watching its fds via AsyncFd
+//! - vCPU→device MMIO goes through channels with tokio::sync::Mutex
 //! - Device event handlers are async, enabling future async I/O
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
@@ -16,17 +17,16 @@ use std::time::Instant;
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 
+use crate::devices::legacy::SerialDevice;
 use crate::devices::virtio::device::VirtioDevice;
 use crate::logger::{METRICS, info, warn};
 use crate::mmio_proxy::MmioRequest;
 use crate::rpc_interface::{ApiRequest, ApiResponse, RuntimeApiController, VmmAction};
 use crate::vstate::bus::BusDevice;
-use crate::devices::legacy::SerialDevice;
-use crate::{FcExitCode, Vmm};
-use crate::DeviceMutex;
+use crate::{DeviceMutex, FcExitCode, Vmm};
 
 // ---------------------------------------------------------------------------
-// Latency stats
+// Latency stats (shared across device tasks via Arc)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default)]
@@ -37,8 +37,12 @@ pub struct LatencyStats {
 }
 
 impl LatencyStats {
-    pub fn record_device(&mut self, nanos: u64) { self.device_samples.push(nanos); }
-    pub fn record_api(&mut self, nanos: u64) { self.api_samples.push(nanos); }
+    pub fn record_device(&mut self, nanos: u64) {
+        self.device_samples.push(nanos);
+    }
+    pub fn record_api(&mut self, nanos: u64) {
+        self.api_samples.push(nanos);
+    }
     pub fn maybe_report(&mut self) {
         let now = Instant::now();
         if self.last_report.map_or(true, |t| now.duration_since(t).as_secs() >= 10) {
@@ -48,13 +52,18 @@ impl LatencyStats {
         }
     }
     fn report(samples: &mut Vec<u64>, label: &str) {
-        if samples.is_empty() { return; }
+        if samples.is_empty() {
+            return;
+        }
         samples.sort_unstable();
         let n = samples.len();
         let p50 = samples[n / 2];
         let p99 = samples[(n * 99 / 100).min(n - 1)];
-        info!("latency[{label}] n={n} p50={:.1}us p99={:.1}us",
-              p50 as f64 / 1000.0, p99 as f64 / 1000.0);
+        info!(
+            "latency[{label}] n={n} p50={:.1}us p99={:.1}us",
+            p50 as f64 / 1000.0,
+            p99 as f64 / 1000.0
+        );
         samples.clear();
     }
 }
@@ -97,7 +106,11 @@ pub fn build_serial_handler(vmm: &Vmm) -> Option<SerialHandler> {
     if input_fd < 0 {
         return None;
     }
-    Some(SerialHandler { serial, input_fd, buffer_ready_fd })
+    Some(SerialHandler {
+        serial,
+        input_fd,
+        buffer_ready_fd,
+    })
 }
 
 /// Build fd→handler mappings from all devices.
@@ -107,7 +120,11 @@ pub fn build_device_handlers(vmm: &Vmm) -> Vec<FdHandler> {
     for (_dev_type, _id, device) in vmm.device_manager.collect_virtio_devices() {
         let fd_tags = device.try_lock().expect("device lock").async_fd_tags();
         for (fd, tag) in fd_tags {
-            handlers.push(FdHandler { fd, tag, device: device.clone() });
+            handlers.push(FdHandler {
+                fd,
+                tag,
+                device: device.clone(),
+            });
         }
     }
     handlers
@@ -120,30 +137,115 @@ pub fn build_device_handlers(vmm: &Vmm) -> Vec<FdHandler> {
 #[derive(Debug)]
 struct BorrowedFd(RawFd);
 impl AsRawFd for BorrowedFd {
-    fn as_raw_fd(&self) -> RawFd { self.0 }
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
 }
 
-struct WatchedFd {
+/// An fd + tag pair for a single device, used inside per-device tasks.
+struct DeviceFd {
     async_fd: AsyncFd<BorrowedFd>,
     tag: u32,
-    device: Arc<DeviceMutex<dyn VirtioDevice>>,
 }
 
+/// Future that resolves when any fd in the slice becomes readable.
+/// Returns the index of the first ready fd.
 struct AnyReady<'a> {
-    fds: &'a [WatchedFd],
+    fds: &'a [DeviceFd],
 }
 
 impl Future for AnyReady<'_> {
     type Output = usize;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<usize> {
-        for (i, wfd) in self.fds.iter().enumerate() {
-            if let Poll::Ready(Ok(mut guard)) = wfd.async_fd.poll_read_ready(cx) {
+        for (i, dfd) in self.fds.iter().enumerate() {
+            if let Poll::Ready(Ok(mut guard)) = dfd.async_fd.poll_read_ready(cx) {
                 guard.clear_ready();
                 return Poll::Ready(i);
             }
         }
         Poll::Pending
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-device task
+// ---------------------------------------------------------------------------
+
+/// Group FdHandlers by device (Arc pointer identity) and return
+/// (device, vec-of-(fd, tag)) groups.
+fn group_handlers_by_device(
+    handlers: Vec<FdHandler>,
+) -> Vec<(Arc<DeviceMutex<dyn VirtioDevice>>, Vec<(RawFd, u32)>)> {
+    let mut map: HashMap<*const DeviceMutex<dyn VirtioDevice>, (Arc<DeviceMutex<dyn VirtioDevice>>, Vec<(RawFd, u32)>)> =
+        HashMap::new();
+    for fh in handlers {
+        let ptr = Arc::as_ptr(&fh.device);
+        map.entry(ptr)
+            .or_insert_with(|| (fh.device.clone(), Vec::new()))
+            .1
+            .push((fh.fd, fh.tag));
+    }
+    map.into_values().collect()
+}
+
+/// Spawn a tokio task for a single device that watches all its fds.
+/// When any fd fires, the task locks the device once, then processes
+/// ALL currently-ready fds in a batch before releasing the lock.
+fn spawn_device_task(
+    device: Arc<DeviceMutex<dyn VirtioDevice>>,
+    fd_tags: Vec<(RawFd, u32)>,
+    latency: Arc<Mutex<LatencyStats>>,
+) {
+    let device_fds: Vec<DeviceFd> = fd_tags
+        .into_iter()
+        .filter_map(|(fd, tag)| {
+            AsyncFd::with_interest(BorrowedFd(fd), Interest::READABLE)
+                .map(|afd| DeviceFd {
+                    async_fd: afd,
+                    tag,
+                })
+                .map_err(|e| warn!("AsyncFd failed for fd {fd}: {e}"))
+                .ok()
+        })
+        .collect();
+
+    if device_fds.is_empty() {
+        return;
+    }
+
+    tokio::spawn(async move {
+        loop {
+            // Wait for at least one fd to become readable.
+            let first_idx = AnyReady { fds: &device_fds }.await;
+
+            let t = Instant::now();
+
+            // Lock the device once for the whole batch.
+            let mut dev = device.lock().await;
+
+            // Process the fd that woke us.
+            dev.process_async_event(device_fds[first_idx].tag);
+
+            // Check remaining fds for readiness and process them too.
+            for (i, dfd) in device_fds.iter().enumerate() {
+                if i == first_idx {
+                    continue;
+                }
+                // try_io succeeds if the fd is ready, fails with WouldBlock if not.
+                if dfd.async_fd.try_io(Interest::READABLE, |_| {
+                    Ok::<(), std::io::Error>(())
+                }).is_ok() {
+                    dev.process_async_event(dfd.tag);
+                }
+            }
+
+            drop(dev);
+
+            if let Ok(mut stats) = latency.try_lock() {
+                stats.record_device(t.elapsed().as_nanos() as u64);
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -176,7 +278,8 @@ pub fn run_with_api(
     from_api: tokio::sync::mpsc::Receiver<ApiRequest>,
     to_api: tokio::sync::mpsc::Sender<ApiResponse>,
 ) -> Result<(), FcExitCode> {
-    rt.rt.block_on(run_event_loop(vmm, handlers, serial, Some((from_api, to_api))))
+    rt.rt
+        .block_on(run_event_loop(vmm, handlers, serial, Some((from_api, to_api))))
 }
 
 pub fn run_no_api(
@@ -192,7 +295,10 @@ pub fn run_no_api(
 // Core event loop
 // ---------------------------------------------------------------------------
 
-type ApiChannel = (tokio::sync::mpsc::Receiver<ApiRequest>, tokio::sync::mpsc::Sender<ApiResponse>);
+type ApiChannel = (
+    tokio::sync::mpsc::Receiver<ApiRequest>,
+    tokio::sync::mpsc::Sender<ApiResponse>,
+);
 
 pub async fn run_event_loop(
     vmm: Arc<Mutex<Vmm>>,
@@ -201,7 +307,7 @@ pub async fn run_event_loop(
     api: Option<ApiChannel>,
 ) -> Result<(), FcExitCode> {
     let mut controller = api.as_ref().map(|_| RuntimeApiController::new(vmm.clone()));
-    let mut latency = LatencyStats::default();
+    let latency = Arc::new(Mutex::new(LatencyStats::default()));
 
     let mut api_rx = None;
     let mut api_tx = None;
@@ -214,24 +320,20 @@ pub async fn run_event_loop(
     let async_exit = AsyncFd::with_interest(BorrowedFd(exit_fd), Interest::READABLE)
         .expect("AsyncFd for exit_evt");
 
-    let watched: Vec<WatchedFd> = handlers
-        .into_iter()
-        .filter_map(|fh| {
-            AsyncFd::with_interest(BorrowedFd(fh.fd), Interest::READABLE)
-                .map(|afd| WatchedFd {
-                    async_fd: afd,
-                    tag: fh.tag,
-                    device: fh.device,
-                })
-                .map_err(|e| warn!("AsyncFd failed for fd {}: {e}", fh.fd))
-                .ok()
-        })
-        .collect();
+    // Group handlers by device and spawn one task per device.
+    let device_groups = group_handlers_by_device(handlers);
+    let num_devices = device_groups.len();
+    let num_fds: usize = device_groups.iter().map(|(_, fds)| fds.len()).sum();
+    for (device, fd_tags) in device_groups {
+        spawn_device_task(device, fd_tags, latency.clone());
+    }
 
     let mut metrics_interval = tokio::time::interval(std::time::Duration::from_secs(60));
     let _ = METRICS.write();
 
-    info!("Tokio event loop started: {} device fds", watched.len());
+    info!(
+        "Tokio event loop started: {num_devices} device tasks, {num_fds} device fds"
+    );
 
     // Swap MMIO bus devices to channel-based proxies so vCPU MMIO accesses
     // go through the async event loop instead of locking device mutexes directly.
@@ -264,8 +366,6 @@ pub async fn run_event_loop(
     });
 
     loop {
-        let any_device = AnyReady { fds: &watched };
-
         tokio::select! {
             biased;
 
@@ -275,11 +375,11 @@ pub async fn run_event_loop(
                 handle_vcpu_exit(&vmm);
             }
 
-
             // MMIO request from vCPU thread
             Some(req) = mmio_rx.recv() => {
                 handle_mmio_request(req).await;
             }
+
             // API request
             req = async {
                 match &mut api_rx {
@@ -292,14 +392,18 @@ pub async fn run_event_loop(
                     let tx = api_tx.as_ref().unwrap();
                     let ctl = controller.as_mut().unwrap();
                     handle_api_request(req, tx, ctl, &mut api_rx).await;
-                    latency.record_api(t.elapsed().as_nanos() as u64);
+                    if let Ok(mut stats) = latency.try_lock() {
+                        stats.record_api(t.elapsed().as_nanos() as u64);
+                    }
                 }
             }
 
             // Metrics
             _ = metrics_interval.tick() => {
                 let _ = METRICS.write();
-                latency.maybe_report();
+                if let Ok(mut stats) = latency.try_lock() {
+                    stats.maybe_report();
+                }
             }
 
             // Serial stdin readable
@@ -342,14 +446,6 @@ pub async fn run_event_loop(
                     }
                 }
             }
-
-            // Device event
-            idx = any_device => {
-                let t = Instant::now();
-                let wfd = &watched[idx];
-                wfd.device.lock().await.process_async_event(wfd.tag);
-                latency.record_device(t.elapsed().as_nanos() as u64);
-            }
         }
 
         match vmm.lock().unwrap().shutdown_exit_code() {
@@ -366,12 +462,24 @@ pub async fn run_event_loop(
 
 async fn handle_mmio_request(req: MmioRequest) {
     match req {
-        MmioRequest::Read { device, base, offset, len, reply } => {
+        MmioRequest::Read {
+            device,
+            base,
+            offset,
+            len,
+            reply,
+        } => {
             let mut buf = vec![0u8; len];
             device.lock().await.read(base, offset, &mut buf);
             let _ = reply.send(buf);
         }
-        MmioRequest::Write { device, base, offset, data, reply } => {
+        MmioRequest::Write {
+            device,
+            base,
+            offset,
+            data,
+            reply,
+        } => {
             let barrier = device.lock().await.write(base, offset, &data);
             let _ = reply.send(barrier);
         }
@@ -413,7 +521,9 @@ async fn handle_api_request(
             let is_resume = *r == VmmAction::Resume;
             let resp = ctl.handle_request(*r).await;
             tx.send(Box::new(resp)).await.expect("API tx closed");
-            if is_resume { break; }
+            if is_resume {
+                break;
+            }
         }
     }
 }
