@@ -520,6 +520,39 @@
             {
                 "syscall": "prctl",
                 "comment": "Tokio spawn_blocking threadpool"
+            },
+            {
+                "syscall": "pread64",
+                "comment": "Used by TokioFileEngine for async block I/O via pread"
+            },
+            {
+                "syscall": "pwrite64",
+                "comment": "Used by TokioFileEngine for async block I/O via pwrite"
+            },
+            {
+                "syscall": "sched_getaffinity",
+                "comment": "Used by tokio blocking thread pool"
+            },
+            {
+                "syscall": "dup",
+                "comment": "Used by EventFd::try_clone in TokioFileEngine"
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "FIOCLEX - set close-on-exec, used by dup/eventfd operations",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 21585,
+                        "comment": "FIOCLEX"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "TEMPORARY: allow all ioctls to debug seccomp issue"
             }
         ]
     },

@@ -970,12 +970,11 @@ impl VirtioDevice for Balloon {
             .collect()
     }
 
-    fn process_async_event(&mut self, _tag: u32) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    fn process_async_event(&mut self, _tag: u32) {
 
         if self.is_activated() {
             let _ = self.process_virtio_queues();
         }
-        Box::pin(async {})
     }
 }
 

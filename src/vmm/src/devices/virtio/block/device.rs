@@ -261,29 +261,26 @@ impl VirtioDevice for Block {
         }
     }
 
-    fn process_async_event(&mut self, tag: u32) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
-
+    fn process_async_event(&mut self, tag: u32) {
         if !self.is_activated() {
-            return Box::pin(async {});
+            return;
         }
         match self {
             Self::Virtio(b) => match tag {
-                1 => {
-                    let is_tokio = matches!(b.disk.file_engine, super::virtio::io::FileEngine::Tokio(_));
-                    if is_tokio {
-                        return Box::pin(async move {
-                            b.process_queue_event_async().await;
-                        });
-                    }
-                    b.process_queue_event();
-                }
+                1 => b.process_queue_event(),
                 2 => b.process_rate_limiter_event(),
                 3 => b.process_async_completion_event(),
                 _ => {}
             },
             Self::VhostUser(_) => {}
         }
-        Box::pin(async {})
+    }
+
+    fn needs_async_io(&self) -> bool {
+        match self {
+            Self::Virtio(b) => matches!(b.disk.file_engine, super::virtio::io::FileEngine::Tokio(_)),
+            _ => false,
+        }
     }
 }
 

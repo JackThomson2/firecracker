@@ -7,6 +7,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use crate::DeviceMutex;
 use std::sync::atomic::AtomicU32;
 
 use serde::{Deserialize, Serialize};
@@ -220,10 +221,13 @@ pub trait VirtioDevice: AsAny + Send {
     }
 
     /// Process an async event identified by tag. Called when the fd becomes readable.
-    /// Returns a boxed future to allow async I/O while remaining dyn-compatible.
-    fn process_async_event(&mut self, _tag: u32) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
-        Box::pin(async {})
-    }
+    /// Takes &mut self (caller holds the DeviceMutex). For devices with async I/O,
+    /// the returned future should NOT hold the lock during I/O — use try_lock internally.
+    /// Process an event synchronously. Default for most devices.
+    fn process_async_event(&mut self, _tag: u32) {}
+
+    /// Whether this device needs async I/O processing (lock released during I/O).
+    fn needs_async_io(&self) -> bool { false }
 }
 
 impl fmt::Debug for dyn VirtioDevice {

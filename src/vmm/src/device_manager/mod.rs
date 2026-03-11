@@ -437,8 +437,12 @@ impl DeviceManager {
     pub fn swap_to_mmio_proxies(
         &self,
         bus: &crate::vstate::bus::Bus,
-    ) -> tokio::sync::mpsc::Receiver<crate::mmio_proxy::MmioRequest> {
+    ) -> (
+        tokio::sync::mpsc::Receiver<crate::mmio_proxy::MmioRequest>,
+        Vec<std::sync::Arc<crate::mmio_proxy::MmioProxy>>,
+    ) {
         let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let mut proxies = Vec::new();
 
         if !self.is_pci_enabled() {
             for (_, mmio_dev) in &self.mmio_devices.virtio_devices {
@@ -449,16 +453,17 @@ impl DeviceManager {
                 let _ = bus.remove(addr, len);
 
                 // Insert proxy that forwards to the event loop
-                let proxy = Arc::new(crate::mmio_proxy::MmioProxy::new(
+                let proxy = std::sync::Arc::new(crate::mmio_proxy::MmioProxy::new(
                     tx.clone(),
                     mmio_dev.inner.clone(),
                 ));
-                let _ = bus.insert(proxy, addr, len);
+                let _ = bus.insert(proxy.clone(), addr, len);
+                proxies.push(proxy);
             }
         }
         // TODO: PCI proxy support
 
-        rx
+        (rx, proxies)
     }
 }
 

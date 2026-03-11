@@ -1083,10 +1083,10 @@ impl VirtioDevice for Net {
         fds
     }
 
-    fn process_async_event(&mut self, tag: u32) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    fn process_async_event(&mut self, tag: u32) {
 
         if !self.is_activated() {
-            return Box::pin(async {});
+            return;
         }
         match tag {
             1 => self.process_rx_queue_event(),
@@ -1096,7 +1096,6 @@ impl VirtioDevice for Net {
             5 => self.process_tx_rate_limiter_event(),
             _ => {}
         }
-        Box::pin(async {})
     }
 }
 

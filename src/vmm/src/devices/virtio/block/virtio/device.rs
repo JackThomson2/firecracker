@@ -376,100 +376,6 @@ impl VirtioBlock {
 
     /// Async version of process_queue_event for the Tokio file engine.
     /// Parses requests synchronously, then awaits each I/O operation directly.
-    pub async fn process_queue_event_async(&mut self) {
-        self.metrics.queue_event_count.inc();
-        if let Err(err) = self.queue_evts[0].read() {
-            error!("Failed to get queue event: {:?}", err);
-            self.metrics.event_fails.inc();
-            return;
-        }
-        if self.rate_limiter.is_blocked() {
-            self.metrics.rate_limiter_throttled_events.inc();
-            return;
-        }
-
-        let active_state = self.device_state.active_state().unwrap().clone();
-        let queue = &mut self.queues[0];
-        let mut used_any = false;
-
-        loop {
-            // Pop descriptor and parse — all sync, no .await while DescriptorChain is alive.
-            let (head_index, request) = {
-                let Some(head) = queue.pop_or_enable_notification().unwrap() else {
-                    break;
-                };
-                self.metrics.remaining_reqs_count.add(queue.len().into());
-                let idx = head.index;
-                let parsed = Request::parse(&head, &active_state.mem, self.disk.nsectors);
-                // head (DescriptorChain with raw pointers) is dropped here
-                match parsed {
-                    Ok(req) => (idx, req),
-                    Err(err) => {
-                        error!("Failed to parse available descriptor chain: {:?}", err);
-                        self.metrics.execute_fails.inc();
-                        queue.add_used(idx, 0).unwrap_or_else(|e| {
-                            error!("Failed to add used descriptor {}: {}", idx, e)
-                        });
-                        used_any = true;
-                        continue;
-                    }
-                }
-            };
-
-            if request.rate_limit(&mut self.rate_limiter) {
-                queue.undo_pop();
-                self.metrics.rate_limiter_throttled_events.inc();
-                break;
-            }
-
-            let pending = request.to_pending_request(head_index);
-            let io_result = match request.r#type {
-                RequestType::In => {
-                    let _m = self.metrics.read_agg.record_latency_metrics();
-                    self.disk.file_engine
-                        .async_read(request.offset(), &active_state.mem, request.data_addr, request.data_len)
-                        .await
-                }
-                RequestType::Out => {
-                    let _m = self.metrics.write_agg.record_latency_metrics();
-                    self.disk.file_engine
-                        .async_write(request.offset(), &active_state.mem, request.data_addr, request.data_len)
-                        .await
-                }
-                RequestType::Flush => {
-                    self.disk.file_engine.async_flush().await.map(|()| 0)
-                }
-                RequestType::GetDeviceID => {
-                    match active_state.mem.write_slice(&self.disk.image_id, request.data_addr) {
-                        Ok(()) => Ok(VIRTIO_BLK_ID_BYTES),
-                        Err(_) => Ok(0),
-                    }
-                }
-                RequestType::Unsupported(_) => Ok(0),
-            };
-
-            let res = io_result.map_err(|e| IoErr::FileEngine(e));
-            let finished = pending.finish(&active_state.mem, res, &self.metrics);
-            used_any = true;
-            queue.add_used(finished.desc_idx, finished.num_bytes_to_mem)
-                .unwrap_or_else(|e| {
-                    error!("Failed to add used descriptor {}: {}", finished.desc_idx, e)
-                });
-        }
-
-        let queue = &mut self.queues[0];
-        queue.advance_used_ring_idx();
-        if used_any && queue.prepare_kick() {
-            active_state
-                .interrupt
-                .trigger(VirtioInterruptType::Queue(0))
-                .unwrap_or_else(|_| { self.metrics.event_fails.inc(); });
-        }
-        if !used_any {
-            self.metrics.no_avail_buffer.inc();
-        }
-    }
-
     /// Process device virtio queue(s).
     pub fn process_virtio_queues(&mut self) -> Result<(), InvalidAvailIdx> {
         self.process_queue(0)
@@ -622,22 +528,42 @@ impl VirtioBlock {
     pub fn async_completion_fd(&self) -> Option<std::os::unix::io::RawFd> {
         match &self.disk.file_engine {
             super::io::FileEngine::Async(engine) => Some(engine.completion_evt().as_raw_fd()),
+            super::io::FileEngine::Tokio(engine) => Some(engine.completion_evt().as_raw_fd()),
             _ => None,
         }
     }
 
     pub fn process_async_completion_event(&mut self) {
-        let engine = unwrap_async_file_engine_or_return!(&mut self.disk.file_engine);
-
-        if let Err(err) = engine.completion_evt().read() {
-            error!("Failed to get async completion event: {:?}", err);
-        } else {
-            self.process_async_completion_queue();
-
-            if self.is_io_engine_throttled {
-                self.is_io_engine_throttled = false;
-                self.process_queue(0).unwrap()
+        match &mut self.disk.file_engine {
+            super::io::FileEngine::Async(engine) => {
+                if let Err(err) = engine.completion_evt().read() {
+                    error!("Failed to get async completion event: {:?}", err);
+                    return;
+                }
+                self.process_async_completion_queue();
             }
+            super::io::FileEngine::Tokio(engine) => {
+                let _ = engine.completion_evt().read();
+                let active_state = self.device_state.active_state().unwrap();
+                let queue = &mut self.queues[0];
+                while let Some((pending, result)) = engine.pop() {
+                    let res = result.map_err(|e| IoErr::FileEngine(block_io::BlockIoError::Tokio(e)));
+                    let finished = pending.finish(&active_state.mem, res, &self.metrics);
+                    queue.add_used(finished.desc_idx, finished.num_bytes_to_mem)
+                        .unwrap_or_else(|e| error!("Failed to add used desc {}: {}", finished.desc_idx, e));
+                }
+                queue.advance_used_ring_idx();
+                if queue.prepare_kick() {
+                    active_state.interrupt.trigger(VirtioInterruptType::Queue(0))
+                        .unwrap_or_else(|_| self.metrics.event_fails.inc());
+                }
+            }
+            _ => return,
+        }
+
+        if self.is_io_engine_throttled {
+            self.is_io_engine_throttled = false;
+            self.process_queue(0).unwrap()
         }
     }
 

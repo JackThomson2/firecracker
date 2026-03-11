@@ -235,7 +235,7 @@ pub async fn run_event_loop(
 
     // Swap MMIO bus devices to channel-based proxies so vCPU MMIO accesses
     // go through the async event loop instead of locking device mutexes directly.
-    let mut mmio_rx = {
+    let (mut mmio_rx, _mmio_proxies) = {
         let v = vmm.lock().unwrap();
         v.device_manager.swap_to_mmio_proxies(&v.vm.common.mmio_bus)
     };
@@ -278,17 +278,7 @@ pub async fn run_event_loop(
 
             // MMIO request from vCPU thread
             Some(req) = mmio_rx.recv() => {
-                match req {
-                    MmioRequest::Read { device, base, offset, len, reply } => {
-                        let mut buf = vec![0u8; len];
-                        device.lock().unwrap().read(base, offset, &mut buf);
-                        let _ = reply.send(buf);
-                    }
-                    MmioRequest::Write { device, base, offset, data, reply } => {
-                        let barrier = device.lock().unwrap().write(base, offset, &data);
-                        let _ = reply.send(barrier);
-                    }
-                }
+                handle_mmio_request(req);
             }
             // API request
             req = async {
@@ -357,7 +347,7 @@ pub async fn run_event_loop(
             idx = any_device => {
                 let t = Instant::now();
                 let wfd = &watched[idx];
-                wfd.device.lock().await.process_async_event(wfd.tag).await;
+                wfd.device.lock().await.process_async_event(wfd.tag);
                 latency.record_device(t.elapsed().as_nanos() as u64);
             }
         }
@@ -373,6 +363,20 @@ pub async fn run_event_loop(
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
+
+fn handle_mmio_request(req: MmioRequest) {
+    match req {
+        MmioRequest::Read { device, base, offset, len, reply } => {
+            let mut buf = vec![0u8; len];
+            device.lock().unwrap().read(base, offset, &mut buf);
+            let _ = reply.send(buf);
+        }
+        MmioRequest::Write { device, base, offset, data, reply } => {
+            let barrier = device.lock().unwrap().write(base, offset, &data);
+            let _ = reply.send(barrier);
+        }
+    }
+}
 
 fn handle_vcpu_exit(vmm: &Arc<Mutex<Vmm>>) {
     let mut v = vmm.lock().unwrap();
