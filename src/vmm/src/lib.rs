@@ -114,8 +114,21 @@ use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Barrier, Mutex};
 
 /// Tokio-aware mutex for VirtioDevice instances.
-/// Use `.lock().await` in async contexts, `.lock().expect("Poisoned lock")` in sync contexts.
+/// Use `.lock().await` in async contexts, `spin_lock()` from vCPU threads.
 pub type DeviceMutex<T> = tokio::sync::Mutex<T>;
+
+/// Spin-try lock for `DeviceMutex` from non-async contexts (vCPU threads).
+/// Cannot use `blocking_lock()` (panics inside tokio runtime) or plain
+/// `try_lock().expect()` (fails under contention with async device tasks).
+/// Device tasks hold the lock for microseconds, so this converges quickly.
+pub fn spin_lock<T: ?Sized>(mutex: &DeviceMutex<T>) -> tokio::sync::MutexGuard<'_, T> {
+    loop {
+        if let Ok(guard) = mutex.try_lock() {
+            return guard;
+        }
+        std::hint::spin_loop();
+    }
+}
 use std::time::Duration;
 
 use device_manager::DeviceManager;

@@ -339,9 +339,6 @@ impl VirtioPciDevice {
     /// known state, the BARs are already created with the right content, therefore we don't need
     /// to go through this codepath.
     pub fn allocate_bars(&mut self, mmio64_allocator: &mut AddressAllocator) {
-        let device_clone = self.device.clone();
-        let device = device_clone.blocking_lock();
-
         // Allocate the virtio-pci capability BAR.
         // See http://docs.oasis-open.org/virtio/virtio/v1.0/cs04/virtio-v1.0-cs04.html#x1-740004
         let virtio_pci_bar_addr = mmio64_allocator
@@ -372,14 +369,14 @@ impl VirtioPciDevice {
         msix_vectors: Arc<MsixVectorGroup>,
         pci_device_bdf: u32,
     ) -> Result<Self, VirtioPciDeviceError> {
-        let num_queues = device.blocking_lock().queues().len();
+        let num_queues = device.try_lock().expect("uncontended during setup").queues().len();
 
         let msix_config = Arc::new(Mutex::new(MsixConfig::new(
             msix_vectors.clone(),
             pci_device_bdf,
         )));
         let pci_config = Self::pci_configuration(
-            device.blocking_lock().device_type(),
+            device.try_lock().expect("uncontended during setup").device_type(),
             &msix_config,
         );
 
@@ -459,7 +456,7 @@ impl VirtioPciDevice {
         if state.device_activated {
             virtio_pci_device
                 .device
-                .blocking_lock()
+                .try_lock().expect("uncontended during setup")
 
                 .activate(
                     virtio_pci_device.memory.clone(),
@@ -608,7 +605,7 @@ impl VirtioPciDevice {
         let bar_addr = self.config_bar_addr();
         for (i, queue_evt) in self
             .device
-            .blocking_lock()
+            .try_lock().expect("uncontended during setup")
 
             .queue_events()
             .iter()
@@ -813,7 +810,7 @@ impl PciDevice for VirtioPciDevice {
             o if (DEVICE_CONFIG_BAR_OFFSET..DEVICE_CONFIG_BAR_OFFSET + DEVICE_CONFIG_SIZE)
                 .contains(&o) =>
             {
-                let device = self.device.blocking_lock();
+                let device = crate::spin_lock(&self.device);
                 device.read_config(o - DEVICE_CONFIG_BAR_OFFSET, data);
             }
             o if (NOTIFICATION_BAR_OFFSET..NOTIFICATION_BAR_OFFSET + NOTIFICATION_SIZE)
@@ -857,7 +854,7 @@ impl PciDevice for VirtioPciDevice {
             o if (DEVICE_CONFIG_BAR_OFFSET..DEVICE_CONFIG_BAR_OFFSET + DEVICE_CONFIG_SIZE)
                 .contains(&o) =>
             {
-                let mut device = self.device.blocking_lock();
+                let mut device = crate::spin_lock(&self.device);
                 device.write_config(o - DEVICE_CONFIG_BAR_OFFSET, data);
             }
             o if (NOTIFICATION_BAR_OFFSET..NOTIFICATION_BAR_OFFSET + NOTIFICATION_SIZE)
@@ -891,9 +888,7 @@ impl PciDevice for VirtioPciDevice {
         if self.needs_activation() {
             debug!("Activating device");
             let interrupt = Arc::clone(self.virtio_interrupt.as_ref().unwrap());
-            match self
-                .virtio_device()
-                .blocking_lock()
+            match crate::spin_lock(&self.device)
 
                 .activate(self.memory.clone(), interrupt.clone())
             {
@@ -910,7 +905,7 @@ impl PciDevice for VirtioPciDevice {
 
         // Device has been reset by the driver
         if self.device_activated.load(Ordering::SeqCst) && self.is_driver_init() {
-            let mut device = self.device.blocking_lock();
+            let mut device = crate::spin_lock(&self.device);
             let reset_result = device.reset();
             match reset_result {
                 Some(_) => {
@@ -920,8 +915,7 @@ impl PciDevice for VirtioPciDevice {
 
                     // Reset queue readiness (changes queue_enable), queue sizes
                     // and selected_queue as per spec for reset
-                    self.virtio_device()
-                        .blocking_lock()
+                    crate::spin_lock(&self.device)
 
                         .queues_mut()
                         .iter_mut()
