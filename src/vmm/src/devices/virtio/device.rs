@@ -221,13 +221,26 @@ pub trait VirtioDevice: AsAny + Send {
     }
 
     /// Process an async event identified by tag. Called when the fd becomes readable.
-    /// Takes &mut self (caller holds the DeviceMutex). For devices with async I/O,
-    /// the returned future should NOT hold the lock during I/O — use try_lock internally.
-    /// Process an event synchronously. Default for most devices.
     fn process_async_event(&mut self, _tag: u32) {}
 
     /// Whether this device needs async I/O processing (lock released during I/O).
     fn needs_async_io(&self) -> bool { false }
+
+    /// Take the tokio completion receiver for block I/O, if this device uses the
+    /// Tokio file engine. The per-device task selects on this alongside device fds.
+    fn take_tokio_completion_rx(
+        &mut self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<super::block::virtio::io::TokioCompletion>>
+    {
+        None
+    }
+
+    /// Process a single tokio block I/O completion. Default no-op.
+    fn process_tokio_completion(
+        &mut self,
+        _completion: super::block::virtio::io::TokioCompletion,
+    ) {
+    }
 }
 
 impl fmt::Debug for dyn VirtioDevice {

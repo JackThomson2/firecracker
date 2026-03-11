@@ -252,8 +252,10 @@ impl VirtioDevice for Block {
             Self::Virtio(b) => {
                 let mut fds = vec![(b.queue_evts[0].as_raw_fd(), 1)]; // PROCESS_QUEUE
                 fds.push((b.rate_limiter.as_raw_fd(), 2)); // PROCESS_RATE_LIMITER
-                if let Some(fd) = b.async_completion_fd() {
-                    fds.push((fd, 3)); // PROCESS_ASYNC_COMPLETION
+                // Only io_uring (Async) engine uses an fd for completions.
+                // Tokio engine completions come via mpsc channel to the per-device task.
+                if let super::virtio::io::FileEngine::Async(engine) = &b.disk.file_engine {
+                    fds.push((engine.completion_evt().as_raw_fd(), 3));
                 }
                 fds
             }
@@ -280,6 +282,30 @@ impl VirtioDevice for Block {
         match self {
             Self::Virtio(b) => matches!(b.disk.file_engine, super::virtio::io::FileEngine::Tokio(_)),
             _ => false,
+        }
+    }
+
+    fn take_tokio_completion_rx(
+        &mut self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<super::virtio::io::TokioCompletion>> {
+        match self {
+            Self::Virtio(b) => {
+                if let super::virtio::io::FileEngine::Tokio(engine) = &mut b.disk.file_engine {
+                    engine.take_completion_rx()
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn process_tokio_completion(
+        &mut self,
+        completion: super::virtio::io::TokioCompletion,
+    ) {
+        if let Self::Virtio(b) = self {
+            b.process_single_tokio_completion(completion);
         }
     }
 }

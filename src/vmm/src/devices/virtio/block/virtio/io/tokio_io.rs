@@ -3,16 +3,14 @@
 
 //! Tokio-based async file engine for virtio-block.
 //! Submits I/O to tokio's blocking thread pool via spawn_blocking.
-//! Completions are signaled via an EventFd that the event loop watches.
+//! Completions flow back through a tokio::sync::mpsc unbounded channel.
 
-use std::collections::VecDeque;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
-use std::os::unix::io::AsRawFd;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use tokio::sync::mpsc;
 use vm_memory::GuestMemoryError;
-use vmm_sys_util::eventfd::EventFd;
 
 use super::PendingRequest;
 use crate::vstate::memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
@@ -29,33 +27,36 @@ pub enum TokioIoError {
     GuestMemory(GuestMemoryError),
 }
 
+/// A completed I/O request from the blocking thread pool.
 #[derive(Debug)]
-struct Completion {
-    req: PendingRequest,
-    result: Result<u32, TokioIoError>,
+pub struct TokioCompletion {
+    /// The original pending request.
+    pub req: PendingRequest,
+    /// Result: number of bytes transferred, or error.
+    pub result: Result<u32, TokioIoError>,
 }
-
-/// Shared completion queue between blocking threads and the event loop.
-type CompletionQueue = Arc<Mutex<VecDeque<Completion>>>;
 
 #[derive(Debug)]
 pub struct TokioFileEngine {
     file: Arc<File>,
-    completions: CompletionQueue,
-    completion_evt: EventFd,
+    completion_tx: mpsc::UnboundedSender<TokioCompletion>,
+    completion_rx: Option<mpsc::UnboundedReceiver<TokioCompletion>>,
 }
 
 impl TokioFileEngine {
     pub fn from_file(file: File) -> Result<Self, std::io::Error> {
+        let (tx, rx) = mpsc::unbounded_channel();
         Ok(Self {
             file: Arc::new(file),
-            completions: Arc::new(Mutex::new(VecDeque::new())),
-            completion_evt: EventFd::new(libc::EFD_NONBLOCK)?,
+            completion_tx: tx,
+            completion_rx: Some(rx),
         })
     }
 
-    pub fn completion_evt(&self) -> &EventFd {
-        &self.completion_evt
+    /// Take the completion receiver. The per-device task owns this and
+    /// selects on it alongside device fds.
+    pub fn take_completion_rx(&mut self) -> Option<mpsc::UnboundedReceiver<TokioCompletion>> {
+        self.completion_rx.take()
     }
 
     pub fn update_file(&mut self, file: File) {
@@ -77,18 +78,18 @@ impl TokioFileEngine {
     ) {
         let file = self.file.clone();
         let mem = mem.clone();
-        let cq = self.completions.clone();
-        let evt = self.completion_evt.try_clone().unwrap();
+        let tx = self.completion_tx.clone();
 
         tokio::task::spawn_blocking(move || {
             let result = (|| {
                 let mut buf = vec![0u8; count as usize];
-                file.read_exact_at(&mut buf, offset).map_err(TokioIoError::Read)?;
-                mem.write_slice(&buf, addr).map_err(TokioIoError::GuestMemory)?;
+                file.read_exact_at(&mut buf, offset)
+                    .map_err(TokioIoError::Read)?;
+                mem.write_slice(&buf, addr)
+                    .map_err(TokioIoError::GuestMemory)?;
                 Ok(count)
             })();
-            cq.lock().unwrap().push_back(Completion { req, result });
-            let _ = evt.write(1);
+            let _ = tx.send(TokioCompletion { req, result });
         });
     }
 
@@ -102,43 +103,36 @@ impl TokioFileEngine {
     ) {
         let file = self.file.clone();
         let mem = mem.clone();
-        let cq = self.completions.clone();
-        let evt = self.completion_evt.try_clone().unwrap();
+        let tx = self.completion_tx.clone();
 
         tokio::task::spawn_blocking(move || {
             let result = (|| {
                 let mut buf = vec![0u8; count as usize];
-                mem.read_slice(&mut buf, addr).map_err(TokioIoError::GuestMemory)?;
-                file.write_all_at(&buf, offset).map_err(TokioIoError::Write)?;
+                mem.read_slice(&mut buf, addr)
+                    .map_err(TokioIoError::GuestMemory)?;
+                file.write_all_at(&buf, offset)
+                    .map_err(TokioIoError::Write)?;
                 Ok(count)
             })();
-            cq.lock().unwrap().push_back(Completion { req, result });
-            let _ = evt.write(1);
+            let _ = tx.send(TokioCompletion { req, result });
         });
     }
 
     pub fn push_flush(&self, req: PendingRequest) {
         let file = self.file.clone();
-        let cq = self.completions.clone();
-        let evt = self.completion_evt.try_clone().unwrap();
+        let tx = self.completion_tx.clone();
 
         tokio::task::spawn_blocking(move || {
             let result = file.sync_all().map(|()| 0).map_err(TokioIoError::SyncAll);
-            cq.lock().unwrap().push_back(Completion { req, result });
-            let _ = evt.write(1);
+            let _ = tx.send(TokioCompletion { req, result });
         });
     }
 
-    /// Pop a completed request.
-    pub fn pop(&self) -> Option<(PendingRequest, Result<u32, TokioIoError>)> {
-        let c = self.completions.lock().unwrap().pop_front()?;
-        Some((c.req, c.result))
-    }
-
-    /// Drain and flush.
+    /// Drain pending completions synchronously (for shutdown/flush).
     pub fn drain_and_flush(&mut self) -> Result<(), TokioIoError> {
-        let _ = self.completion_evt.read();
-        while self.pop().is_some() {}
+        if let Some(rx) = &mut self.completion_rx {
+            while rx.try_recv().is_ok() {}
+        }
         self.file.sync_all().map_err(TokioIoError::SyncAll)
     }
 }

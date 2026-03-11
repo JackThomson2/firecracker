@@ -10,7 +10,7 @@ use std::fs::File;
 
 pub use self::async_io::{AsyncFileEngine, AsyncIoError};
 pub use self::sync_io::{SyncFileEngine, SyncIoError};
-pub use self::tokio_io::{TokioFileEngine, TokioIoError};
+pub use self::tokio_io::{TokioCompletion, TokioFileEngine, TokioIoError};
 use crate::devices::virtio::block::virtio::PendingRequest;
 use crate::devices::virtio::block::virtio::device::FileEngineType;
 use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};

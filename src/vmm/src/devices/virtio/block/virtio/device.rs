@@ -525,10 +525,11 @@ impl VirtioBlock {
     }
 
     /// Get the async completion fd, if using async IO engine.
+    /// Get the async completion fd, if using the io_uring async IO engine.
+    /// Tokio engine completions come via mpsc channel, not an fd.
     pub fn async_completion_fd(&self) -> Option<std::os::unix::io::RawFd> {
         match &self.disk.file_engine {
             super::io::FileEngine::Async(engine) => Some(engine.completion_evt().as_raw_fd()),
-            super::io::FileEngine::Tokio(engine) => Some(engine.completion_evt().as_raw_fd()),
             _ => None,
         }
     }
@@ -542,23 +543,41 @@ impl VirtioBlock {
                 }
                 self.process_async_completion_queue();
             }
-            super::io::FileEngine::Tokio(engine) => {
-                let _ = engine.completion_evt().read();
-                let active_state = self.device_state.active_state().unwrap();
-                let queue = &mut self.queues[0];
-                while let Some((pending, result)) = engine.pop() {
-                    let res = result.map_err(|e| IoErr::FileEngine(block_io::BlockIoError::Tokio(e)));
-                    let finished = pending.finish(&active_state.mem, res, &self.metrics);
-                    queue.add_used(finished.desc_idx, finished.num_bytes_to_mem)
-                        .unwrap_or_else(|e| error!("Failed to add used desc {}: {}", finished.desc_idx, e));
-                }
-                queue.advance_used_ring_idx();
-                if queue.prepare_kick() {
-                    active_state.interrupt.trigger(VirtioInterruptType::Queue(0))
-                        .unwrap_or_else(|_| self.metrics.event_fails.inc());
-                }
-            }
+            // Tokio completions now come via mpsc channel to the per-device task,
+            // not through an fd event. See process_single_tokio_completion().
             _ => return,
+        }
+
+        if self.is_io_engine_throttled {
+            self.is_io_engine_throttled = false;
+            self.process_queue(0).unwrap()
+        }
+    }
+
+    /// Process a single completion from the Tokio file engine's mpsc channel.
+    pub fn process_single_tokio_completion(
+        &mut self,
+        completion: super::io::TokioCompletion,
+    ) {
+        let active_state = self.device_state.active_state().unwrap();
+        let queue = &mut self.queues[0];
+
+        let res = completion
+            .result
+            .map_err(|e| IoErr::FileEngine(block_io::BlockIoError::Tokio(e)));
+        let finished = completion.req.finish(&active_state.mem, res, &self.metrics);
+        queue
+            .add_used(finished.desc_idx, finished.num_bytes_to_mem)
+            .unwrap_or_else(|e| {
+                error!("Failed to add used desc {}: {}", finished.desc_idx, e)
+            });
+
+        queue.advance_used_ring_idx();
+        if queue.prepare_kick() {
+            active_state
+                .interrupt
+                .trigger(VirtioInterruptType::Queue(0))
+                .unwrap_or_else(|_| self.metrics.event_fails.inc());
         }
 
         if self.is_io_engine_throttled {

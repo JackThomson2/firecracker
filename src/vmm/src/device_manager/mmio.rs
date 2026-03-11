@@ -31,7 +31,6 @@ use crate::vstate::bus::{Bus, BusError};
 use crate::vstate::memory::GuestAddress;
 use crate::vstate::resources::ResourceAllocator;
 use crate::Vm;
-use crate::DeviceMutex;
 
 /// Errors for MMIO device manager.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]

@@ -191,11 +191,19 @@ fn group_handlers_by_device(
 /// Spawn a tokio task for a single device that watches all its fds.
 /// When any fd fires, the task locks the device once, then processes
 /// ALL currently-ready fds in a batch before releasing the lock.
+/// For block devices with a Tokio file engine, also selects on the
+/// completion channel.
 fn spawn_device_task(
     device: Arc<DeviceMutex<dyn VirtioDevice>>,
     fd_tags: Vec<(RawFd, u32)>,
     latency: Arc<Mutex<LatencyStats>>,
 ) {
+    // Take the tokio completion receiver before spawning (needs &mut).
+    let mut completion_rx = device
+        .try_lock()
+        .expect("uncontended")
+        .take_tokio_completion_rx();
+
     let device_fds: Vec<DeviceFd> = fd_tags
         .into_iter()
         .filter_map(|(fd, tag)| {
@@ -209,37 +217,57 @@ fn spawn_device_task(
         })
         .collect();
 
-    if device_fds.is_empty() {
+    if device_fds.is_empty() && completion_rx.is_none() {
         return;
     }
 
     tokio::spawn(async move {
         loop {
-            // Wait for at least one fd to become readable.
-            let first_idx = AnyReady { fds: &device_fds }.await;
+            let t;
 
-            let t = Instant::now();
+            // Select between device fds and completion channel.
+            tokio::select! {
+                biased;
 
-            // Lock the device once for the whole batch.
-            let mut dev = device.lock().await;
-
-            // Process the fd that woke us.
-            dev.process_async_event(device_fds[first_idx].tag);
-
-            // Check remaining fds for readiness and process them too.
-            for (i, dfd) in device_fds.iter().enumerate() {
-                if i == first_idx {
-                    continue;
+                // Tokio block I/O completion
+                Some(completion) = async {
+                    match &mut completion_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    t = Instant::now();
+                    let mut dev = device.lock().await;
+                    dev.process_tokio_completion(completion);
+                    // Drain any additional completions that arrived.
+                    if let Some(rx) = &mut completion_rx {
+                        while let Ok(c) = rx.try_recv() {
+                            dev.process_tokio_completion(c);
+                        }
+                    }
                 }
-                // try_io succeeds if the fd is ready, fails with WouldBlock if not.
-                if dfd.async_fd.try_io(Interest::READABLE, |_| {
-                    Ok::<(), std::io::Error>(())
-                }).is_ok() {
-                    dev.process_async_event(dfd.tag);
+
+                // Device fd event
+                first_idx = AnyReady { fds: &device_fds }, if !device_fds.is_empty() => {
+                    t = Instant::now();
+                    let mut dev = device.lock().await;
+
+                    // Process the fd that woke us.
+                    dev.process_async_event(device_fds[first_idx].tag);
+
+                    // Check remaining fds for readiness and process them too.
+                    for (i, dfd) in device_fds.iter().enumerate() {
+                        if i == first_idx {
+                            continue;
+                        }
+                        if dfd.async_fd.try_io(Interest::READABLE, |_| {
+                            Ok::<(), std::io::Error>(())
+                        }).is_ok() {
+                            dev.process_async_event(dfd.tag);
+                        }
+                    }
                 }
             }
-
-            drop(dev);
 
             if let Ok(mut stats) = latency.try_lock() {
                 stats.record_device(t.elapsed().as_nanos() as u64);
