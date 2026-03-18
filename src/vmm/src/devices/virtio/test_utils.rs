@@ -538,8 +538,17 @@ pub(crate) mod test {
         ///
         /// * `msec` - The amount pf time in milliseconds for which to Emulate
         /// Process pending device events by calling process_async_event for each fd tag.
-        pub fn emulate_for_msec(&mut self, _msec: i32) -> Result<usize, std::io::Error> {
+        pub fn emulate_for_msec(&mut self, msec: i32) -> Result<usize, std::io::Error> {
+            if msec > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(msec as u64));
+            }
             let mut device = self.device.lock().unwrap();
+            // Check if the rate limiter deadline has passed (simulating tokio timer)
+            if let Some(deadline) = device.rate_limiter_deadline() {
+                if deadline <= tokio::time::Instant::now() {
+                    device.process_rate_limiter_unblock();
+                }
+            }
             let tags: Vec<(_, u32)> = device.async_fd_tags();
             for (_fd, tag) in &tags {
                 device.process_async_event(*tag);

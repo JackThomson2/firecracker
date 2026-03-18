@@ -73,6 +73,13 @@ def pytest_addoption(parser):
         type=Path,
     )
 
+    parser.addoption(
+        "--minimal",
+        action="store_true",
+        default=False,
+        help="Run minimal test matrix: only 6.1 kernel with PCI enabled",
+    )
+
 
 def pytest_report_header():
     """Pytest hook to print relevant metadata in the logs"""
@@ -82,6 +89,28 @@ def pytest_report_header():
             f"EC2 Instance ID: {global_props.instance_id}",
         ]
     )
+
+
+def pytest_collection_modifyitems(config, items):
+    """When --minimal is passed, keep only 6.1 kernel + PCI enabled variants."""
+    if not config.getoption("--minimal"):
+        return
+    selected = []
+    deselected = []
+    for item in items:
+        node_id = item.nodeid
+        # Skip if it uses a non-6.1 kernel
+        if "vmlinux-5.10" in node_id:
+            deselected.append(item)
+            continue
+        # Skip PCI_OFF variants
+        if "PCI_OFF" in node_id:
+            deselected.append(item)
+            continue
+        selected.append(item)
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+        items[:] = selected
 
 
 @pytest.hookimpl(wrapper=True, tryfirst=True)

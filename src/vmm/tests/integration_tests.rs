@@ -29,16 +29,22 @@ use vmm::vmm_config::snapshot::{
     CreateSnapshotParams, LoadSnapshotParams, MemBackendConfig, MemBackendType, SnapshotType,
 };
 use vmm::vmm_config::vsock::VsockDeviceConfig;
-use vmm::{DumpCpuConfigError, EventManager, FcExitCode, Vmm};
+use vmm::{DumpCpuConfigError, FcExitCode, Vmm};
 use vmm_sys_util::tempfile::TempFile;
 
-#[allow(unused_mut, unused_variables)]
-fn check_booted_microvm(vmm: Arc<Mutex<Vmm>>, mut evmgr: EventManager) {
-    // On x86_64, the vmm should exit once its workload completes and signals the exit event.
-    // On aarch64, the test kernel doesn't exit, so the vmm is force-stopped.
-    #[cfg(target_arch = "x86_64")]
-    evmgr.run_with_timeout(500).unwrap();
-    #[cfg(target_arch = "aarch64")]
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(f)
+}
+
+fn check_booted_microvm(vmm: Arc<Mutex<Vmm>>) {
+    // Give the workload time to complete, then explicitly stop.
+    // In the tokio architecture, the async event loop handles exit events,
+    // but these tests don't run the event loop, so we stop explicitly.
+    thread::sleep(Duration::from_millis(500));
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 
     assert_eq!(
@@ -52,38 +58,34 @@ fn test_build_and_boot_microvm() {
     // Error case: no boot source configured.
     {
         let resources: VmResources = MockVmResources::new().into();
-        let mut event_manager = EventManager::new().unwrap();
         let empty_seccomp_filters = get_empty_filters();
 
-        let vmm_ret = build_and_boot_microvm(
+        let vmm_ret = block_on(build_and_boot_microvm(
             &InstanceInfo::default(),
             &resources,
-            &mut event_manager,
             &empty_seccomp_filters,
-        );
+        ));
         assert_eq!(format!("{:?}", vmm_ret.err()), "Some(MissingKernelConfig)");
     }
 
     for pci_enabled in [false, true] {
         for memory_hotplug in [false, true] {
-            let (vmm, evmgr) = create_vmm(None, false, true, pci_enabled, memory_hotplug);
-            check_booted_microvm(vmm, evmgr);
+            let vmm = create_vmm(None, false, true, pci_enabled, memory_hotplug);
+            check_booted_microvm(vmm);
         }
     }
 }
 
 #[allow(unused_mut, unused_variables)]
-fn check_build_microvm(vmm: Arc<Mutex<Vmm>>, mut evmgr: EventManager) {
+fn check_build_microvm(vmm: Arc<Mutex<Vmm>>) {
     // The built microVM should be in the `VmState::Paused` state here.
     assert_eq!(vmm.lock().unwrap().instance_info().state, VmState::Paused);
 
     // The microVM should be able to resume and exit successfully.
     // On x86_64, the vmm should exit once its workload completes and signals the exit event.
     // On aarch64, the test kernel doesn't exit, so the vmm is force-stopped.
-    vmm.lock().unwrap().resume_vm().unwrap();
-    #[cfg(target_arch = "x86_64")]
-    evmgr.run_with_timeout(500).unwrap();
-    #[cfg(target_arch = "aarch64")]
+    block_on(vmm.lock().unwrap().resume_vm()).unwrap();
+    thread::sleep(Duration::from_millis(500));
     vmm.lock().unwrap().stop(FcExitCode::Ok);
     assert_eq!(
         vmm.lock().unwrap().shutdown_exit_code(),
@@ -95,8 +97,8 @@ fn check_build_microvm(vmm: Arc<Mutex<Vmm>>, mut evmgr: EventManager) {
 fn test_build_microvm() {
     for pci_enabled in [false, true] {
         for memory_hotplug in [false, true] {
-            let (vmm, evmgr) = create_vmm(None, false, false, pci_enabled, memory_hotplug);
-            check_build_microvm(vmm, evmgr);
+            let vmm = create_vmm(None, false, false, pci_enabled, memory_hotplug);
+            check_build_microvm(vmm);
         }
     }
 }
@@ -106,11 +108,11 @@ fn pause_resume_microvm(vmm: Arc<Mutex<Vmm>>) {
 
     // There's a race between this thread and the vcpu thread, but this thread
     // should be able to pause vcpu thread before it finishes running its test-binary.
-    api_controller.handle_request(VmmAction::Pause).unwrap();
+    block_on(api_controller.handle_request(VmmAction::Pause)).unwrap();
     // Pausing again the microVM should not fail (microVM remains in the
     // `Paused` state).
-    api_controller.handle_request(VmmAction::Pause).unwrap();
-    api_controller.handle_request(VmmAction::Resume).unwrap();
+    block_on(api_controller.handle_request(VmmAction::Pause)).unwrap();
+    block_on(api_controller.handle_request(VmmAction::Resume)).unwrap();
 
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 }
@@ -120,7 +122,7 @@ fn test_pause_resume_microvm() {
     for pci_enabled in [false, true] {
         for memory_hotplug in [false, true] {
             // Tests that pausing and resuming a microVM work as expected.
-            let (vmm, _) = create_vmm(None, false, true, pci_enabled, memory_hotplug);
+            let vmm = create_vmm(None, false, true, pci_enabled, memory_hotplug);
 
             pause_resume_microvm(vmm);
         }
@@ -135,7 +137,7 @@ fn test_dirty_bitmap_success() {
         default_vmm(Some(NOISY_KERNEL_IMAGE)),
     ];
 
-    for (vmm, _) in vmms {
+    for vmm in vmms {
         // Let it churn for a while and dirty some pages...
         thread::sleep(Duration::from_millis(100));
         let bitmap = vmm.lock().unwrap().vm.get_dirty_bitmap().unwrap();
@@ -155,7 +157,7 @@ fn test_dirty_bitmap_success() {
 
 #[test]
 fn test_disallow_snapshots_without_pausing() {
-    let (vmm, _) = default_vmm(Some(NOISY_KERNEL_IMAGE));
+    let vmm = default_vmm(Some(NOISY_KERNEL_IMAGE));
     let vm_info = VmInfo {
         mem_size_mib: 1u64,
         ..Default::default()
@@ -163,31 +165,31 @@ fn test_disallow_snapshots_without_pausing() {
 
     // Verify saving state while running is not allowed.
     assert!(matches!(
-        vmm.lock().unwrap().save_state(&vm_info),
+        block_on(vmm.lock().unwrap().save_state(&vm_info)),
         Err(MicrovmStateError::NotAllowed(_))
     ));
 
     // Pause microVM.
-    vmm.lock().unwrap().pause_vm().unwrap();
+    block_on(vmm.lock().unwrap().pause_vm()).unwrap();
     // It is now allowed.
-    vmm.lock().unwrap().save_state(&vm_info).unwrap();
+    block_on(vmm.lock().unwrap().save_state(&vm_info)).unwrap();
     // Stop.
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 }
 
 #[test]
 fn test_disallow_dump_cpu_config_without_pausing() {
-    let (vmm, _) = default_vmm_no_boot(Some(NOISY_KERNEL_IMAGE));
+    let vmm = default_vmm_no_boot(Some(NOISY_KERNEL_IMAGE));
 
     // This call should succeed since the microVM is in the paused state before boot.
-    vmm.lock().unwrap().dump_cpu_config().unwrap();
+    block_on(vmm.lock().unwrap().dump_cpu_config()).unwrap();
 
     // Boot the microVM.
-    vmm.lock().unwrap().resume_vm().unwrap();
+    block_on(vmm.lock().unwrap().resume_vm()).unwrap();
 
     // Verify this call is not allowed while running.
     assert!(matches!(
-        vmm.lock().unwrap().dump_cpu_config(),
+        block_on(vmm.lock().unwrap().dump_cpu_config()),
         Err(DumpCpuConfigError::NotAllowed(_))
     ));
 
@@ -203,7 +205,7 @@ fn verify_create_snapshot(
     let snapshot_file = TempFile::new().unwrap();
     let memory_file = TempFile::new().unwrap();
 
-    let (vmm, _) = create_vmm(
+    let vmm = create_vmm(
         Some(NOISY_KERNEL_IMAGE),
         is_diff,
         true,
@@ -218,7 +220,7 @@ fn verify_create_snapshot(
     thread::sleep(Duration::from_millis(200));
 
     // Pause microVM.
-    controller.handle_request(VmmAction::Pause).unwrap();
+    block_on(controller.handle_request(VmmAction::Pause)).unwrap();
 
     // Create snapshot.
     let snapshot_type = match is_diff {
@@ -231,9 +233,7 @@ fn verify_create_snapshot(
         mem_file_path: memory_file.as_path().to_path_buf(),
     };
 
-    controller
-        .handle_request(VmmAction::CreateSnapshot(snapshot_params))
-        .unwrap();
+    block_on(controller.handle_request(VmmAction::CreateSnapshot(snapshot_params))).unwrap();
 
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 
@@ -274,7 +274,6 @@ fn verify_create_snapshot(
 }
 
 fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
-    let mut event_manager = EventManager::new().unwrap();
     let empty_seccomp_filters = get_empty_filters();
     let mut vm_resources = VmResources::default();
 
@@ -282,21 +281,23 @@ fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
         &empty_seccomp_filters,
         InstanceInfo::default(),
         &mut vm_resources,
-        &mut event_manager,
     );
 
-    preboot_api_controller
-        .handle_preboot_request(VmmAction::LoadSnapshot(LoadSnapshotParams {
-            snapshot_path: snapshot_file.as_path().to_path_buf(),
-            mem_backend: MemBackendConfig {
-                backend_path: memory_file.as_path().to_path_buf(),
-                backend_type: MemBackendType::File,
+    block_on(
+        preboot_api_controller.handle_preboot_request(VmmAction::LoadSnapshot(
+            LoadSnapshotParams {
+                snapshot_path: snapshot_file.as_path().to_path_buf(),
+                mem_backend: MemBackendConfig {
+                    backend_path: memory_file.as_path().to_path_buf(),
+                    backend_type: MemBackendType::File,
+                },
+                track_dirty_pages: false,
+                resume_vm: true,
+                network_overrides: vec![],
             },
-            track_dirty_pages: false,
-            resume_vm: true,
-            network_overrides: vec![],
-        }))
-        .unwrap();
+        )),
+    )
+    .unwrap();
 
     let vmm = preboot_api_controller.built_vmm.take().unwrap();
 
@@ -356,7 +357,6 @@ fn get_microvm_state_from_snapshot(pci_enabled: bool) -> MicrovmState {
 fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &str) {
     let (snapshot_file, memory_file) = verify_create_snapshot(false, false, false);
 
-    let mut event_manager = EventManager::new().unwrap();
     let empty_seccomp_filters = get_empty_filters();
     let mut vm_resources = VmResources::default();
 
@@ -364,10 +364,9 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
         &empty_seccomp_filters,
         InstanceInfo::default(),
         &mut vm_resources,
-        &mut event_manager,
     );
 
-    preboot_api_controller.handle_preboot_request(res).unwrap();
+    block_on(preboot_api_controller.handle_preboot_request(res)).unwrap();
 
     // Load snapshot should no longer be allowed.
     let req = VmmAction::LoadSnapshot(LoadSnapshotParams {
@@ -380,7 +379,7 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
         resume_vm: false,
         network_overrides: vec![],
     });
-    let err = preboot_api_controller.handle_preboot_request(req);
+    let err = block_on(preboot_api_controller.handle_preboot_request(req));
     assert!(
         matches!(
             err.unwrap_err(),
