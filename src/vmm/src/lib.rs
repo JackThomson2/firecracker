@@ -19,9 +19,6 @@ pub mod arch;
 /// Async event loop using a single-threaded Tokio runtime.
 pub mod async_event_loop;
 
-/// Channel-based MMIO proxy for vCPU→device communication.
-pub mod mmio_proxy;
-
 /// High-level interface over Linux io_uring.
 ///
 /// Aims to provide an easy-to-use interface, while making some Firecracker-specific simplifying
@@ -44,13 +41,9 @@ pub mod io_uring;
 /// with the values passed in the `RateLimiter::new()` constructor.
 /// All subsequent accounting is done independently for each token bucket based
 /// on the `TokenType` used. If any of the buckets runs out of budget, the limiter
-/// goes in the 'blocked' state. At this point an internal timer is set up which
-/// will later 'wake up' the user in order to retry sending data. The 'wake up'
-/// notification will be dispatched as an event on the FD provided by the `AsRawFD`
-/// trait implementation.
-///
-/// The contract is that the user shall also call the `event_handler()` method on
-/// receipt of such an event.
+/// goes in the 'blocked' state. At this point an internal tokio timer is armed which
+/// will later 'wake up' the user in order to retry sending data. The device task
+/// should poll `wait_unblock()` and call `event_handler()` when it resolves.
 ///
 /// The token buckets are replenished when a called `consume()` doesn't find enough
 /// tokens in the bucket. The amount of tokens replenished is automatically calculated
@@ -63,16 +56,6 @@ pub mod io_uring;
 ///
 /// The granularity for 'wake up' events when the rate limiter is blocked is
 /// currently hardcoded to `100 milliseconds`.
-///
-/// ## Limitations
-///
-/// This rate limiter implementation relies on the *Linux kernel's timerfd* so its
-/// usage is limited to Linux systems.
-///
-/// Another particularity of this implementation is that it is not self-driving.
-/// It is meant to be used in an external event loop and thus implements the `AsRawFd`
-/// trait and provides an *event-handler* as part of its API. This *event-handler*
-/// needs to be called by the user on every event on the rate limiter's `AsRawFd` FD.
 pub mod rate_limiter;
 
 /// Module for handling ACPI tables.
@@ -124,8 +107,12 @@ pub mod initrd;
 
 use std::collections::HashMap;
 use std::io;
-use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Barrier, Mutex};
+
+/// Tokio-aware mutex for VirtioDevice instances.
+/// Use `.lock().await` in async contexts, `.blocking_lock()` from vCPU threads.
+pub type DeviceMutex<T> = tokio::sync::Mutex<T>;
+
 use std::time::Duration;
 
 use device_manager::DeviceManager;
@@ -139,14 +126,12 @@ use vstate::vcpu::{self, StartThreadedError, VcpuSendEventError};
 
 use crate::cpu_config::templates::CpuConfiguration;
 use crate::devices::virtio::balloon::device::{HintingStatus, StartHintingCmd};
-use crate::devices::virtio::balloon::{
-    BALLOON_DEV_ID, Balloon, BalloonConfig, BalloonError, BalloonStats,
-};
+use crate::devices::virtio::balloon::{BALLOON_DEV_ID, Balloon, BalloonError};
 use crate::devices::virtio::block::BlockError;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::device::VirtioDeviceType;
 use crate::devices::virtio::mem::device::VirtioMem;
-use crate::devices::virtio::mem::{VIRTIO_MEM_DEV_ID, VirtioMemError, VirtioMemStatus};
+use crate::devices::virtio::mem::VirtioMemError;
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::pmem::device::Pmem;
 use crate::devices::virtio::rng::Entropy;
@@ -154,7 +139,6 @@ use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
 use crate::logger::{METRICS, MetricsError, error, info, warn};
 use crate::mmds::data_store::Mmds;
 use crate::persist::{MicrovmState, MicrovmStateError, VmInfo};
-use crate::rate_limiter::BucketUpdate;
 use crate::resources::VmmConfig;
 use crate::vmm_config::balloon::BalloonDeviceConfig;
 use crate::vmm_config::boot_source::BootSourceConfig;
@@ -505,17 +489,17 @@ impl Vmm {
         Ok(())
     }
 
-    /// Sends a resume command to the vCPUs.
-    pub async fn resume_vm(&mut self) -> Result<(), VmmError> {
-        self.device_manager.kick_virtio_devices();
-
-        // Send the events.
+    /// Send an event to all vCPUs and await their responses with a timeout.
+    async fn send_vcpu_event_and_await(
+        &mut self,
+        event: VcpuEvent,
+    ) -> Result<Vec<VcpuResponse>, VmmError> {
         self.vcpus_handles
             .iter_mut()
-            .try_for_each(|handle| handle.send_event(VcpuEvent::Resume))
+            .try_for_each(|handle| handle.send_event(event.clone()))
             .map_err(|_| VmmError::VcpuMessage)?;
 
-        // Await all responses.
+        let mut responses = Vec::with_capacity(self.vcpus_handles.len());
         for handle in &mut self.vcpus_handles {
             match tokio::time::timeout(
                 RECV_TIMEOUT_SEC,
@@ -523,38 +507,34 @@ impl Vmm {
             )
             .await
             {
-                Ok(Some(VcpuResponse::Resumed)) => {}
+                Ok(Some(resp)) => responses.push(resp),
                 _ => return Err(VmmError::VcpuMessage),
             }
         }
+        Ok(responses)
+    }
 
-        self.instance_info.state = VmState::Running;
-        Ok(())
+    /// Sends a resume command to the vCPUs.
+    pub async fn resume_vm(&mut self) -> Result<(), VmmError> {
+        self.device_manager.kick_virtio_devices();
+        let responses = self.send_vcpu_event_and_await(VcpuEvent::Resume).await?;
+        if responses.iter().all(|r| matches!(r, VcpuResponse::Resumed)) {
+            self.instance_info.state = VmState::Running;
+            Ok(())
+        } else {
+            Err(VmmError::VcpuMessage)
+        }
     }
 
     /// Sends a pause command to the vCPUs.
     pub async fn pause_vm(&mut self) -> Result<(), VmmError> {
-        // Send the events.
-        self.vcpus_handles
-            .iter_mut()
-            .try_for_each(|handle| handle.send_event(VcpuEvent::Pause))
-            .map_err(|_| VmmError::VcpuMessage)?;
-
-        // Await all responses.
-        for handle in &mut self.vcpus_handles {
-            match tokio::time::timeout(
-                RECV_TIMEOUT_SEC,
-                handle.response_receiver_mut().recv(),
-            )
-            .await
-            {
-                Ok(Some(VcpuResponse::Paused)) => {}
-                _ => return Err(VmmError::VcpuMessage),
-            }
+        let responses = self.send_vcpu_event_and_await(VcpuEvent::Pause).await?;
+        if responses.iter().all(|r| matches!(r, VcpuResponse::Paused)) {
+            self.instance_info.state = VmState::Paused;
+            Ok(())
+        } else {
+            Err(VmmError::VcpuMessage)
         }
-
-        self.instance_info.state = VmState::Paused;
-        Ok(())
     }
 
     /// Injects CTRL+ALT+DEL keystroke combo in the i8042 device.
@@ -575,13 +555,13 @@ impl Vmm {
         vm_info: &VmInfo,
     ) -> Result<MicrovmState, MicrovmStateError> {
         use self::MicrovmStateError::SaveVmState;
-        let device_states = self.device_manager.save();
+        let device_states = self.device_manager.save().await;
         let vcpu_states = self.save_vcpu_states().await?;
         let kvm_state = self.kvm.save_state();
         let vm_state = {
             #[cfg(target_arch = "x86_64")]
             {
-                self.vm.save_state().map_err(SaveVmState)?
+                self.vm.save_state().await.map_err(SaveVmState)?
             }
             #[cfg(target_arch = "aarch64")]
             {
@@ -601,26 +581,12 @@ impl Vmm {
     }
 
     async fn save_vcpu_states(&mut self) -> Result<Vec<VcpuState>, MicrovmStateError> {
-        for handle in self.vcpus_handles.iter_mut() {
-            handle
-                .send_event(VcpuEvent::SaveState)
-                .map_err(MicrovmStateError::SignalVcpu)?;
-        }
-
-        let mut vcpu_responses = Vec::new();
-        for handle in &mut self.vcpus_handles {
-            match tokio::time::timeout(
-                RECV_TIMEOUT_SEC,
-                handle.response_receiver_mut().recv(),
-            )
+        let responses = self
+            .send_vcpu_event_and_await(VcpuEvent::SaveState)
             .await
-            {
-                Ok(Some(resp)) => vcpu_responses.push(resp),
-                _ => return Err(MicrovmStateError::UnexpectedVcpuResponse),
-            }
-        }
+            .map_err(|_| MicrovmStateError::UnexpectedVcpuResponse)?;
 
-        let vcpu_states = vcpu_responses
+        responses
             .into_iter()
             .map(|response| match response {
                 VcpuResponse::SavedState(state) => Ok(*state),
@@ -628,35 +594,19 @@ impl Vmm {
                 VcpuResponse::NotAllowed(reason) => Err(MicrovmStateError::NotAllowed(reason)),
                 _ => Err(MicrovmStateError::UnexpectedVcpuResponse),
             })
-            .collect::<Result<Vec<VcpuState>, MicrovmStateError>>()?;
-
-        Ok(vcpu_states)
+            .collect()
     }
 
     /// Dumps CPU configuration.
     pub async fn dump_cpu_config(
         &mut self,
     ) -> Result<Vec<CpuConfiguration>, DumpCpuConfigError> {
-        for handle in self.vcpus_handles.iter_mut() {
-            handle
-                .send_event(VcpuEvent::DumpCpuConfig)
-                .map_err(DumpCpuConfigError::SendEvent)?;
-        }
-
-        let mut vcpu_responses = Vec::new();
-        for handle in &mut self.vcpus_handles {
-            match tokio::time::timeout(
-                RECV_TIMEOUT_SEC,
-                handle.response_receiver_mut().recv(),
-            )
+        let responses = self
+            .send_vcpu_event_and_await(VcpuEvent::DumpCpuConfig)
             .await
-            {
-                Ok(Some(resp)) => vcpu_responses.push(resp),
-                _ => return Err(DumpCpuConfigError::UnexpectedResponse),
-            }
-        }
+            .map_err(|_| DumpCpuConfigError::UnexpectedResponse)?;
 
-        let cpu_configs = vcpu_responses
+        responses
             .into_iter()
             .map(|response| match response {
                 VcpuResponse::DumpedCpuConfig(cpu_config) => Ok(*cpu_config),
@@ -664,114 +614,7 @@ impl Vmm {
                 VcpuResponse::NotAllowed(reason) => Err(DumpCpuConfigError::NotAllowed(reason)),
                 _ => Err(DumpCpuConfigError::UnexpectedResponse),
             })
-            .collect::<Result<Vec<CpuConfiguration>, DumpCpuConfigError>>()?;
-
-        Ok(cpu_configs)
-    }
-
-    /// Updates the path of the host file backing the emulated block device with id `drive_id`.
-    /// We update the disk image on the device and its virtio configuration.
-    pub fn update_block_device_path(
-        &mut self,
-        drive_id: &str,
-        path_on_host: String,
-    ) -> Result<(), VmmError> {
-        self.device_manager
-            .with_virtio_device(drive_id, |block: &mut Block| {
-                block.update_disk_image(path_on_host)
-            })??;
-        Ok(())
-    }
-
-    /// Updates the rate limiter parameters for block device with `drive_id` id.
-    pub fn update_block_rate_limiter(
-        &mut self,
-        drive_id: &str,
-        rl_bytes: BucketUpdate,
-        rl_ops: BucketUpdate,
-    ) -> Result<(), VmmError> {
-        self.device_manager
-            .with_virtio_device(drive_id, |block: &mut Block| {
-                block.update_rate_limiter(rl_bytes, rl_ops)
-            })??;
-        Ok(())
-    }
-
-    /// Updates the rate limiter parameters for block device with `drive_id` id.
-    pub fn update_vhost_user_block_config(&mut self, drive_id: &str) -> Result<(), VmmError> {
-        self.device_manager
-            .with_virtio_device(drive_id, |block: &mut Block| block.update_config())??;
-        Ok(())
-    }
-
-    /// Updates the rate limiter parameters for net device with `net_id` id.
-    pub fn update_net_rate_limiters(
-        &mut self,
-        net_id: &str,
-        rx_bytes: BucketUpdate,
-        rx_ops: BucketUpdate,
-        tx_bytes: BucketUpdate,
-        tx_ops: BucketUpdate,
-    ) -> Result<(), VmmError> {
-        self.device_manager
-            .with_virtio_device(net_id, |net: &mut Net| {
-                net.patch_rate_limiters(rx_bytes, rx_ops, tx_bytes, tx_ops)
-            })?;
-        Ok(())
-    }
-
-    /// Returns a reference to the balloon device if present.
-    pub fn balloon_config(&self) -> Result<BalloonConfig, VmmError> {
-        let config = self
-            .device_manager
-            .with_virtio_device(BALLOON_DEV_ID, |dev: &mut Balloon| dev.config())?;
-        Ok(config)
-    }
-
-    /// Returns the latest balloon statistics if they are enabled.
-    pub fn latest_balloon_stats(&self) -> Result<BalloonStats, VmmError> {
-        let stats = self
-            .device_manager
-            .with_virtio_device(BALLOON_DEV_ID, |dev: &mut Balloon| dev.latest_stats())??;
-        Ok(stats)
-    }
-
-    /// Updates configuration for the balloon device target size.
-    pub fn update_balloon_config(&mut self, amount_mib: u32) -> Result<(), VmmError> {
-        self.device_manager
-            .with_virtio_device(BALLOON_DEV_ID, |dev: &mut Balloon| {
-                dev.update_size(amount_mib)
-            })??;
-        Ok(())
-    }
-
-    /// Updates configuration for the balloon device as described in `balloon_stats_update`.
-    pub fn update_balloon_stats_config(
-        &mut self,
-        stats_polling_interval_s: u16,
-    ) -> Result<(), VmmError> {
-        self.device_manager
-            .with_virtio_device(BALLOON_DEV_ID, |dev: &mut Balloon| {
-                dev.update_stats_polling_interval(stats_polling_interval_s)
-            })??;
-        Ok(())
-    }
-
-    /// Returns the current state of the memory hotplug device.
-    pub fn memory_hotplug_status(&self) -> Result<VirtioMemStatus, VmmError> {
-        self.device_manager
-            .with_virtio_device(VIRTIO_MEM_DEV_ID, |dev: &mut VirtioMem| dev.status())
-            .map_err(VmmError::FindDeviceError)
-    }
-
-    /// Returns the current state of the memory hotplug device.
-    pub fn update_memory_hotplug_size(&self, requested_size_mib: usize) -> Result<(), VmmError> {
-        self.device_manager
-            .with_virtio_device(VIRTIO_MEM_DEV_ID, |dev: &mut VirtioMem| {
-                dev.update_requested_size(requested_size_mib)
-            })
-            .map_err(VmmError::FindDeviceError)??;
-        Ok(())
+            .collect()
     }
 
     /// Starts the balloon free page hinting run

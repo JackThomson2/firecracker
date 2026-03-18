@@ -178,7 +178,7 @@ impl<'a> Persist<'a> for ResourceAllocator {
     type ConstructorArgs = ();
     type Error = Infallible;
 
-    fn save(&self) -> Self::State {
+    async fn save(&self) -> Self::State {
         self.clone()
     }
 
@@ -285,22 +285,22 @@ mod tests {
         }
     }
 
-    fn clone_allocator(allocator: &ResourceAllocator) -> ResourceAllocator {
-        let state = allocator.save();
+    async fn clone_allocator(allocator: &ResourceAllocator) -> ResourceAllocator {
+        let state = allocator.save().await;
         let serialized_data = bitcode::serialize(&state).unwrap();
         let restored_state: ResourceAllocator = bitcode::deserialize(&serialized_data).unwrap();
         ResourceAllocator::restore((), &restored_state).unwrap()
     }
 
-    #[test]
-    fn test_save_restore() {
+    #[tokio::test]
+    async fn test_save_restore() {
         let mut allocator0 = ResourceAllocator::new();
         let irq_0 = allocator0.allocate_gsi_legacy(1).unwrap()[0];
         assert_eq!(irq_0, GSI_LEGACY_START);
         let gsi_0 = allocator0.allocate_gsi_msi(1).unwrap()[0];
         assert_eq!(gsi_0, GSI_MSI_START);
 
-        let mut allocator1 = clone_allocator(&allocator0);
+        let mut allocator1 = clone_allocator(&allocator0).await;
         let irq_1 = allocator1.allocate_gsi_legacy(1).unwrap()[0];
         assert_eq!(irq_1, GSI_LEGACY_START + 1);
         let gsi_1 = allocator1.allocate_gsi_msi(1).unwrap()[0];
@@ -318,7 +318,7 @@ mod tests {
             .unwrap();
         assert_eq!(system_mem, arch::SYSTEM_MEM_START);
 
-        let mut allocator2 = clone_allocator(&allocator1);
+        let mut allocator2 = clone_allocator(&allocator1).await;
         allocator2
             .allocate_32bit_mmio_memory(0x42, 1, AllocPolicy::ExactMatch(mmio32_mem))
             .unwrap_err();

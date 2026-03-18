@@ -669,7 +669,6 @@ pub(crate) mod tests {
     use vmm_sys_util::errno;
 
     use super::*;
-    use crate::RECV_TIMEOUT_SEC;
     use crate::arch::{BootProtocol, EntryPoint};
     use crate::seccomp::get_empty_filters;
     use crate::utils::mib_to_bytes;
@@ -997,8 +996,8 @@ pub(crate) mod tests {
             .expect("failed to send event to vcpu");
         assert_eq!(
             handle
-                .response_receiver()
-                .recv_timeout(RECV_TIMEOUT_SEC)
+                .response_receiver_mut()
+                .blocking_recv()
                 .expect("did not receive event response from vcpu"),
             response
         );
@@ -1018,7 +1017,7 @@ pub(crate) mod tests {
         );
 
         let event_sender = vcpu.event_sender.take().expect("vCPU already started");
-        let _ = event_sender.send(VcpuEvent::Resume);
+        let _ = event_sender.blocking_send(VcpuEvent::Resume);
         vcpu.kvm_vcpu.fd.set_kvm_immediate_exit(1);
         // paused is expected to coerce immediate_exit to 0 when receiving a VcpuEvent::Resume
         let _ = vcpu.paused();
@@ -1083,8 +1082,8 @@ pub(crate) mod tests {
             .send_event(VcpuEvent::SaveState)
             .expect("failed to send event to vcpu");
         match vcpu_handle
-            .response_receiver()
-            .recv_timeout(RECV_TIMEOUT_SEC)
+            .response_receiver_mut()
+            .blocking_recv()
             .expect("did not receive event response from vcpu")
         {
             VcpuResponse::SavedState(_) => {}
@@ -1103,8 +1102,8 @@ pub(crate) mod tests {
             .send_event(VcpuEvent::DumpCpuConfig)
             .expect("Failed to send an event to vcpu.");
         match vcpu_handle
-            .response_receiver()
-            .recv_timeout(RECV_TIMEOUT_SEC)
+            .response_receiver_mut()
+            .blocking_recv()
             .expect("Could not receive a response from vcpu.")
         {
             VcpuResponse::DumpedCpuConfig(_) => (),

@@ -177,7 +177,7 @@ impl<'a> Persist<'a> for MsixVectorGroup {
     type ConstructorArgs = Arc<Vm>;
     type Error = InterruptError;
 
-    fn save(&self) -> Self::State {
+    async fn save(&self) -> Self::State {
         // We don't save the "enabled" state of the MSI interrupt. PCI devices store the MSI-X
         // configuration and make sure that the vector is enabled during the restore path if it was
         // initially enabled

@@ -164,7 +164,7 @@ impl ArchVm {
     }
 
     /// Saves and returns the Kvm Vm state.
-    pub fn save_state(&self) -> Result<VmState, ArchVmError> {
+    pub async fn save_state(&self) -> Result<VmState, ArchVmError> {
         let pitstate = self.fd().get_pit2().map_err(ArchVmError::VmGetPit2)?;
 
         let mut clock = self.fd().get_clock().map_err(ArchVmError::VmGetClock)?;
@@ -197,7 +197,7 @@ impl ArchVm {
 
         Ok(VmState {
             memory: self.common.guest_memory.describe(),
-            resource_allocator: self.resource_allocator().save(),
+            resource_allocator: self.resource_allocator().save().await,
             pitstate,
             clock,
             pic_master,
@@ -256,16 +256,16 @@ mod tests {
     use crate::vstate::vm::tests::{setup_vm, setup_vm_with_memory};
 
     #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn test_vm_save_restore_state() {
+    #[tokio::test]
+    async fn test_vm_save_restore_state() {
         let (_, vm) = setup_vm();
         // Irqchips, clock and pitstate are not configured so trying to save state should fail.
-        vm.save_state().unwrap_err();
+        vm.save_state().await.unwrap_err();
 
         let (_, vm) = setup_vm_with_memory(0x1000);
         vm.setup_irqchip().unwrap();
 
-        let vm_state = vm.save_state().unwrap();
+        let vm_state = vm.save_state().await.unwrap();
         assert_eq!(
             vm_state.pitstate.flags | KVM_PIT_SPEAKER_DUMMY,
             KVM_PIT_SPEAKER_DUMMY
@@ -282,13 +282,13 @@ mod tests {
     }
 
     #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn test_vm_save_restore_state_bad_irqchip() {
+    #[tokio::test]
+    async fn test_vm_save_restore_state_bad_irqchip() {
         use kvm_bindings::KVM_NR_IRQCHIPS;
 
         let (_, vm) = setup_vm_with_memory(0x1000);
         vm.setup_irqchip().unwrap();
-        let mut vm_state = vm.save_state().unwrap();
+        let mut vm_state = vm.save_state().await.unwrap();
 
         let (_, mut vm) = setup_vm_with_memory(0x1000);
         vm.setup_irqchip().unwrap();
@@ -311,11 +311,11 @@ mod tests {
     }
 
     #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn test_vmstate_serde() {
+    #[tokio::test]
+    async fn test_vmstate_serde() {
         let (_, mut vm) = setup_vm_with_memory(0x1000);
         vm.setup_irqchip().unwrap();
-        let state = vm.save_state().unwrap();
+        let state = vm.save_state().await.unwrap();
 
         // Test direct bitcode serialization
         let serialized_data = bitcode::serialize(&state).unwrap();

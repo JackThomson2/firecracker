@@ -833,15 +833,15 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn test_msi_vector_group_persistence() {
+    #[tokio::test]
+    async fn test_msi_vector_group_persistence() {
         let (_, mut vm) = setup_vm_with_memory(mib_to_bytes(128));
         enable_irqchip(&mut vm);
         let vm = Arc::new(vm);
         let msix_group = create_msix_group(&vm);
 
         msix_group.enable().unwrap();
-        let state = msix_group.save();
+        let state = msix_group.save().await;
         let restored_group = MsixVectorGroup::restore(vm, &state).unwrap();
 
         assert_eq!(msix_group.num_vectors(), restored_group.num_vectors());
@@ -856,8 +856,8 @@ pub(crate) mod tests {
     }
 
     #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn test_restore_state_resource_allocator() {
+    #[tokio::test]
+    async fn test_restore_state_resource_allocator() {
         use vm_allocator::AllocPolicy;
 
         let (_, mut vm) = setup_vm_with_memory(0x1000);
@@ -874,7 +874,7 @@ pub(crate) mod tests {
             (gsi, range)
         };
 
-        let state = vm.save_state().unwrap();
+        let state = vm.save_state().await.unwrap();
         let serialized_data = bitcode::serialize(&state).unwrap();
 
         let restored_state: VmState = bitcode::deserialize(&serialized_data).unwrap();
