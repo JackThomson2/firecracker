@@ -14,6 +14,10 @@
                 "syscall": "epoll_pwait"
             },
             {
+                "syscall": "epoll_wait",
+                "comment": "Used by tokio runtime event loop"
+            },
+            {
                 "syscall": "exit"
             },
             {
@@ -96,6 +100,10 @@
             {
                 "syscall": "munmap",
                 "comment": "Used for freeing memory"
+            },
+            {
+                "syscall": "memfd_create",
+                "comment": "Used by IovDeque for net device split RX/TX tasks"
             },
             {
                 "syscall": "recvfrom",
@@ -281,6 +289,19 @@
                         "op": "eq",
                         "val": 32769,
                         "comment": "libc::MAP_SHARED | libc::MAP_POPULATE"
+                    }
+                ]
+            },
+            {
+                "syscall": "mmap",
+                "comment": "Used by IovDeque ring buffer (net device split RX/TX)",
+                "args": [
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 17,
+                        "comment": "libc::MAP_SHARED | libc::MAP_FIXED"
                     }
                 ]
             },
@@ -510,6 +531,18 @@
                 "comment": "Tokio spawn_blocking threadpool"
             },
             {
+                "syscall": "clone",
+                "comment": "Thread creation for per-device tokio runtimes"
+            },
+            {
+                "syscall": "mmap",
+                "comment": "Per-device tokio runtime internal allocations"
+            },
+            {
+                "syscall": "timerfd_create",
+                "comment": "Per-device tokio runtime timer setup"
+            },
+            {
                 "syscall": "set_robust_list",
                 "comment": "Tokio spawn_blocking threadpool"
             },
@@ -520,6 +553,39 @@
             {
                 "syscall": "prctl",
                 "comment": "Tokio spawn_blocking threadpool"
+            },
+            {
+                "syscall": "pread64",
+                "comment": "Used by TokioFileEngine for async block I/O via pread"
+            },
+            {
+                "syscall": "pwrite64",
+                "comment": "Used by TokioFileEngine for async block I/O via pwrite"
+            },
+            {
+                "syscall": "sched_getaffinity",
+                "comment": "Used by tokio blocking thread pool"
+            },
+            {
+                "syscall": "dup",
+                "comment": "Used by EventFd::try_clone in TokioFileEngine"
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "FIOCLEX - set close-on-exec, used by dup/eventfd operations",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 21585,
+                        "comment": "FIOCLEX"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "TEMPORARY: allow all ioctls to debug seccomp issue"
             }
         ]
     },
@@ -532,6 +598,10 @@
             },
             {
                 "syscall": "epoll_pwait"
+            },
+            {
+                "syscall": "epoll_wait",
+                "comment": "Used by micro_http server event loop"
             },
             {
                 "syscall": "exit"
