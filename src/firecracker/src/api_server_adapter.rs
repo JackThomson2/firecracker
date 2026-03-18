@@ -72,7 +72,9 @@ pub(crate) fn run_with_api(
 
     let tokio_rt = async_event_loop::create_runtime();
 
-    let result: Result<(), ApiServerError> = tokio_rt.rt.block_on(async {
+    let result: Result<(), ApiServerError> = {
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&tokio_rt.rt, async {
         let build_result = match config_json {
             Some(json) => super::build_microvm_from_json(
                 seccomp_filters, json, instance_info,
@@ -96,7 +98,7 @@ pub(crate) fn run_with_api(
             }
             Err(e) => Err(e),
         }
-    });
+    })};
 
     api_kill_switch.write(1).unwrap();
     api_thread.join().expect("Api thread should join");

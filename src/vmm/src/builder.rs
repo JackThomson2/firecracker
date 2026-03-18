@@ -55,6 +55,7 @@ use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::VcpuError;
 use crate::vstate::vm::{Vm, VmError};
 use crate::{Vmm, VmmError};
+use crate::DeviceMutex;
 
 /// Errors associated with starting the instance.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -524,6 +525,11 @@ pub fn build_microvm_from_snapshot(
 
     let vmm = Arc::new(Mutex::new(vmm));
 
+    // Build device fd handlers for the async event loop BEFORE seccomp.
+    let device_handlers = crate::async_event_loop::build_device_handlers(&vmm.lock().unwrap());
+    info!("Built {} device handlers for async event loop (snapshot restore)", device_handlers.len());
+    vmm.lock().unwrap().device_handlers = Some(device_handlers);
+
     // Load seccomp filters for the VMM thread.
     // Keep this as the last step of the building process.
     crate::seccomp::apply_filter(
@@ -583,11 +589,10 @@ fn attach_entropy_device(
     device_manager: &mut DeviceManager,
     vm: &Arc<Vm>,
     cmdline: &mut LoaderKernelCmdline,
-    entropy_device: &Arc<Mutex<Entropy>>,
+    entropy_device: &Arc<DeviceMutex<Entropy>>,
 ) -> Result<(), AttachDeviceError> {
     let id = entropy_device
-        .lock()
-        .expect("Poisoned lock")
+        .try_lock().expect("device lock")
         .id()
         .to_string();
 
@@ -623,7 +628,7 @@ fn attach_virtio_mem_device(
     config: &MemoryHotplugConfig,
     addr: GuestAddress,
 ) -> Result<(), StartMicrovmError> {
-    let virtio_mem = Arc::new(Mutex::new(
+    let virtio_mem = Arc::new(DeviceMutex::new(
         VirtioMem::new(
             Arc::clone(vm),
             addr,
@@ -634,7 +639,7 @@ fn attach_virtio_mem_device(
         .map_err(|e| StartMicrovmError::Internal(VmmError::VirtioMem(e)))?,
     ));
 
-    let id = virtio_mem.lock().expect("Poisoned lock").id().to_string();
+    let id = virtio_mem.try_lock().expect("device lock").id().to_string();
     device_manager.attach_virtio_device(
         vm,
         id,
@@ -645,7 +650,7 @@ fn attach_virtio_mem_device(
     Ok(())
 }
 
-fn attach_block_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Block>>> + Debug>(
+fn attach_block_devices<'a, I: Iterator<Item = &'a Arc<DeviceMutex<Block>>> + Debug>(
     device_manager: &mut DeviceManager,
     vm: &Arc<Vm>,
     cmdline: &mut LoaderKernelCmdline,
@@ -653,7 +658,7 @@ fn attach_block_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Block>>> + Debug>(
 ) -> Result<(), StartMicrovmError> {
     for block in blocks {
         let (id, is_vhost_user) = {
-            let locked = block.lock().expect("Poisoned lock");
+            let locked = block.try_lock().expect("device lock");
             if locked.root_device() {
                 match locked.partuuid() {
                     Some(partuuid) => cmdline.insert_str(format!("root=PARTUUID={}", partuuid))?,
@@ -678,14 +683,14 @@ fn attach_block_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Block>>> + Debug>(
     Ok(())
 }
 
-fn attach_net_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Net>>> + Debug>(
+fn attach_net_devices<'a, I: Iterator<Item = &'a Arc<DeviceMutex<Net>>> + Debug>(
     device_manager: &mut DeviceManager,
     vm: &Arc<Vm>,
     cmdline: &mut LoaderKernelCmdline,
     net_devices: I,
 ) -> Result<(), StartMicrovmError> {
     for net_device in net_devices {
-        let id = net_device.lock().expect("Poisoned lock").id().to_string();
+        let id = net_device.try_lock().expect("device lock").id().to_string();
         // The device mutex mustn't be locked here otherwise it will deadlock.
         device_manager.attach_virtio_device(
             vm,
@@ -698,7 +703,7 @@ fn attach_net_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Net>>> + Debug>(
     Ok(())
 }
 
-fn attach_pmem_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Pmem>>> + Debug>(
+fn attach_pmem_devices<'a, I: Iterator<Item = &'a Arc<DeviceMutex<Pmem>>> + Debug>(
     device_manager: &mut DeviceManager,
     vm: &Arc<Vm>,
     cmdline: &mut LoaderKernelCmdline,
@@ -706,7 +711,7 @@ fn attach_pmem_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Pmem>>> + Debug>(
 ) -> Result<(), StartMicrovmError> {
     for (i, device) in pmem_devices.enumerate() {
         let id = {
-            let mut locked_dev = device.lock().expect("Poisoned lock");
+            let mut locked_dev = device.try_lock().expect("device lock");
             if locked_dev.config.root_device {
                 cmdline.insert_str(format!("root=/dev/pmem{i}"))?;
                 match locked_dev.config.read_only {
@@ -734,9 +739,9 @@ fn attach_unixsock_vsock_device(
     device_manager: &mut DeviceManager,
     vm: &Arc<Vm>,
     cmdline: &mut LoaderKernelCmdline,
-    unix_vsock: &Arc<Mutex<Vsock<VsockUnixBackend>>>,
+    unix_vsock: &Arc<DeviceMutex<Vsock<VsockUnixBackend>>>,
 ) -> Result<(), AttachDeviceError> {
-    let id = String::from(unix_vsock.lock().expect("Poisoned lock").id());
+    let id = String::from(unix_vsock.try_lock().expect("device lock").id());
     // The device mutex mustn't be locked here otherwise it will deadlock.
     device_manager.attach_virtio_device(vm, id, unix_vsock.clone(), cmdline, false)
 }
@@ -745,9 +750,9 @@ fn attach_balloon_device(
     device_manager: &mut DeviceManager,
     vm: &Arc<Vm>,
     cmdline: &mut LoaderKernelCmdline,
-    balloon: &Arc<Mutex<Balloon>>,
+    balloon: &Arc<DeviceMutex<Balloon>>,
 ) -> Result<(), AttachDeviceError> {
-    let id = String::from(balloon.lock().expect("Poisoned lock").id());
+    let id = String::from(balloon.try_lock().expect("device lock").id());
     // The device mutex mustn't be locked here otherwise it will deadlock.
     device_manager.attach_virtio_device(vm, id, balloon.clone(), cmdline, false)
 }
@@ -926,7 +931,7 @@ pub(crate) mod tests {
         let net = net_builder.iter().next().unwrap();
         let mut mmds = Mmds::default();
         mmds.set_version(mmds_version);
-        net.lock().unwrap().configure_mmds_network_stack(
+        net.try_lock().expect("device lock").configure_mmds_network_stack(
             MmdsNetworkStack::default_ipv4_addr(),
             Arc::new(Mutex::new(mmds)),
         );
@@ -947,7 +952,7 @@ pub(crate) mod tests {
     ) {
         let vsock_dev_id = VSOCK_DEV_ID.to_owned();
         let vsock = VsockBuilder::create_unixsock_vsock(vsock_config).unwrap();
-        let vsock = Arc::new(Mutex::new(vsock));
+        let vsock = Arc::new(DeviceMutex::new(vsock));
 
         attach_unixsock_vsock_device(
             &mut vmm.device_manager,

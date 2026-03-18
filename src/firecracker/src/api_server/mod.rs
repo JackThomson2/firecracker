@@ -201,6 +201,7 @@ mod tests {
     use vmm::seccomp::get_empty_filters;
     use vmm::vmm_config::instance_info::InstanceInfo;
     use vmm::vmm_config::snapshot::CreateSnapshotParams;
+    use vmm_sys_util::eventfd::EventFd;
     use vmm_sys_util::tempfile::TempFile;
 
     use super::request::cpu_configuration::parse_put_cpu_config;
@@ -230,12 +231,12 @@ mod tests {
 
     #[test]
     fn test_serve_vmm_action_request() {
-        let (api_request_sender, _from_api) = tokio::sync::mpsc::channel(1);
+        let (api_request_sender, _from_api) = tokio::sync::mpsc::channel(16);
         let (to_api, vmm_response_receiver) = tokio::sync::mpsc::channel(1);
 
         let mut api_server = ApiServer::new(api_request_sender, vmm_response_receiver);
         to_api
-            .send(Box::new(Err(VmmActionError::StartMicrovm(
+            .blocking_send(Box::new(Err(VmmActionError::StartMicrovm(
                 StartMicrovmError::MissingKernelConfig,
             ))))
             .unwrap();
@@ -249,7 +250,7 @@ mod tests {
         // at all, which is what this test is trying to prove).
         let start_time_us = get_time_us(ClockType::Monotonic) - 1;
         assert_eq!(METRICS.latencies_us.pause_vm.fetch(), 0);
-        to_api.send(Box::new(Ok(VmmData::Empty))).unwrap();
+        to_api.blocking_send(Box::new(Ok(VmmData::Empty))).unwrap();
         let response =
             api_server.serve_vmm_action_request(Box::new(VmmAction::Pause), start_time_us);
         assert_eq!(response.status(), StatusCode::NoContent);
@@ -257,7 +258,7 @@ mod tests {
 
         assert_eq!(METRICS.latencies_us.diff_create_snapshot.fetch(), 0);
         to_api
-            .send(Box::new(Err(VmmActionError::OperationNotSupportedPreBoot)))
+            .blocking_send(Box::new(Err(VmmActionError::OperationNotSupportedPreBoot)))
             .unwrap();
         let response = api_server.serve_vmm_action_request(
             Box::new(VmmAction::CreateSnapshot(CreateSnapshotParams {
@@ -271,7 +272,7 @@ mod tests {
         // The metric should not be updated if the request wasn't successful.
         assert_eq!(METRICS.latencies_us.diff_create_snapshot.fetch(), 0);
 
-        to_api.send(Box::new(Ok(VmmData::Empty))).unwrap();
+        to_api.blocking_send(Box::new(Ok(VmmData::Empty))).unwrap();
         let response = api_server.serve_vmm_action_request(
             Box::new(VmmAction::CreateSnapshot(CreateSnapshotParams {
                 snapshot_type: SnapshotType::Diff,
@@ -312,7 +313,7 @@ mod tests {
 
         // Test a Get Info request.
         to_api
-            .send(Box::new(Ok(VmmData::InstanceInformation(
+            .blocking_send(Box::new(Ok(VmmData::InstanceInformation(
                 InstanceInfo::default(),
             ))))
             .unwrap();
@@ -383,7 +384,7 @@ mod tests {
             .unwrap();
 
         to_api
-            .send(Box::new(Ok(VmmData::InstanceInformation(
+            .blocking_send(Box::new(Ok(VmmData::InstanceInformation(
                 InstanceInfo::default(),
             ))))
             .unwrap();
@@ -408,7 +409,7 @@ mod tests {
         let api_thread_path_to_socket = path_to_socket.clone();
 
         let (api_request_sender, _from_api) = tokio::sync::mpsc::channel(1);
-        let (_to_api, vmm_response_receiver) = channel();
+        let (_to_api, vmm_response_receiver) = tokio::sync::mpsc::channel(1);
         let seccomp_filters = get_empty_filters();
 
         let server = HttpServer::new(PathBuf::from(api_thread_path_to_socket)).unwrap();
@@ -452,7 +453,7 @@ mod tests {
         let path_to_socket = tmp_socket.as_path().to_str().unwrap().to_owned();
 
         let (api_request_sender, _from_api) = tokio::sync::mpsc::channel(1);
-        let (_to_api, vmm_response_receiver) = channel();
+        let (_to_api, vmm_response_receiver) = tokio::sync::mpsc::channel(1);
         let seccomp_filters = get_empty_filters();
 
         let api_kill_switch = EventFd::new(libc::EFD_NONBLOCK).unwrap();

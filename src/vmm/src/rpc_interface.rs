@@ -8,6 +8,14 @@ use serde_json::Value;
 use utils::time::{ClockType, get_time_us};
 
 use super::builder::build_and_boot_microvm;
+use crate::device_manager::FindDeviceError;
+use crate::devices::virtio::balloon::device::Balloon;
+use crate::devices::virtio::balloon::BALLOON_DEV_ID;
+use crate::devices::virtio::block::device::Block;
+use crate::devices::virtio::device::VirtioDevice;
+use crate::devices::virtio::mem::device::VirtioMem;
+use crate::devices::virtio::mem::VIRTIO_MEM_DEV_ID;
+use crate::devices::virtio::net::device::Net;
 use super::persist::{create_snapshot, restore_from_snapshot};
 use super::resources::VmResources;
 use super::{Vmm, VmmError};
@@ -200,6 +208,8 @@ pub enum VmmActionError {
     StartMicrovm(#[from] StartMicrovmError),
     /// Vsock config error: {0}
     VsockConfig(#[from] VsockConfigError),
+    /// Device not found: {0}
+    FindDevice(#[from] FindDeviceError),
 }
 
 /// The enum represents the response sent by the VMM in case of success. The response is either
@@ -274,6 +284,8 @@ pub struct PrebootApiController<'a> {
     // Some PrebootApiRequest errors are irrecoverable and Firecracker
     // should cleanly teardown if they occur.
     fatal_error: Option<BuildMicrovmFromRequestsError>,
+    /// Whether to resume the VM after the event loop starts.
+    pub deferred_resume: bool,
 }
 
 // TODO Remove when `EventManager` implements `std::fmt::Debug`.
@@ -331,6 +343,7 @@ impl<'a> PrebootApiController<'a> {
             instance_info,
             vm_resources,
             built_vmm: None,
+            deferred_resume: false,
             boot_path: false,
             fatal_error: None,
         }
@@ -638,7 +651,6 @@ impl<'a> PrebootApiController<'a> {
                 .resume_vm()
                 .await
                 .inspect_err(|_| {
-                    // If resume fails, we consider the process is too dirty to recover.
                     self.fatal_error = Some(BuildMicrovmFromRequestsError::Resume);
                 })?;
         }
@@ -661,6 +673,26 @@ pub struct RuntimeApiController {
 }
 
 impl RuntimeApiController {
+    /// Lock the device identified by type T and id, without holding the vmm lock
+    /// across the await point. Safe to call from async context.
+    async fn with_device<T, F, R>(&self, id: &str, f: F) -> Result<R, FindDeviceError>
+    where
+        T: VirtioDevice + 'static + std::fmt::Debug,
+        F: FnOnce(&mut T) -> R,
+    {
+        let device = {
+            let vmm = self.vmm.lock().expect("Poisoned lock");
+            vmm.device_manager
+                .get_virtio_device(T::const_device_type(), id)
+                .ok_or(FindDeviceError::DeviceNotFound)?
+        };
+        // vmm lock dropped here — safe to await
+        let mut dev = device.lock().await;
+        Ok(f(dev
+            .as_mut_any()
+            .downcast_mut::<T>()
+            .expect("Invalid device for a given device type")))
+    }
     /// Handles the incoming runtime `VmmAction` request and provides a response for it.
     pub async fn handle_request(&mut self, request: VmmAction) -> Result<VmmData, VmmActionError> {
         use self::VmmAction::*;
@@ -669,29 +701,24 @@ impl RuntimeApiController {
             CreateSnapshot(snapshot_create_cfg) => self.create_snapshot(&snapshot_create_cfg).await,
             FlushMetrics => self.flush_metrics(),
             GetBalloonConfig => self
-                .vmm
-                .lock()
-                .expect("Poisoned lock")
-                .balloon_config()
+                .with_device::<Balloon, _, _>(BALLOON_DEV_ID, |dev| dev.config())
+                .await
                 .map(|state| VmmData::BalloonConfig(BalloonDeviceConfig::from(state)))
-                .map_err(VmmActionError::InternalVmm),
+                .map_err(VmmActionError::FindDevice),
             GetBalloonStats => self
-                .vmm
-                .lock()
-                .expect("Poisoned lock")
-                .latest_balloon_stats()
+                .with_device::<Balloon, _, _>(BALLOON_DEV_ID, |dev| dev.latest_stats())
+                .await
+                .map_err(VmmActionError::FindDevice)?
                 .map(VmmData::BalloonStats)
-                .map_err(VmmActionError::InternalVmm),
+                .map_err(|e| VmmActionError::InternalVmm(e.into())),
             GetFullVmConfig => Ok(VmmData::FullVmConfig(
                 self.vmm.lock().expect("Poisoned lock").full_config(),
             )),
             GetMemoryHotplugStatus => self
-                .vmm
-                .lock()
-                .expect("Poisoned lock")
-                .memory_hotplug_status()
+                .with_device::<VirtioMem, _, _>(VIRTIO_MEM_DEV_ID, |dev| dev.status())
+                .await
                 .map(VmmData::VirtioMemStatus)
-                .map_err(VmmActionError::InternalVmm),
+                .map_err(VmmActionError::FindDevice),
             GetMMDS => Ok(VmmData::MmdsValue(
                 self.vmm
                     .lock()
@@ -740,19 +767,21 @@ impl RuntimeApiController {
             #[cfg(target_arch = "x86_64")]
             SendCtrlAltDel => self.send_ctrl_alt_del(),
             UpdateBalloon(balloon_update) => self
-                .vmm
-                .lock()
-                .expect("Poisoned lock")
-                .update_balloon_config(balloon_update.amount_mib)
+                .with_device::<Balloon, _, _>(BALLOON_DEV_ID, |dev| {
+                    dev.update_size(balloon_update.amount_mib)
+                })
+                .await
+                .map_err(VmmActionError::FindDevice)?
                 .map(|_| VmmData::Empty)
-                .map_err(VmmActionError::BalloonUpdate),
+                .map_err(|e| VmmActionError::BalloonUpdate(e.into())),
             UpdateBalloonStatistics(balloon_stats_update) => self
-                .vmm
-                .lock()
-                .expect("Poisoned lock")
-                .update_balloon_stats_config(balloon_stats_update.stats_polling_interval_s)
+                .with_device::<Balloon, _, _>(BALLOON_DEV_ID, |dev| {
+                    dev.update_stats_polling_interval(balloon_stats_update.stats_polling_interval_s)
+                })
+                .await
+                .map_err(VmmActionError::FindDevice)?
                 .map(|_| VmmData::Empty)
-                .map_err(VmmActionError::BalloonUpdate),
+                .map_err(|e| VmmActionError::BalloonUpdate(e.into())),
             StartFreePageHinting(cmd) => self
                 .vmm
                 .lock()
@@ -774,15 +803,16 @@ impl RuntimeApiController {
                 .stop_balloon_hinting()
                 .map(|_| VmmData::Empty)
                 .map_err(VmmActionError::BalloonUpdate),
-            UpdateBlockDevice(new_cfg) => self.update_block_device(new_cfg),
-            UpdateNetworkInterface(netif_update) => self.update_net_rate_limiters(netif_update),
+            UpdateBlockDevice(new_cfg) => self.update_block_device(new_cfg).await,
+            UpdateNetworkInterface(netif_update) => self.update_net_rate_limiters(netif_update).await,
             UpdateMemoryHotplugSize(cfg) => self
-                .vmm
-                .lock()
-                .expect("Poisoned lock")
-                .update_memory_hotplug_size(cfg.requested_size_mib)
+                .with_device::<VirtioMem, _, _>(VIRTIO_MEM_DEV_ID, |dev| {
+                    dev.update_requested_size(cfg.requested_size_mib)
+                })
+                .await
+                .map_err(VmmActionError::FindDevice)?
                 .map(|_| VmmData::Empty)
-                .map_err(VmmActionError::MemoryHotplugUpdate),
+                .map_err(|e| VmmActionError::MemoryHotplugUpdate(e.into())),
             // Operations not allowed post-boot.
             ConfigureBootSource(_)
             | ConfigureLogger(_)
@@ -902,52 +932,57 @@ impl RuntimeApiController {
     ///  - path of the host file backing the emulated block device, update the disk image on the
     ///    device and its virtio configuration
     ///  - rate limiter configuration.
-    fn update_block_device(
+    async fn update_block_device(
         &mut self,
         new_cfg: BlockDeviceUpdateConfig,
     ) -> Result<VmmData, VmmActionError> {
-        let mut vmm = self.vmm.lock().expect("Poisoned lock");
-
         // vhost-user-block updates
         if new_cfg.path_on_host.is_none() && new_cfg.rate_limiter.is_none() {
-            vmm.update_vhost_user_block_config(&new_cfg.drive_id)
-                .map_err(DriveError::DeviceUpdate)?;
+            self.with_device::<Block, _, _>(&new_cfg.drive_id, |block| block.update_config())
+                .await
+                .map_err(VmmActionError::FindDevice)?
+                .map_err(|e| DriveError::DeviceUpdate(e.into()))?;
         }
 
         // virtio-block updates
         if let Some(new_path) = new_cfg.path_on_host {
-            vmm.update_block_device_path(&new_cfg.drive_id, new_path)
-                .map_err(DriveError::DeviceUpdate)?;
+            self.with_device::<Block, _, _>(&new_cfg.drive_id, |block| {
+                block.update_disk_image(new_path)
+            })
+            .await
+            .map_err(VmmActionError::FindDevice)?
+            .map_err(|e| DriveError::DeviceUpdate(e.into()))?;
         }
         if new_cfg.rate_limiter.is_some() {
-            vmm.update_block_rate_limiter(
-                &new_cfg.drive_id,
-                RateLimiterUpdate::from(new_cfg.rate_limiter).bandwidth,
-                RateLimiterUpdate::from(new_cfg.rate_limiter).ops,
-            )
-            .map_err(DriveError::DeviceUpdate)?;
+            self.with_device::<Block, _, _>(&new_cfg.drive_id, |block| {
+                block.update_rate_limiter(
+                    RateLimiterUpdate::from(new_cfg.rate_limiter).bandwidth,
+                    RateLimiterUpdate::from(new_cfg.rate_limiter).ops,
+                )
+            })
+            .await
+            .map_err(VmmActionError::FindDevice)?
+            .map_err(|e| DriveError::DeviceUpdate(e.into()))?;
         }
         Ok(VmmData::Empty)
     }
 
     /// Updates configuration for an emulated net device as described in `new_cfg`.
-    fn update_net_rate_limiters(
+    async fn update_net_rate_limiters(
         &mut self,
         new_cfg: NetworkInterfaceUpdateConfig,
     ) -> Result<VmmData, VmmActionError> {
-        self.vmm
-            .lock()
-            .expect("Poisoned lock")
-            .update_net_rate_limiters(
-                &new_cfg.iface_id,
+        self.with_device::<Net, _, _>(&new_cfg.iface_id, |net| {
+            net.patch_rate_limiters(
                 RateLimiterUpdate::from(new_cfg.rx_rate_limiter).bandwidth,
                 RateLimiterUpdate::from(new_cfg.rx_rate_limiter).ops,
                 RateLimiterUpdate::from(new_cfg.tx_rate_limiter).bandwidth,
                 RateLimiterUpdate::from(new_cfg.tx_rate_limiter).ops,
             )
-            .map(|()| VmmData::Empty)
-            .map_err(NetworkInterfaceError::DeviceUpdate)
-            .map_err(VmmActionError::NetworkConfig)
+        })
+        .await
+        .map(|()| VmmData::Empty)
+        .map_err(VmmActionError::FindDevice)
     }
 }
 
@@ -972,16 +1007,18 @@ mod tests {
     }
 
     fn preboot_request(request: VmmAction) -> Result<VmmData, VmmActionError> {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let mut vm_resources = VmResources::default();
         let seccomp_filters = BpfThreadMap::new();
         let mut preboot = default_preboot(&mut vm_resources, &seccomp_filters);
-        preboot.handle_preboot_request(request)
+        rt.block_on(preboot.handle_preboot_request(request))
     }
 
     fn preboot_request_with_mmds(
         request: VmmAction,
         mmds: Arc<Mutex<Mmds>>,
     ) -> Result<VmmData, VmmActionError> {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let mut vm_resources = VmResources {
             mmds: Some(mmds),
             mmds_size_limit: HTTP_MAX_PAYLOAD_SIZE,
@@ -989,7 +1026,7 @@ mod tests {
         };
         let seccomp_filters = BpfThreadMap::new();
         let mut preboot = default_preboot(&mut vm_resources, &seccomp_filters);
-        preboot.handle_preboot_request(request)
+        rt.block_on(preboot.handle_preboot_request(request))
     }
 
     #[test]
@@ -1170,9 +1207,10 @@ mod tests {
     }
 
     fn runtime_request(request: VmmAction) -> Result<VmmData, VmmActionError> {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let vmm = Arc::new(Mutex::new(default_vmm()));
         let mut runtime = RuntimeApiController::new(vmm.clone());
-        runtime.handle_request(request)
+        rt.block_on(runtime.handle_request(request))
     }
 
     #[test]

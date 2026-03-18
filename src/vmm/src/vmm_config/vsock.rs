@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::convert::TryFrom;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::devices::virtio::vsock::{Vsock, VsockError, VsockUnixBackend, VsockUnixBackendError};
+use crate::DeviceMutex;
 
-type MutexVsockUnix = Arc<Mutex<Vsock<VsockUnixBackend>>>;
+type MutexVsockUnix = Arc<DeviceMutex<Vsock<VsockUnixBackend>>>;
 
 /// Errors associated with `NetworkInterfaceConfig`.
 #[derive(Debug, derive_more::From, thiserror::Error, displaydoc::Display)]
@@ -42,7 +43,7 @@ struct VsockAndUnixPath {
 
 impl From<&VsockAndUnixPath> for VsockDeviceConfig {
     fn from(vsock: &VsockAndUnixPath) -> Self {
-        let vsock_lock = vsock.vsock.lock().unwrap();
+        let vsock_lock = vsock.vsock.try_lock().expect("device lock");
         VsockDeviceConfig {
             vsock_id: None,
             guest_cid: u32::try_from(vsock_lock.cid()).unwrap(),
@@ -74,11 +75,11 @@ impl VsockBuilder {
     }
 
     /// Inserts an existing vsock device.
-    pub fn set_device(&mut self, device: Arc<Mutex<Vsock<VsockUnixBackend>>>) {
+    pub fn set_device(&mut self, device: Arc<DeviceMutex<Vsock<VsockUnixBackend>>>) {
         self.inner = Some(VsockAndUnixPath {
             uds_path: device
-                .lock()
-                .expect("Poisoned lock")
+                .try_lock().expect("device lock")
+
                 .backend()
                 .host_sock_path()
                 .to_owned(),
@@ -95,7 +96,7 @@ impl VsockBuilder {
         }
         self.inner = Some(VsockAndUnixPath {
             uds_path: cfg.uds_path.clone(),
-            vsock: Arc::new(Mutex::new(Self::create_unixsock_vsock(cfg)?)),
+            vsock: Arc::new(DeviceMutex::new(Self::create_unixsock_vsock(cfg)?)),
         });
         Ok(())
     }
@@ -153,13 +154,13 @@ pub(crate) mod tests {
 
         store.insert(vsock_config.clone()).unwrap();
         let vsock = store.get().unwrap();
-        assert_eq!(vsock.lock().unwrap().id(), VSOCK_DEV_ID);
+        assert_eq!(vsock.try_lock().expect("Poisoned lock").id(), VSOCK_DEV_ID);
 
         let new_cid = vsock_config.guest_cid + 1;
         vsock_config.guest_cid = new_cid;
         store.insert(vsock_config).unwrap();
         let vsock = store.get().unwrap();
-        assert_eq!(vsock.lock().unwrap().cid(), u64::from(new_cid));
+        assert_eq!(vsock.try_lock().expect("Poisoned lock").cid(), u64::from(new_cid));
     }
 
     #[test]
@@ -187,7 +188,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        vsock_builder.set_device(Arc::new(Mutex::new(vsock)));
+        vsock_builder.set_device(Arc::new(DeviceMutex::new(vsock)));
         assert!(vsock_builder.inner.is_some());
         assert_eq!(
             vsock_builder.inner.unwrap().uds_path,

@@ -608,7 +608,8 @@ fn run_without_api(
 ) -> Result<(), RunWithoutApiError> {
     let tokio_rt = vmm::async_event_loop::create_runtime();
 
-    tokio_rt.rt.block_on(async {
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&tokio_rt.rt, async {
         let vmm = build_microvm_from_json(
             seccomp_filters, config_json.unwrap(), instance_info,
             bool_timer_enabled, pci_enabled, mmds_size_limit, metadata_json,

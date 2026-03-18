@@ -1,11 +1,12 @@
 // Copyright 2025 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::devices::virtio::pmem::device::{Pmem, PmemError};
+use crate::DeviceMutex;
 
 /// Errors associated wit the operations allowed on a pmem device
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -40,7 +41,7 @@ pub struct PmemConfig {
 #[derive(Debug, Default)]
 pub struct PmemBuilder {
     /// The list of pmem devices
-    pub devices: Vec<Arc<Mutex<Pmem>>>,
+    pub devices: Vec<Arc<DeviceMutex<Pmem>>>,
 }
 
 impl PmemBuilder {
@@ -48,7 +49,7 @@ impl PmemBuilder {
     pub fn has_root_device(&self) -> bool {
         self.devices
             .iter()
-            .any(|d| d.lock().unwrap().config.root_device)
+            .any(|d| d.try_lock().expect("device lock").config.root_device)
     }
 
     /// Build a device from the config
@@ -63,23 +64,23 @@ impl PmemBuilder {
         let position = self
             .devices
             .iter()
-            .position(|d| d.lock().unwrap().config.id == config.id);
+            .position(|d| d.try_lock().expect("device lock").config.id == config.id);
         if let Some(index) = position {
-            if !self.devices[index].lock().unwrap().config.root_device
+            if !self.devices[index].try_lock().expect("device lock").config.root_device
                 && config.root_device
                 && self.has_root_device()
             {
                 return Err(PmemConfigError::RootPmemDeviceAlreadyExist);
             }
             let pmem = Pmem::new(config)?;
-            let pmem = Arc::new(Mutex::new(pmem));
+            let pmem = Arc::new(DeviceMutex::new(pmem));
             self.devices[index] = pmem;
         } else {
             if config.root_device && self.has_root_device() {
                 return Err(PmemConfigError::RootPmemDeviceAlreadyExist);
             }
             let pmem = Pmem::new(config)?;
-            let pmem = Arc::new(Mutex::new(pmem));
+            let pmem = Arc::new(DeviceMutex::new(pmem));
             self.devices.push(pmem);
         }
         Ok(())
@@ -88,7 +89,7 @@ impl PmemBuilder {
     /// Adds an existing pmem device in the builder. This function should
     /// only be used during snapshot restoration process and should add
     /// devices in the same order as they were in the original VM.
-    pub fn add_device(&mut self, device: Arc<Mutex<Pmem>>) {
+    pub fn add_device(&mut self, device: Arc<DeviceMutex<Pmem>>) {
         self.devices.push(device);
     }
 
@@ -96,7 +97,7 @@ impl PmemBuilder {
     pub fn configs(&self) -> Vec<PmemConfig> {
         self.devices
             .iter()
-            .map(|b| b.lock().unwrap().config.clone())
+            .map(|b| b.try_lock().expect("device lock").config.clone())
             .collect()
     }
 }

@@ -3,7 +3,7 @@
 
 use std::convert::TryInto;
 use std::ops::Deref;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -12,6 +12,7 @@ use crate::VmmError;
 use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::net::{Net, TapError};
 use crate::utils::net::mac::MacAddr;
+use crate::DeviceMutex;
 
 /// This struct represents the strongly typed equivalent of the json body from net iface
 /// related requests.
@@ -77,7 +78,7 @@ pub enum NetworkInterfaceError {
 /// Builder for a list of network devices.
 #[derive(Debug, Default)]
 pub struct NetBuilder {
-    net_devices: Vec<Arc<Mutex<Net>>>,
+    net_devices: Vec<Arc<DeviceMutex<Net>>>,
 }
 
 impl NetBuilder {
@@ -90,12 +91,12 @@ impl NetBuilder {
     }
 
     /// Returns a immutable iterator over the network devices.
-    pub fn iter(&self) -> ::std::slice::Iter<'_, Arc<Mutex<Net>>> {
+    pub fn iter(&self) -> ::std::slice::Iter<'_, Arc<DeviceMutex<Net>>> {
         self.net_devices.iter()
     }
 
     /// Adds an existing network device in the builder.
-    pub fn add_device(&mut self, device: Arc<Mutex<Net>>) {
+    pub fn add_device(&mut self, device: Arc<DeviceMutex<Net>>) {
         self.net_devices.push(device);
     }
 
@@ -104,10 +105,10 @@ impl NetBuilder {
     pub fn build(
         &mut self,
         netif_config: NetworkInterfaceConfig,
-    ) -> Result<Arc<Mutex<Net>>, NetworkInterfaceError> {
+    ) -> Result<Arc<DeviceMutex<Net>>, NetworkInterfaceError> {
         if let Some(ref mac_address) = netif_config.guest_mac {
-            let mac_conflict = |net: &Arc<Mutex<Net>>| {
-                let net = net.lock().expect("Poisoned lock");
+            let mac_conflict = |net: &Arc<DeviceMutex<Net>>| {
+                let net = net.try_lock().expect("device lock");
                 // Check if another net dev has same MAC.
                 Some(mac_address) == net.guest_mac() && netif_config.iface_id != net.id()
             };
@@ -125,13 +126,13 @@ impl NetBuilder {
         if let Some(index) = self
             .net_devices
             .iter()
-            .position(|net| net.lock().expect("Poisoned lock").id() == netif_config.iface_id)
+            .position(|net| net.try_lock().expect("device lock").id() == netif_config.iface_id)
         {
             self.net_devices.swap_remove(index);
         }
 
         // Add new device.
-        let net = Arc::new(Mutex::new(Self::create_net(netif_config)?));
+        let net = Arc::new(DeviceMutex::new(Self::create_net(netif_config)?));
         self.net_devices.push(net.clone());
 
         Ok(net)
@@ -165,7 +166,7 @@ impl NetBuilder {
     pub fn configs(&self) -> Vec<NetworkInterfaceConfig> {
         let mut ret = vec![];
         for net in &self.net_devices {
-            ret.push(NetworkInterfaceConfig::from(net.lock().unwrap().deref()));
+            ret.push(NetworkInterfaceConfig::from(net.try_lock().expect("device lock").deref()));
         }
         ret
     }
@@ -337,14 +338,14 @@ mod tests {
         )
         .unwrap();
 
-        net_builder.add_device(Arc::new(Mutex::new(net)));
+        net_builder.add_device(Arc::new(DeviceMutex::new(net)));
         assert_eq!(net_builder.net_devices.len(), 1);
         assert_eq!(
             net_builder
                 .net_devices
                 .pop()
                 .unwrap()
-                .lock()
+                .try_lock()
                 .unwrap()
                 .deref()
                 .id(),
