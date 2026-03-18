@@ -150,13 +150,13 @@ impl MsixConfig {
     }
 
     /// Create the state object for serializing MSI-X vectors
-    pub fn state(&self) -> MsixConfigState {
+    pub async fn state(&self) -> MsixConfigState {
         MsixConfigState {
             table_entries: self.table_entries.clone(),
             pba_entries: self.pba_entries.clone(),
             masked: self.masked,
             enabled: self.enabled,
-            vectors: self.vectors.save(),
+            vectors: self.vectors.save().await,
         }
     }
 

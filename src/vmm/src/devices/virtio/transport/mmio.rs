@@ -7,7 +7,7 @@
 
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Barrier, Mutex, MutexGuard};
+use std::sync::{Arc, Barrier};
 
 use vmm_sys_util::eventfd::EventFd;
 
@@ -20,6 +20,7 @@ use crate::utils::byte_order;
 use crate::vstate::bus::BusDevice;
 use crate::vstate::interrupts::InterruptError;
 use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
+use crate::DeviceMutex;
 
 // TODO crosvm uses 0 here, but IIRC virtio specified some other vendor id that should be used
 const VENDOR_ID: u32 = 0;
@@ -51,7 +52,7 @@ const MMIO_VERSION: u32 = 2;
 /// and inner virtio device.
 #[derive(Debug, Clone)]
 pub struct MmioTransport {
-    device: Arc<Mutex<dyn VirtioDevice>>,
+    device: Arc<DeviceMutex<dyn VirtioDevice>>,
     // The register where feature bits are stored.
     pub(crate) features_select: u32,
     // The register where features page is selected.
@@ -69,7 +70,7 @@ impl MmioTransport {
     pub fn new(
         mem: GuestMemoryMmap,
         interrupt: Arc<IrqTrigger>,
-        device: Arc<Mutex<dyn VirtioDevice>>,
+        device: Arc<DeviceMutex<dyn VirtioDevice>>,
         is_vhost_user: bool,
     ) -> MmioTransport {
         MmioTransport {
@@ -86,12 +87,14 @@ impl MmioTransport {
     }
 
     /// Gets the encapsulated locked VirtioDevice.
-    pub fn locked_device(&self) -> MutexGuard<'_, dyn VirtioDevice + 'static> {
-        self.device.lock().expect("Poisoned lock")
+    pub fn locked_device(&self) -> tokio::sync::MutexGuard<'_, dyn VirtioDevice + 'static> {
+        // try_lock first (works in any context, succeeds when uncontended).
+        // Fall back to blocking_lock for vCPU threads where contention is possible.
+        self.device.try_lock().unwrap_or_else(|_| self.device.blocking_lock())
     }
 
     /// Gets the encapsulated VirtioDevice.
-    pub fn device(&self) -> Arc<Mutex<dyn VirtioDevice>> {
+    pub fn device(&self) -> Arc<DeviceMutex<dyn VirtioDevice>> {
         self.device.clone()
     }
 
@@ -181,7 +184,8 @@ impl MmioTransport {
             }
             DRIVER_OK if self.device_status == (ACKNOWLEDGE | DRIVER | FEATURES_OK) => {
                 self.device_status = status;
-                let mut locked_device = self.device.lock().expect("Poisoned lock");
+                let mut locked_device = self.device.try_lock()
+                    .unwrap_or_else(|_| self.device.blocking_lock());
                 let device_activated = locked_device.is_activated();
                 if !device_activated {
                     // temporary variable needed for borrow checker
@@ -204,7 +208,8 @@ impl MmioTransport {
             }
             _ if status == 0 => {
                 {
-                    let mut locked_device = self.device.lock().expect("Poisoned lock");
+                    let mut locked_device = self.device.try_lock()
+                        .unwrap_or_else(|_| self.device.blocking_lock());
                     if locked_device.is_activated() {
                         let mut device_status = self.device_status;
                         let reset_result = locked_device.reset();
@@ -609,7 +614,12 @@ pub(crate) mod tests {
         let mut dummy = DummyDevice::new();
         // Validate reset is no-op.
         assert!(dummy.reset().is_none());
-        let mut d = MmioTransport::new(m, interrupt, Arc::new(Mutex::new(dummy)), false);
+        let mut d = MmioTransport::new(
+            m,
+            interrupt,
+            Arc::new(crate::DeviceMutex::new(dummy)) as Arc<crate::DeviceMutex<dyn VirtioDevice>>,
+            false,
+        );
 
         // We just make sure here that the implementation of a mmio device behaves as we expect,
         // given a known virtio device implementation (the dummy device).
@@ -638,7 +648,8 @@ pub(crate) mod tests {
         let mut d = MmioTransport::new(
             m,
             interrupt,
-            Arc::new(Mutex::new(DummyDevice::new())),
+            Arc::new(crate::DeviceMutex::new(DummyDevice::new()))
+                as Arc<crate::DeviceMutex<dyn VirtioDevice>>,
             false,
         );
 
@@ -734,8 +745,13 @@ pub(crate) mod tests {
     fn test_bus_device_write() {
         let m = single_region_mem(0x1000);
         let interrupt = Arc::new(IrqTrigger::new());
-        let dummy_dev = Arc::new(Mutex::new(DummyDevice::new()));
-        let mut d = MmioTransport::new(m, interrupt, dummy_dev.clone(), false);
+        let dummy_dev = Arc::new(crate::DeviceMutex::new(DummyDevice::new()));
+        let mut d = MmioTransport::new(
+            m,
+            interrupt,
+            dummy_dev.clone() as Arc<crate::DeviceMutex<dyn VirtioDevice>>,
+            false,
+        );
         let mut buf = vec![0; 5];
         write_le_u32(&mut buf[..4], 1);
 
@@ -787,7 +803,7 @@ pub(crate) mod tests {
         write_le_u32(&mut buf[..], 0x124);
 
         // Set the device available features in order to make acknowledging possible.
-        dummy_dev.lock().unwrap().set_avail_features(0x124);
+        dummy_dev.blocking_lock().set_avail_features(0x124);
         d.write(0x0, 0x20, &buf[..]);
         assert_eq!(d.locked_device().acked_features(), 0x124);
 
@@ -900,7 +916,8 @@ pub(crate) mod tests {
         let mut d = MmioTransport::new(
             m,
             interrupt,
-            Arc::new(Mutex::new(DummyDevice::new())),
+            Arc::new(crate::DeviceMutex::new(DummyDevice::new()))
+                as Arc<crate::DeviceMutex<dyn VirtioDevice>>,
             false,
         );
 
@@ -984,7 +1001,12 @@ pub(crate) mod tests {
             activate_should_error: true,
             ..DummyDevice::new()
         };
-        let mut d = MmioTransport::new(m, interrupt, Arc::new(Mutex::new(device)), false);
+        let mut d = MmioTransport::new(
+            m,
+            interrupt,
+            Arc::new(crate::DeviceMutex::new(device)) as Arc<crate::DeviceMutex<dyn VirtioDevice>>,
+            false,
+        );
 
         set_device_status(&mut d, device_status::ACKNOWLEDGE);
         set_device_status(&mut d, device_status::ACKNOWLEDGE | device_status::DRIVER);
@@ -1076,7 +1098,8 @@ pub(crate) mod tests {
         let mut d = MmioTransport::new(
             m,
             interrupt,
-            Arc::new(Mutex::new(DummyDevice::new())),
+            Arc::new(crate::DeviceMutex::new(DummyDevice::new()))
+                as Arc<crate::DeviceMutex<dyn VirtioDevice>>,
             false,
         );
         let mut buf = [0; 4];

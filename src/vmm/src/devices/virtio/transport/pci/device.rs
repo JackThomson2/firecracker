@@ -45,6 +45,7 @@ use crate::vstate::bus::BusDevice;
 use crate::vstate::interrupts::{InterruptError, MsixVectorGroup};
 use crate::vstate::memory::GuestMemoryMmap;
 use crate::vstate::resources::ResourceAllocator;
+use crate::DeviceMutex;
 
 const DEVICE_INIT: u8 = 0x00;
 const DEVICE_ACKNOWLEDGE: u8 = 0x01;
@@ -270,7 +271,7 @@ pub struct VirtioPciDevice {
     common_config: VirtioPciCommonConfig,
 
     // Virtio device reference and status
-    device: Arc<Mutex<dyn VirtioDevice>>,
+    device: Arc<DeviceMutex<dyn VirtioDevice>>,
     device_activated: Arc<AtomicBool>,
 
     // PCI interrupts.
@@ -338,9 +339,6 @@ impl VirtioPciDevice {
     /// known state, the BARs are already created with the right content, therefore we don't need
     /// to go through this codepath.
     pub fn allocate_bars(&mut self, mmio64_allocator: &mut AddressAllocator) {
-        let device_clone = self.device.clone();
-        let device = device_clone.lock().unwrap();
-
         // Allocate the virtio-pci capability BAR.
         // See http://docs.oasis-open.org/virtio/virtio/v1.0/cs04/virtio-v1.0-cs04.html#x1-740004
         let virtio_pci_bar_addr = mmio64_allocator
@@ -367,18 +365,18 @@ impl VirtioPciDevice {
     pub fn new(
         id: String,
         memory: GuestMemoryMmap,
-        device: Arc<Mutex<dyn VirtioDevice>>,
+        device: Arc<DeviceMutex<dyn VirtioDevice>>,
         msix_vectors: Arc<MsixVectorGroup>,
         pci_device_bdf: u32,
     ) -> Result<Self, VirtioPciDeviceError> {
-        let num_queues = device.lock().expect("Poisoned lock").queues().len();
+        let num_queues = device.try_lock().expect("uncontended during setup").queues().len();
 
         let msix_config = Arc::new(Mutex::new(MsixConfig::new(
             msix_vectors.clone(),
             pci_device_bdf,
         )));
         let pci_config = Self::pci_configuration(
-            device.lock().expect("Poisoned lock").device_type(),
+            device.try_lock().expect("uncontended during setup").device_type(),
             &msix_config,
         );
 
@@ -417,7 +415,7 @@ impl VirtioPciDevice {
     pub fn new_from_state(
         id: String,
         vm: &Arc<Vm>,
-        device: Arc<Mutex<dyn VirtioDevice>>,
+        device: Arc<DeviceMutex<dyn VirtioDevice>>,
         state: VirtioPciDeviceState,
     ) -> Result<Self, VirtioPciDeviceError> {
         let msix_config =
@@ -458,8 +456,8 @@ impl VirtioPciDevice {
         if state.device_activated {
             virtio_pci_device
                 .device
-                .lock()
-                .expect("Poisoned lock")
+                .try_lock().expect("uncontended during setup")
+
                 .activate(
                     virtio_pci_device.memory.clone(),
                     virtio_pci_device.virtio_interrupt.as_ref().unwrap().clone(),
@@ -594,7 +592,7 @@ impl VirtioPciDevice {
         }
     }
 
-    pub fn virtio_device(&self) -> Arc<Mutex<dyn VirtioDevice>> {
+    pub fn virtio_device(&self) -> Arc<DeviceMutex<dyn VirtioDevice>> {
         self.device.clone()
     }
 
@@ -607,8 +605,8 @@ impl VirtioPciDevice {
         let bar_addr = self.config_bar_addr();
         for (i, queue_evt) in self
             .device
-            .lock()
-            .expect("Poisoned lock")
+            .try_lock().expect("uncontended during setup")
+
             .queue_events()
             .iter()
             .enumerate()
@@ -621,7 +619,7 @@ impl VirtioPciDevice {
         Ok(())
     }
 
-    pub fn state(&self) -> VirtioPciDeviceState {
+    pub async fn state(&self) -> VirtioPciDeviceState {
         VirtioPciDeviceState {
             pci_device_bdf: self.pci_device_bdf,
             device_activated: self.device_activated.load(Ordering::Acquire),
@@ -636,7 +634,8 @@ impl VirtioPciDevice {
                 .msix_config
                 .lock()
                 .expect("Poisoned lock")
-                .state(),
+                .state()
+                .await,
             bar_address: self.bar_address,
         }
     }
@@ -691,7 +690,7 @@ impl VirtioInterrupt for VirtioInterruptMsix {
             return Ok(());
         }
 
-        let config = &mut self.msix_config.lock().unwrap();
+        let config = &mut self.msix_config.lock().expect("Poisoned lock");
         let entry = &config.table_entries[vector as usize];
         // In case the vector control register associated with the entry
         // has its first bit set, this means the vector is masked and the
@@ -812,7 +811,7 @@ impl PciDevice for VirtioPciDevice {
             o if (DEVICE_CONFIG_BAR_OFFSET..DEVICE_CONFIG_BAR_OFFSET + DEVICE_CONFIG_SIZE)
                 .contains(&o) =>
             {
-                let device = self.device.lock().unwrap();
+                let device = self.device.blocking_lock();
                 device.read_config(o - DEVICE_CONFIG_BAR_OFFSET, data);
             }
             o if (NOTIFICATION_BAR_OFFSET..NOTIFICATION_BAR_OFFSET + NOTIFICATION_SIZE)
@@ -856,7 +855,7 @@ impl PciDevice for VirtioPciDevice {
             o if (DEVICE_CONFIG_BAR_OFFSET..DEVICE_CONFIG_BAR_OFFSET + DEVICE_CONFIG_SIZE)
                 .contains(&o) =>
             {
-                let mut device = self.device.lock().unwrap();
+                let mut device = self.device.blocking_lock();
                 device.write_config(o - DEVICE_CONFIG_BAR_OFFSET, data);
             }
             o if (NOTIFICATION_BAR_OFFSET..NOTIFICATION_BAR_OFFSET + NOTIFICATION_SIZE)
@@ -890,10 +889,8 @@ impl PciDevice for VirtioPciDevice {
         if self.needs_activation() {
             debug!("Activating device");
             let interrupt = Arc::clone(self.virtio_interrupt.as_ref().unwrap());
-            match self
-                .virtio_device()
-                .lock()
-                .unwrap()
+            match self.device.blocking_lock()
+
                 .activate(self.memory.clone(), interrupt.clone())
             {
                 Ok(()) => self.device_activated.store(true, Ordering::SeqCst),
@@ -909,7 +906,7 @@ impl PciDevice for VirtioPciDevice {
 
         // Device has been reset by the driver
         if self.device_activated.load(Ordering::SeqCst) && self.is_driver_init() {
-            let mut device = self.device.lock().unwrap();
+            let mut device = self.device.blocking_lock();
             let reset_result = device.reset();
             match reset_result {
                 Some(_) => {
@@ -919,9 +916,8 @@ impl PciDevice for VirtioPciDevice {
 
                     // Reset queue readiness (changes queue_enable), queue sizes
                     // and selected_queue as per spec for reset
-                    self.virtio_device()
-                        .lock()
-                        .unwrap()
+                    self.device.blocking_lock()
+
                         .queues_mut()
                         .iter_mut()
                         .for_each(Queue::reset);
@@ -979,7 +975,7 @@ mod tests {
     fn create_vmm_with_virtio_pci_device() -> Vmm {
         let mut vmm = default_vmm();
         vmm.device_manager.enable_pci(&vmm.vm);
-        let entropy = Arc::new(Mutex::new(Entropy::new(RateLimiter::default()).unwrap()));
+        let entropy: Arc<crate::DeviceMutex<Entropy>> = Arc::new(crate::DeviceMutex::new(Entropy::new(RateLimiter::default()).unwrap()));
         vmm.device_manager
             .attach_virtio_device(
                 &vmm.vm,
@@ -1004,7 +1000,7 @@ mod tests {
     fn test_pci_device_config() {
         let mut vmm = create_vmm_with_virtio_pci_device();
         let device = get_virtio_device(&vmm);
-        let mut locked_virtio_pci_device = device.lock().unwrap();
+        let mut locked_virtio_pci_device = device.lock().expect("Poisoned lock");
 
         // For more information for the values we are checking here look into the VirtIO spec here:
         // https://docs.oasis-open.org/virtio/virtio/v1.1/csprd01/virtio-v1.1-csprd01.html#x1-1220007
@@ -1105,7 +1101,7 @@ mod tests {
     fn test_reading_bars() {
         let mut vmm = create_vmm_with_virtio_pci_device();
         let device = get_virtio_device(&vmm);
-        let mut locked_virtio_pci_device = device.lock().unwrap();
+        let mut locked_virtio_pci_device = device.lock().expect("Poisoned lock");
 
         // According to OSdev wiki (https://wiki.osdev.org/PCI#Configuration_Space):
         //
@@ -1241,7 +1237,7 @@ mod tests {
     fn test_capabilities() {
         let mut vmm = create_vmm_with_virtio_pci_device();
         let device = get_virtio_device(&vmm);
-        let mut locked_virtio_pci_device = device.lock().unwrap();
+        let mut locked_virtio_pci_device = device.lock().expect("Poisoned lock");
 
         // VirtIO devices need to expose a set of mandatory capabilities:
         // * Common configuration
@@ -1368,7 +1364,7 @@ mod tests {
     fn test_pci_configuration_cap() {
         let mut vmm = create_vmm_with_virtio_pci_device();
         let device = get_virtio_device(&vmm);
-        let mut locked_virtio_pci_device = device.lock().unwrap();
+        let mut locked_virtio_pci_device = device.lock().expect("Poisoned lock");
 
         // Let's read the number of queues of the entropy device
         // That information is located at offset 0x12 past the BAR region belonging to the common
@@ -1432,7 +1428,7 @@ mod tests {
     fn test_isr_capability() {
         let mut vmm = create_vmm_with_virtio_pci_device();
         let device = get_virtio_device(&vmm);
-        let mut locked_virtio_pci_device = device.lock().unwrap();
+        let mut locked_virtio_pci_device = device.lock().expect("Poisoned lock");
 
         // We don't support legacy interrupts so reads to ISR BAR should always return 0s and
         // writes to it should not have any effect
@@ -1445,7 +1441,7 @@ mod tests {
     fn test_notification_capability() {
         let mut vmm = create_vmm_with_virtio_pci_device();
         let device = get_virtio_device(&vmm);
-        let mut locked_virtio_pci_device = device.lock().unwrap();
+        let mut locked_virtio_pci_device = device.lock().expect("Poisoned lock");
 
         let notification_cap_offset = (capabilities_start(&mut locked_virtio_pci_device) as usize
             + 3 * (size_of::<VirtioPciCap>() + 2))
@@ -1547,7 +1543,7 @@ mod tests {
     fn test_device_initialization() {
         let mut vmm = create_vmm_with_virtio_pci_device();
         let device = get_virtio_device(&vmm);
-        let mut locked_virtio_pci_device = device.lock().unwrap();
+        let mut locked_virtio_pci_device = device.lock().expect("Poisoned lock");
 
         assert!(locked_virtio_pci_device.is_driver_init());
         assert!(!locked_virtio_pci_device.is_driver_ready());

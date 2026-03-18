@@ -137,7 +137,7 @@ impl<'a> Persist<'a> for VmGenId {
     type ConstructorArgs = ();
     type Error = VmGenIdError;
 
-    fn save(&self) -> Self::State {
+    async fn save(&self) -> Self::State {
         VMGenIDState {
             gsi: self.gsi,
             addr: self.guest_address.0,

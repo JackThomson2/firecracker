@@ -5,7 +5,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
-use std::convert::Infallible;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -47,6 +46,7 @@ use crate::vmm_config::mmds::MmdsConfigError;
 use crate::vstate::bus::BusError;
 use crate::vstate::memory::GuestMemoryMmap;
 use crate::{EmulateSerialInitError, Vm};
+use crate::DeviceMutex;
 
 /// ACPI device manager.
 pub mod acpi;
@@ -190,7 +190,7 @@ impl DeviceManager {
         &mut self,
         vm: &Vm,
         id: String,
-        device: Arc<Mutex<T>>,
+        device: Arc<DeviceMutex<T>>,
         cmdline: &mut Cmdline,
         is_vhost_user: bool,
     ) -> Result<(), AttachDeviceError> {
@@ -209,7 +209,7 @@ impl DeviceManager {
         &mut self,
         vm: &Arc<Vm>,
         id: String,
-        device: Arc<Mutex<T>>,
+        device: Arc<DeviceMutex<T>>,
         cmdline: &mut Cmdline,
         is_vhost_user: bool,
     ) -> Result<(), AttachDeviceError> {
@@ -287,11 +287,11 @@ impl DeviceManager {
         let _: Result<(), MmioError> =
             self.mmio_devices
                 .for_each_virtio_mmio_device(|_, _, device| {
-                    let mmio_transport_locked = device.inner.lock().expect("Poisoned lock");
+                    let mmio_transport_locked = device.inner.try_lock().expect("uncontended");
                     mmio_transport_locked
                         .device()
-                        .lock()
-                        .expect("Poisoned lock")
+                        .try_lock().expect("device lock")
+
                         .kick();
                     Ok(())
                 });
@@ -301,40 +301,34 @@ impl DeviceManager {
                 .lock()
                 .expect("Poisoned lock")
                 .virtio_device()
-                .lock()
-                .expect("Poisoned lock")
+                .try_lock().expect("device lock")
+
                 .kick();
         }
     }
 
-    fn do_mark_virtio_queue_memory_dirty(
-        device: Arc<Mutex<dyn VirtioDevice>>,
+    async fn do_mark_virtio_queue_memory_dirty(
+        device: Arc<DeviceMutex<dyn VirtioDevice>>,
         mem: &GuestMemoryMmap,
     ) {
-        // SAFETY:
-        // This should never fail as we mark pages only if device has already been activated,
-        // and the address validation was already performed on device activation.
-        let mut locked_device = device.lock().expect("Poisoned lock");
+        let mut locked_device = device.lock().await;
         if locked_device.is_activated() {
             locked_device.mark_queue_memory_dirty(mem).unwrap()
         }
     }
 
     /// Mark queue memory dirty for activated VirtIO devices
-    pub fn mark_virtio_queue_memory_dirty(&self, mem: &GuestMemoryMmap) {
+    pub async fn mark_virtio_queue_memory_dirty(&self, mem: &GuestMemoryMmap) {
         // Go through MMIO VirtIO devices
-        let _: Result<(), Infallible> =
-            self.mmio_devices
-                .for_each_virtio_mmio_device(|_, _, device| {
-                    let mmio_transport_locked = device.inner.lock().expect("Poisoned locked");
-                    Self::do_mark_virtio_queue_memory_dirty(mmio_transport_locked.device(), mem);
-                    Ok(())
-                });
+        for (_, device) in &self.mmio_devices.virtio_devices {
+            let mmio_transport_locked = device.inner.lock().await;
+            Self::do_mark_virtio_queue_memory_dirty(mmio_transport_locked.device(), mem).await;
+        }
 
         // Go through PCI VirtIO devices
         for device in self.pci_devices.virtio_devices.values() {
             let virtio_device = device.lock().expect("Poisoned lock").virtio_device();
-            Self::do_mark_virtio_queue_memory_dirty(virtio_device, mem);
+            Self::do_mark_virtio_queue_memory_dirty(virtio_device, mem).await;
         }
     }
 
@@ -343,7 +337,7 @@ impl DeviceManager {
         &self,
         device_type: VirtioDeviceType,
         device_id: &str,
-    ) -> Option<Arc<Mutex<dyn VirtioDevice>>> {
+    ) -> Option<Arc<DeviceMutex<dyn VirtioDevice>>> {
         if self.is_pci_enabled() {
             let pci_device = self.pci_devices.get_virtio_device(device_type, device_id)?;
             Some(
@@ -360,8 +354,8 @@ impl DeviceManager {
             Some(
                 mmio_device
                     .inner
-                    .lock()
-                    .expect("Poisoned lock")
+                    .try_lock()
+                    .expect("uncontended")
                     .device()
                     .clone(),
             )
@@ -369,20 +363,35 @@ impl DeviceManager {
     }
 
     /// Run fn `f()` for the virtio device matching `virtio_type` and `id`.
+    pub async fn with_virtio_device_async<T, F, R>(&self, id: &str, f: F) -> Result<R, FindDeviceError>
+    where
+        T: VirtioDevice + 'static + Debug,
+        F: FnOnce(&mut T) -> R,
+    {
+        let device = self
+            .get_virtio_device(T::const_device_type(), id)
+            .ok_or(FindDeviceError::DeviceNotFound)?;
+        let mut dev = device.lock().await;
+        Ok(f(dev
+            .as_mut_any()
+            .downcast_mut::<T>()
+            .expect("Invalid device for a given device type")))
+    }
+
+    /// Sync version — uses blocking_lock. Only call from non-tokio threads.
     pub fn with_virtio_device<T, F, R>(&self, id: &str, f: F) -> Result<R, FindDeviceError>
     where
         T: VirtioDevice + 'static + Debug,
         F: FnOnce(&mut T) -> R,
     {
-        if let Some(device) = self.get_virtio_device(T::const_device_type(), id) {
-            let mut dev = device.lock().expect("Poisoned lock");
-            Ok(f(dev
-                .as_mut_any()
-                .downcast_mut::<T>()
-                .expect("Invalid device for a given device type")))
-        } else {
-            Err(FindDeviceError::DeviceNotFound)
-        }
+        let device = self
+            .get_virtio_device(T::const_device_type(), id)
+            .ok_or(FindDeviceError::DeviceNotFound)?;
+        let mut dev = device.blocking_lock();
+        Ok(f(dev
+            .as_mut_any()
+            .downcast_mut::<T>()
+            .expect("Invalid device for a given device type")))
     }
 
     /// Run fn `f()` on all virtio devices
@@ -406,19 +415,19 @@ impl DeviceManager {
         }
     }
 
-    /// Collect all virtio devices as (type, id, Arc<Mutex<dyn VirtioDevice>>).
+    /// Collect all virtio devices as (type, id, Arc<DeviceMutex<dyn VirtioDevice>>).
     pub fn collect_virtio_devices(
         &self,
-    ) -> Vec<(VirtioDeviceType, String, Arc<Mutex<dyn VirtioDevice>>)> {
+    ) -> Vec<(VirtioDeviceType, String, Arc<DeviceMutex<dyn VirtioDevice>>)> {
         let mut result = Vec::new();
         if self.is_pci_enabled() {
             for ((dev_type, dev_id), pci_dev) in &self.pci_devices.virtio_devices {
-                let vdev = pci_dev.lock().expect("Poisoned lock").virtio_device().clone();
+                let vdev = pci_dev.lock().unwrap().virtio_device().clone();
                 result.push((*dev_type, dev_id.clone(), vdev));
             }
         } else {
             for ((dev_type, dev_id), mmio_dev) in &self.mmio_devices.virtio_devices {
-                let vdev = mmio_dev.inner.lock().expect("Poisoned lock").device().clone();
+                let vdev = mmio_dev.inner.try_lock().expect("uncontended").device().clone();
                 result.push((*dev_type, dev_id.clone(), vdev));
             }
         }
@@ -427,37 +436,6 @@ impl DeviceManager {
 
     pub fn is_pci_enabled(&self) -> bool {
         self.pci_devices.pci_segment.is_some()
-    }
-
-    /// Replace all MMIO virtio devices on the bus with channel-based proxies.
-    /// Returns the MMIO channel receiver for the async event loop.
-    /// After this call, vCPU MMIO accesses go through the channel instead of
-    /// locking the device mutex directly.
-    pub fn swap_to_mmio_proxies(
-        &self,
-        bus: &crate::vstate::bus::Bus,
-    ) -> tokio::sync::mpsc::Receiver<crate::mmio_proxy::MmioRequest> {
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
-
-        if !self.is_pci_enabled() {
-            for (_, mmio_dev) in &self.mmio_devices.virtio_devices {
-                let addr = mmio_dev.resources.addr;
-                let len = mmio_dev.resources.len;
-
-                // Remove old device from bus
-                let _ = bus.remove(addr, len);
-
-                // Insert proxy that forwards to the event loop
-                let proxy = Arc::new(crate::mmio_proxy::MmioProxy::new(
-                    tx.clone(),
-                    mmio_dev.inner.clone(),
-                ));
-                let _ = bus.insert(proxy, addr, len);
-            }
-        }
-        // TODO: PCI proxy support
-
-        rx
     }
 }
 
@@ -549,11 +527,11 @@ impl<'a> Persist<'a> for DeviceManager {
     type ConstructorArgs = DeviceRestoreArgs<'a>;
     type Error = DeviceManagerPersistError;
 
-    fn save(&self) -> Self::State {
+    async fn save(&self) -> Self::State {
         DevicesState {
-            mmio_state: self.mmio_devices.save(),
-            acpi_state: self.acpi_devices.save(),
-            pci_state: self.pci_devices.save(),
+            mmio_state: self.mmio_devices.save().await,
+            acpi_state: self.acpi_devices.save().await,
+            pci_state: self.pci_devices.save().await,
         }
     }
 
@@ -621,7 +599,7 @@ impl DeviceManager {
         #[cfg(target_arch = "aarch64")]
         {
             if let Some(device) = &self.mmio_devices.serial {
-                let mut device_locked = device.inner.lock().expect("Poisoned lock");
+                let mut device_locked = device.inner.lock().unwrap();
 
                 device_locked
                     .serial

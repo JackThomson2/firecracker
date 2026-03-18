@@ -170,7 +170,7 @@ impl<'a> Persist<'a> for VmClock {
     type ConstructorArgs = ();
     type Error = VmClockError;
 
-    fn save(&self) -> Self::State {
+    async fn save(&self) -> Self::State {
         VmClockState {
             guest_address: self.guest_address.0,
             gsi: self.gsi,
@@ -263,8 +263,8 @@ mod tests {
         assert_eq!(guest_data, vmclock.inner);
     }
 
-    #[test]
-    fn test_device_save_restore() {
+    #[tokio::test]
+    async fn test_device_save_restore() {
         let vmclock = default_vmclock();
         // We're using memory inside the system memory portion of the guest RAM. So we need a
         // memory region that includes it.
@@ -274,7 +274,7 @@ mod tests {
 
         vmclock.activate(&mem).unwrap();
 
-        let state = vmclock.save();
+        let state = vmclock.save().await;
         let mut vmclock_new = VmClock::restore((), &state).unwrap();
         vmclock_new.do_post_restore(&mem);
 

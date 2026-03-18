@@ -26,7 +26,7 @@ impl Persist<'_> for MmdsNetworkStack {
     type ConstructorArgs = Arc<Mutex<Mmds>>;
     type Error = ();
 
-    fn save(&self) -> Self::State {
+    async fn save(&self) -> Self::State {
         let mut mac_addr = [0; MAC_ADDR_LEN as usize];
         mac_addr.copy_from_slice(self.mac_addr.get_bytes());
 
@@ -52,11 +52,11 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn test_persistence() {
+    #[tokio::test]
+    async fn test_persistence() {
         let ns = MmdsNetworkStack::new_with_defaults(None, Arc::new(Mutex::new(Mmds::default())));
 
-        let ns_state = ns.save();
+        let ns_state = ns.save().await;
         let serialized_data = bitcode::serialize(&ns_state).unwrap();
 
         let restored_state = bitcode::deserialize(&serialized_data).unwrap();
