@@ -5,7 +5,7 @@
 
 use std::num::Wrapping;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +17,7 @@ use crate::devices::virtio::queue::Queue;
 use crate::devices::virtio::transport::mmio::MmioTransport;
 use crate::snapshot::Persist;
 use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
+use crate::DeviceMutex;
 
 /// Errors thrown during restoring virtio state.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -71,7 +72,7 @@ impl Persist<'_> for Queue {
     type ConstructorArgs = QueueConstructorArgs;
     type Error = QueueError;
 
-    fn save(&self) -> Self::State {
+    async fn save(&self) -> Self::State {
         QueueState {
             max_size: self.max_size,
             size: self.size,
@@ -130,12 +131,16 @@ pub struct VirtioDeviceState {
 
 impl VirtioDeviceState {
     /// Construct the virtio state of a device.
-    pub fn from_device(device: &dyn VirtioDevice) -> Self {
+    pub async fn from_device(device: &dyn VirtioDevice) -> Self {
+        let mut queues = Vec::with_capacity(device.queues().len());
+        for q in device.queues() {
+            queues.push(q.save().await);
+        }
         VirtioDeviceState {
             device_type: device.device_type(),
             avail_features: device.avail_features(),
             acked_features: device.acked_features(),
-            queues: device.queues().iter().map(Persist::save).collect(),
+            queues,
             activated: device.is_activated(),
         }
     }
@@ -211,7 +216,7 @@ pub struct MmioTransportConstructorArgs {
     /// Interrupt to use for the device
     pub interrupt: Arc<IrqTrigger>,
     /// Device associated with the current MMIO state.
-    pub device: Arc<Mutex<dyn VirtioDevice>>,
+    pub device: Arc<DeviceMutex<dyn VirtioDevice>>,
     /// Is device backed by vhost-user.
     pub is_vhost_user: bool,
 }
@@ -221,7 +226,7 @@ impl Persist<'_> for MmioTransport {
     type ConstructorArgs = MmioTransportConstructorArgs;
     type Error = ();
 
-    fn save(&self) -> Self::State {
+    async fn save(&self) -> Self::State {
         MmioTransportState {
             features_select: self.features_select,
             acked_features_select: self.acked_features_select,
@@ -360,8 +365,8 @@ mod tests {
             .unwrap_err();
     }
 
-    #[test]
-    fn test_queue_persistence() {
+    #[tokio::test]
+    async fn test_queue_persistence() {
         let mem = default_mem();
 
         let mut queue = Queue::new(128);
@@ -369,7 +374,7 @@ mod tests {
         queue.size = queue.max_size;
         queue.initialize(&mem).unwrap();
 
-        let queue_state = queue.save();
+        let queue_state = queue.save().await;
         let serialized_data = bitcode::serialize(&queue_state).unwrap();
 
         let ca = QueueConstructorArgs {
@@ -382,11 +387,11 @@ mod tests {
         assert_eq!(restored_queue, queue);
     }
 
-    #[test]
-    fn test_virtio_device_state_serde() {
+    #[tokio::test]
+    async fn test_virtio_device_state_serde() {
         let dummy = DummyDevice::new();
 
-        let state = VirtioDeviceState::from_device(&dummy);
+        let state = VirtioDeviceState::from_device(&dummy).await;
         let serialized_data = bitcode::serialize(&state).unwrap();
 
         let restored_state: VirtioDeviceState = bitcode::deserialize(&serialized_data).unwrap();
@@ -395,7 +400,7 @@ mod tests {
 
     impl PartialEq for MmioTransport {
         fn eq(&self, other: &MmioTransport) -> bool {
-            let self_dev_type = self.device().lock().unwrap().device_type();
+            let self_dev_type = self.device().try_lock().unwrap().device_type();
             self.acked_features_select == other.acked_features_select &&
                 self.features_select == other.features_select &&
                 self.queue_select == other.queue_select &&
@@ -404,17 +409,17 @@ mod tests {
                 self.interrupt.irq_status.load(Ordering::SeqCst) == other.interrupt.irq_status.load(Ordering::SeqCst) &&
                 // Only checking equality of device type, actual device (de)ser is tested by that
                 // device's tests.
-                self_dev_type == other.device().lock().unwrap().device_type()
+                self_dev_type == other.device().try_lock().unwrap().device_type()
         }
     }
 
-    fn generic_mmiotransport_persistence_test(
+    async fn generic_mmiotransport_persistence_test(
         mmio_transport: MmioTransport,
         interrupt: Arc<IrqTrigger>,
         mem: GuestMemoryMmap,
-        device: Arc<Mutex<dyn VirtioDevice>>,
+        device: Arc<DeviceMutex<dyn VirtioDevice>>,
     ) {
-        let transport_state = mmio_transport.save();
+        let transport_state = mmio_transport.save().await;
         let serialized_data = bitcode::serialize(&transport_state).unwrap();
 
         let restore_args = MmioTransportConstructorArgs {
@@ -434,7 +439,7 @@ mod tests {
         MmioTransport,
         Arc<IrqTrigger>,
         GuestMemoryMmap,
-        Arc<Mutex<VirtioBlock>>,
+        Arc<DeviceMutex<VirtioBlock>>,
     ) {
         let mem = default_mem();
         let interrupt = Arc::new(IrqTrigger::new());
@@ -446,7 +451,7 @@ mod tests {
             f.as_path().to_str().unwrap().to_string(),
             FileEngineType::default(),
         );
-        let block = Arc::new(Mutex::new(block));
+        let block = Arc::new(DeviceMutex::new(block));
         let mmio_transport =
             MmioTransport::new(mem.clone(), interrupt.clone(), block.clone(), false);
 
@@ -457,11 +462,11 @@ mod tests {
         MmioTransport,
         Arc<IrqTrigger>,
         GuestMemoryMmap,
-        Arc<Mutex<Net>>,
+        Arc<DeviceMutex<Net>>,
     ) {
         let mem = default_mem();
         let interrupt = Arc::new(IrqTrigger::new());
-        let net = Arc::new(Mutex::new(default_net()));
+        let net = Arc::new(DeviceMutex::new(default_net()));
         let mmio_transport = MmioTransport::new(mem.clone(), interrupt.clone(), net.clone(), false);
 
         (mmio_transport, interrupt, mem, net)
@@ -471,7 +476,7 @@ mod tests {
         MmioTransport,
         Arc<IrqTrigger>,
         GuestMemoryMmap,
-        Arc<Mutex<Vsock<VsockUnixBackend>>>,
+        Arc<DeviceMutex<Vsock<VsockUnixBackend>>>,
     ) {
         let mem = default_mem();
         let interrupt = Arc::new(IrqTrigger::new());
@@ -483,28 +488,28 @@ mod tests {
         let uds_path = String::from(temp_uds_path.as_path().to_str().unwrap());
         let backend = VsockUnixBackend::new(guest_cid, uds_path).unwrap();
         let vsock = Vsock::new(guest_cid, backend).unwrap();
-        let vsock = Arc::new(Mutex::new(vsock));
+        let vsock = Arc::new(DeviceMutex::new(vsock));
         let mmio_transport =
             MmioTransport::new(mem.clone(), interrupt.clone(), vsock.clone(), false);
 
         (mmio_transport, interrupt, mem, vsock)
     }
 
-    #[test]
-    fn test_block_over_mmiotransport_persistence() {
+    #[tokio::test]
+    async fn test_block_over_mmiotransport_persistence() {
         let (mmio_transport, interrupt, mem, block) = create_default_block();
-        generic_mmiotransport_persistence_test(mmio_transport, interrupt, mem, block);
+        generic_mmiotransport_persistence_test(mmio_transport, interrupt, mem, block).await;
     }
 
-    #[test]
-    fn test_net_over_mmiotransport_persistence() {
+    #[tokio::test]
+    async fn test_net_over_mmiotransport_persistence() {
         let (mmio_transport, interrupt, mem, net) = create_default_net();
-        generic_mmiotransport_persistence_test(mmio_transport, interrupt, mem, net);
+        generic_mmiotransport_persistence_test(mmio_transport, interrupt, mem, net).await;
     }
 
-    #[test]
-    fn test_vsock_over_mmiotransport_persistence() {
+    #[tokio::test]
+    async fn test_vsock_over_mmiotransport_persistence() {
         let (mmio_transport, interrupt, mem, vsock) = default_vsock();
-        generic_mmiotransport_persistence_test(mmio_transport, interrupt, mem, vsock);
+        generic_mmiotransport_persistence_test(mmio_transport, interrupt, mem, vsock).await;
     }
 }

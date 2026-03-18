@@ -182,7 +182,8 @@ pub async fn create_snapshot(
     // do it here is that we don't mark pages as dirty during runtime
     // for queue objects.
     vmm.device_manager
-        .mark_virtio_queue_memory_dirty(vmm.vm.guest_memory());
+        .mark_virtio_queue_memory_dirty(vmm.vm.guest_memory())
+        .await;
 
     Ok(())
 }
@@ -688,10 +689,10 @@ mod tests {
         vmm
     }
 
-    #[test]
-    fn test_microvm_state_snapshot() {
+    #[tokio::test]
+    async fn test_microvm_state_snapshot() {
         let vmm = default_vmm_with_devices();
-        let states = vmm.device_manager.save();
+        let states = vmm.device_manager.save().await;
 
         // Only checking that all devices are saved, actual device state
         // is tested by that device's tests.
@@ -714,7 +715,7 @@ mod tests {
             #[cfg(target_arch = "aarch64")]
             vm_state: vmm.vm.save_state(&mpidrs).unwrap(),
             #[cfg(target_arch = "x86_64")]
-            vm_state: vmm.vm.save_state().unwrap(),
+            vm_state: vmm.vm.save_state().await.unwrap(),
         };
 
         let serialized_data = bitcode::serialize(&microvm_state).unwrap();

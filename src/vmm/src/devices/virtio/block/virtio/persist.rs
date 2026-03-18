@@ -29,6 +29,8 @@ pub enum FileEngineTypeState {
     Sync,
     /// Async File Engine.
     Async,
+    /// Tokio File Engine.
+    Tokio,
 }
 
 impl From<FileEngineType> for FileEngineTypeState {
@@ -36,6 +38,7 @@ impl From<FileEngineType> for FileEngineTypeState {
         match file_engine_type {
             FileEngineType::Sync => FileEngineTypeState::Sync,
             FileEngineType::Async => FileEngineTypeState::Async,
+            FileEngineType::Tokio => FileEngineTypeState::Tokio,
         }
     }
 }
@@ -45,6 +48,7 @@ impl From<FileEngineTypeState> for FileEngineType {
         match file_engine_type_state {
             FileEngineTypeState::Sync => FileEngineType::Sync,
             FileEngineTypeState::Async => FileEngineType::Async,
+            FileEngineTypeState::Tokio => FileEngineType::Tokio,
         }
     }
 }
@@ -67,7 +71,7 @@ impl Persist<'_> for VirtioBlock {
     type ConstructorArgs = BlockConstructorArgs;
     type Error = VirtioBlockError;
 
-    fn save(&self) -> Self::State {
+    async fn save(&self) -> Self::State {
         // Save device state.
         VirtioBlockState {
             id: self.id.clone(),
@@ -75,8 +79,8 @@ impl Persist<'_> for VirtioBlock {
             cache_type: self.cache_type,
             root_device: self.root_device,
             disk_path: self.disk.file_path.clone(),
-            virtio_state: VirtioDeviceState::from_device(self),
-            rate_limiter_state: self.rate_limiter.save(),
+            virtio_state: VirtioDeviceState::from_device(self).await,
+            rate_limiter_state: self.rate_limiter.save().await,
             file_engine_type: FileEngineTypeState::from(self.file_engine_type()),
         }
     }
@@ -147,8 +151,8 @@ mod tests {
     use crate::devices::virtio::device::VirtioDevice;
     use crate::devices::virtio::test_utils::{default_interrupt, default_mem};
 
-    #[test]
-    fn test_cache_semantic_ser() {
+    #[tokio::test]
+    async fn test_cache_semantic_ser() {
         // We create the backing file here so that it exists for the whole lifetime of the test.
         let f = TempFile::new().unwrap();
         f.as_file().set_len(0x1000).unwrap();
@@ -167,7 +171,7 @@ mod tests {
         let block = VirtioBlock::new(config).unwrap();
 
         // Save the block device.
-        let block_state = block.save();
+        let block_state = block.save().await;
         let _serialized_data = bitcode::serialize(&block_state).unwrap();
     }
 
@@ -188,8 +192,8 @@ mod tests {
         assert_eq!(FileEngineTypeState::default(), FileEngineTypeState::Sync);
     }
 
-    #[test]
-    fn test_persistence() {
+    #[tokio::test]
+    async fn test_persistence() {
         // We create the backing file here so that it exists for the whole lifetime of the test.
         let f = TempFile::new().unwrap();
         f.as_file().set_len(0x1000).unwrap();
@@ -209,7 +213,7 @@ mod tests {
         let guest_mem = default_mem();
 
         // Save the block device.
-        let block_state = block.save();
+        let block_state = block.save().await;
         let serialized_data = bitcode::serialize(&block_state).unwrap();
 
         // Restore the block device.

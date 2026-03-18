@@ -42,9 +42,9 @@ impl<'a> Persist<'a> for Pmem {
     type ConstructorArgs = PmemConstructorArgs<'a>;
     type Error = PmemPersistError;
 
-    fn save(&self) -> Self::State {
+    async fn save(&self) -> Self::State {
         PmemState {
-            virtio_state: VirtioDeviceState::from_device(self),
+            virtio_state: VirtioDeviceState::from_device(self).await,
             config_space: self.config_space,
             config: self.config.clone(),
         }
@@ -81,8 +81,8 @@ mod tests {
     use crate::devices::virtio::device::VirtioDevice;
     use crate::devices::virtio::test_utils::default_mem;
 
-    #[test]
-    fn test_persistence() {
+    #[tokio::test]
+    async fn test_persistence() {
         // We create the backing file here so that it exists for the whole lifetime of the test.
         let dummy_file = TempFile::new().unwrap();
         dummy_file.as_file().set_len(0x20_0000);
@@ -99,7 +99,7 @@ mod tests {
         let vm = Vm::new(&kvm).unwrap();
 
         // Save the block device.
-        let pmem_state = pmem.save();
+        let pmem_state = pmem.save().await;
         let serialized_data = bitcode::serialize(&pmem_state).unwrap();
 
         // Restore the block device.

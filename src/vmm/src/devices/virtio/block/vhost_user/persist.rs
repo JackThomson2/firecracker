@@ -30,7 +30,7 @@ impl Persist<'_> for VhostUserBlock {
     type ConstructorArgs = BlockConstructorArgs;
     type Error = VhostUserBlockError;
 
-    fn save(&self) -> Self::State {
+    async fn save(&self) -> Self::State {
         unimplemented!("VhostUserBlock does not support snapshotting yet");
     }
 

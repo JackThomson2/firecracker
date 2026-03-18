@@ -43,10 +43,10 @@ impl Persist<'_> for Entropy {
     type ConstructorArgs = EntropyConstructorArgs;
     type Error = EntropyPersistError;
 
-    fn save(&self) -> Self::State {
+    async fn save(&self) -> Self::State {
         EntropyState {
-            virtio_state: VirtioDeviceState::from_device(self),
-            rate_limiter_state: self.rate_limiter().save(),
+            virtio_state: VirtioDeviceState::from_device(self).await,
+            rate_limiter_state: self.rate_limiter().save().await,
         }
     }
 
@@ -79,11 +79,11 @@ mod tests {
     use crate::devices::virtio::test_utils::default_interrupt;
     use crate::devices::virtio::test_utils::test::create_virtio_mem;
 
-    #[test]
-    fn test_persistence() {
+    #[tokio::test]
+    async fn test_persistence() {
         let entropy = Entropy::new(RateLimiter::default()).unwrap();
 
-        let entropy_state = entropy.save();
+        let entropy_state = entropy.save().await;
         let serialized_data = bitcode::serialize(&entropy_state).unwrap();
 
         let guest_mem = create_virtio_mem();

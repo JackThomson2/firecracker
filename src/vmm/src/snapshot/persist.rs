@@ -16,7 +16,7 @@ where
     type Error;
 
     /// Returns the current state of the component.
-    fn save(&self) -> Self::State;
+    async fn save(&self) -> Self::State;
     /// Constructs a component from a specified state.
     fn restore(
         constructor_args: Self::ConstructorArgs,

@@ -56,9 +56,9 @@ impl Persist<'_> for VirtioMem {
     type ConstructorArgs = VirtioMemConstructorArgs;
     type Error = VirtioMemPersistError;
 
-    fn save(&self) -> Self::State {
+    async fn save(&self) -> Self::State {
         VirtioMemState {
-            virtio_state: VirtioDeviceState::from_device(self),
+            virtio_state: VirtioDeviceState::from_device(self).await,
             addr: self.config.addr,
             region_size: self.config.region_size,
             block_size: self.config.block_size,
@@ -113,10 +113,10 @@ mod tests {
     use crate::devices::virtio::mem::device::test_utils::default_virtio_mem;
     use crate::vstate::vm::tests::setup_vm_with_memory;
 
-    #[test]
-    fn test_save_state() {
+    #[tokio::test]
+    async fn test_save_state() {
         let dev = default_virtio_mem();
-        let state = dev.save();
+        let state = dev.save().await;
 
         assert_eq!(state.addr, dev.config.addr);
         assert_eq!(state.region_size, dev.config.region_size);
@@ -130,11 +130,11 @@ mod tests {
         assert_eq!(state.slot_size, dev.slot_size);
     }
 
-    #[test]
-    fn test_save_restore_state() {
+    #[tokio::test]
+    async fn test_save_restore_state() {
         let mut original_dev = default_virtio_mem();
         original_dev.set_acked_features(original_dev.avail_features());
-        let state = original_dev.save();
+        let state = original_dev.save().await;
 
         // Create a "new" VM for restore
         let (_, vm) = setup_vm_with_memory(0x1000);

@@ -63,7 +63,7 @@ impl Persist<'_> for VsockUnixBackend {
     type ConstructorArgs = VsockUdsConstructorArgs;
     type Error = VsockUnixBackendError;
 
-    fn save(&self) -> Self::State {
+    async fn save(&self) -> Self::State {
         VsockBackendState {
             uds_path: self.host_sock_path.clone(),
             local_port_last: self.local_port_last,
@@ -88,10 +88,10 @@ where
     type ConstructorArgs = VsockConstructorArgs<B>;
     type Error = VsockError;
 
-    fn save(&self) -> Self::State {
+    async fn save(&self) -> Self::State {
         VsockFrontendState {
             cid: self.cid(),
-            virtio_state: VirtioDeviceState::from_device(self),
+            virtio_state: VirtioDeviceState::from_device(self).await,
         }
     }
 
@@ -133,7 +133,7 @@ pub(crate) mod tests {
         type ConstructorArgs = VsockUdsConstructorArgs;
         type Error = VsockUnixBackendError;
 
-        fn save(&self) -> Self::State {
+        async fn save(&self) -> Self::State {
             VsockBackendState {
                 uds_path: "test".to_owned(),
                 local_port_last: 0xdeadbeef,
@@ -145,8 +145,8 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn test_persist_uds_backend() {
+    #[tokio::test]
+    async fn test_persist_uds_backend() {
         let ctx = TestContext::new();
         let device_features = AVAIL_FEATURES;
         let driver_features: u64 = AVAIL_FEATURES | 1 | (1 << 32);
@@ -162,8 +162,8 @@ pub(crate) mod tests {
         // Test serialization
         // Save backend and device state separately.
         let state = VsockState {
-            backend: ctx.device.backend().save(),
-            frontend: ctx.device.save(),
+            backend: ctx.device.backend().save().await,
+            frontend: ctx.device.save().await,
         };
 
         let serialized_data = bitcode::serialize(&state).unwrap();

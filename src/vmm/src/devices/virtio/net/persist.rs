@@ -72,17 +72,60 @@ impl Persist<'_> for Net {
     type ConstructorArgs = NetConstructorArgs;
     type Error = NetPersistError;
 
-    fn save(&self) -> Self::State {
+    async fn save(&self) -> Self::State {
+        if let Some(split) = &self.split_info {
+            // Save from the split RX/TX task state.
+            let mut rx = split.rx.lock().await;
+            let tx = split.tx.lock().await;
+
+            rx.prepare_save();
+
+            let mmds_ns = match &rx.mmds_ns {
+                Some(ns) => {
+                    let ns: std::sync::MutexGuard<'_, MmdsNetworkStack> = ns.lock().unwrap();
+                    Some(ns.save().await)
+                }
+                None => None,
+            };
+
+            // Build queue states from the split tasks' queues.
+            let mut queues = Vec::new();
+            queues.push(rx.rx_queue.save().await);
+            queues.push(tx.tx_queue.save().await);
+
+            return NetState {
+                id: self.id.clone(),
+                tap_if_name: self.iface_name(),
+                rx_rate_limiter_state: rx.rx_rate_limiter.save().await,
+                tx_rate_limiter_state: tx.tx_rate_limiter.save().await,
+                mmds_ns,
+                config_space: NetConfigSpaceState {
+                    guest_mac: tx.guest_mac,
+                },
+                virtio_state: VirtioDeviceState {
+                    device_type: VirtioDeviceType::Net,
+                    avail_features: self.avail_features,
+                    acked_features: self.acked_features,
+                    queues,
+                    activated: true,
+                },
+            };
+        }
+
+        let mmds_ns = match &self.mmds_ns {
+            Some(mmds) => Some(mmds.save().await),
+            None => None,
+        };
         NetState {
             id: self.id.clone(),
             tap_if_name: self.iface_name(),
-            rx_rate_limiter_state: self.rx_rate_limiter.save(),
-            tx_rate_limiter_state: self.tx_rate_limiter.save(),
-            mmds_ns: self.mmds_ns.as_ref().map(|mmds| mmds.save()),
+            rx_rate_limiter_state: self.rx_rate_limiter.save().await,
+            tx_rate_limiter_state: self.tx_rate_limiter.save().await,
+            mmds_ns,
             config_space: NetConfigSpaceState {
                 guest_mac: self.guest_mac,
             },
-            virtio_state: VirtioDeviceState::from_device(self),
+            virtio_state: VirtioDeviceState::from_device(self).await,
         }
     }
 
@@ -139,7 +182,7 @@ mod tests {
     use crate::devices::virtio::net::test_utils::{default_net, default_net_no_mmds};
     use crate::devices::virtio::test_utils::{default_interrupt, default_mem};
 
-    fn validate_save_and_restore(net: Net, mmds_ds: Option<Arc<Mutex<Mmds>>>) {
+    async fn validate_save_and_restore(net: Net, mmds_ds: Option<Arc<Mutex<Mmds>>>) {
         let guest_mem = default_mem();
 
         let id;
@@ -151,7 +194,7 @@ mod tests {
 
         // Create and save the net device.
         {
-            let net_state = net.save();
+            let net_state = net.save().await;
             serialized_data = bitcode::serialize(&net_state).unwrap();
 
             // Save some fields that we want to check later.
@@ -159,7 +202,7 @@ mod tests {
             tap_if_name = net.iface_name();
             has_mmds_ns = net.mmds_ns.is_some();
             allow_mmds_requests = has_mmds_ns && mmds_ds.is_some();
-            virtio_state = VirtioDeviceState::from_device(&net);
+            virtio_state = VirtioDeviceState::from_device(&net).await;
         }
 
         // Drop the initial net device so that we don't get an error when trying to recreate the
@@ -197,19 +240,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_persistence() {
+    #[tokio::test]
+    async fn test_persistence() {
         let mmds = Some(Arc::new(Mutex::new(Mmds::default())));
-        validate_save_and_restore(default_net(), mmds.as_ref().cloned());
-        validate_save_and_restore(default_net_no_mmds(), None);
+        validate_save_and_restore(default_net(), mmds.as_ref().cloned()).await;
+        validate_save_and_restore(default_net_no_mmds(), None).await;
 
         // Check what happens if the MMIODeviceManager gives us the reference to the MMDS
         // data store even if this device does not have mmds ns configured.
         // The restore should be conservative and not configure the mmds ns.
-        validate_save_and_restore(default_net_no_mmds(), mmds);
+        validate_save_and_restore(default_net_no_mmds(), mmds).await;
 
         // Check what happens if the MMIODeviceManager does not give us the reference to the MMDS
         // data store. This will return an error.
-        validate_save_and_restore(default_net(), None);
+        validate_save_and_restore(default_net(), None).await;
     }
 }

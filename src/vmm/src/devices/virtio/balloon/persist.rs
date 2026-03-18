@@ -119,7 +119,7 @@ impl Persist<'_> for Balloon {
     type ConstructorArgs = BalloonConstructorArgs;
     type Error = super::BalloonError;
 
-    fn save(&self) -> Self::State {
+    async fn save(&self) -> Self::State {
         BalloonState {
             stats_polling_interval_s: self.stats_polling_interval_s,
             stats_desc_index: self.stats_desc_index,
@@ -129,7 +129,7 @@ impl Persist<'_> for Balloon {
                 num_pages: self.config_space.num_pages,
                 actual_pages: self.config_space.actual_pages,
             },
-            virtio_state: VirtioDeviceState::from_device(self),
+            virtio_state: VirtioDeviceState::from_device(self).await,
         }
     }
 
@@ -207,14 +207,14 @@ mod tests {
     use crate::devices::virtio::device::VirtioDevice;
     use crate::devices::virtio::test_utils::{default_interrupt, default_mem};
 
-    #[test]
-    fn test_persistence() {
+    #[tokio::test]
+    async fn test_persistence() {
         let guest_mem = default_mem();
 
         // Create and save the balloon device.
         let balloon = Balloon::new(0x42, false, 2, false, false).unwrap();
 
-        let balloon_state = balloon.save();
+        let balloon_state = balloon.save().await;
         let serialized_data = bitcode::serialize(&balloon_state).unwrap();
 
         // Deserialize and restore the balloon device.
