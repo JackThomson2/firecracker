@@ -22,6 +22,7 @@
 
 use std::fmt::Debug;
 use std::ops::Deref;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 
 use log::{error, info, warn};
@@ -405,6 +406,79 @@ where
             self.send_transport_reset_event().unwrap_or_else(|err| {
                 error!("Failed to send reset transport event: {:?}", err);
             });
+        }
+    }
+
+    fn async_fd_tags(&self) -> Vec<(RawFd, u32)> {
+        vec![
+            (self.queue_events[RXQ_INDEX].as_raw_fd(), 1), // RX queue
+            (self.queue_events[TXQ_INDEX].as_raw_fd(), 2), // TX queue
+            (self.queue_events[EVQ_INDEX].as_raw_fd(), 3), // Event queue
+            (self.backend.as_raw_fd(), 4),                  // Backend (muxer)
+        ]
+    }
+
+    fn process_async_event(&mut self, tag: u32) {
+        if !self.is_activated() {
+            return;
+        }
+        // Drain the relevant eventfd (best-effort; EAGAIN just means it was
+        // already consumed by batch processing and the counter is already 0).
+        match tag {
+            1 => {
+                let _ = self.queue_events[RXQ_INDEX].read();
+            }
+            2 => {
+                let _ = self.queue_events[TXQ_INDEX].read();
+            }
+            3 => {
+                let _ = self.queue_events[EVQ_INDEX].read();
+            }
+            4 => {
+                // Handled in the loop below.
+            }
+            _ => {}
+        }
+        // Loop until no more progress is made. This is critical because:
+        // - The muxer's inner epoll may have more events than a single
+        //   notify() can drain (it processes up to 32 at a time).
+        // - AsyncFd uses EPOLLET; if the muxer's epoll fd stays readable
+        //   (undrained events), no new edge event fires and we get stuck.
+        // - TX processing may produce internal muxer RX (e.g. connection
+        //   responses) that don't trigger the backend epoll fd.
+        let mut used_rx = false;
+        let mut used_tx = false;
+        loop {
+            use vmm_sys_util::epoll::EventSet;
+            self.backend.notify(EventSet::IN);
+            let tx = self.process_tx().unwrap_or_else(|e| {
+                error!("vsock: TX error: {e:?}");
+                false
+            });
+            let rx = if self.backend.has_pending_rx() {
+                self.process_rx().unwrap_or_else(|e| {
+                    error!("vsock: RX error: {e:?}");
+                    false
+                })
+            } else {
+                false
+            };
+            used_rx |= rx;
+            used_tx |= tx;
+            if !tx && !rx {
+                break;
+            }
+        }
+        // Signal used queues after processing.
+        let mut queues = Vec::new();
+        if used_rx {
+            queues.push(RXQ_INDEX as u16);
+        }
+        if used_tx {
+            queues.push(TXQ_INDEX as u16);
+        }
+        if !queues.is_empty() {
+            let _ = self.signal_used_queues(&queues);
         }
     }
 }

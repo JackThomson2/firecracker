@@ -971,6 +971,7 @@ impl VirtioDevice for Balloon {
     }
 
     fn process_async_event(&mut self, _tag: u32) {
+
         if self.is_activated() {
             let _ = self.process_virtio_queues();
         }

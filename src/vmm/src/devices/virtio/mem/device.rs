@@ -3,6 +3,7 @@
 
 use std::io;
 use std::ops::{Deref, Range};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
@@ -691,6 +692,22 @@ impl VirtioDevice for VirtioMem {
         if self.is_activated() {
             info!("kick mem {}.", self.id());
             self.process_virtio_queues();
+        }
+    }
+
+    fn async_fd_tags(&self) -> Vec<(RawFd, u32)> {
+        vec![
+            (self.queue_events[MEM_QUEUE].as_raw_fd(), 1), // MEM queue
+        ]
+    }
+
+    fn process_async_event(&mut self, tag: u32) {
+        if !self.is_activated() {
+            return;
+        }
+        match tag {
+            1 => self.process_mem_queue_event(),
+            _ => {}
         }
     }
 }

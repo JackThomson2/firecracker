@@ -317,18 +317,34 @@ impl VirtioDevice for Entropy {
         use std::os::unix::io::AsRawFd;
         vec![
             (self.queue_events()[0].as_raw_fd(), 1), // PROCESS_ENTROPY_QUEUE
-            (self.rate_limiter().as_raw_fd(), 2), // PROCESS_RATE_LIMITER
         ]
     }
 
     fn process_async_event(&mut self, tag: u32) {
+
         if !self.is_activated() {
             return;
         }
         match tag {
             1 => self.process_entropy_queue_event(),
-            2 => self.process_rate_limiter_event(),
             _ => {}
+        }
+    }
+
+    fn rate_limiter_deadline(&self) -> Option<tokio::time::Instant> {
+        self.rate_limiter.blocked_deadline()
+    }
+
+    fn process_rate_limiter_unblock(&mut self) {
+        METRICS.rate_limiter_event_count.inc();
+        match self.rate_limiter.event_handler() {
+            Ok(_) => {
+                self.process_entropy_queue().unwrap();
+            }
+            Err(err) => {
+                error!("entropy: Failed to handle rate-limiter unblock: {err:?}");
+                METRICS.entropy_event_fails.inc();
+            }
         }
     }
 }

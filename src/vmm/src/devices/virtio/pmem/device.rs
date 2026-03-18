@@ -415,6 +415,7 @@ impl VirtioDevice for Pmem {
     }
 
     fn process_async_event(&mut self, _tag: u32) {
+
         if self.is_activated() {
             self.process_queue();
         }

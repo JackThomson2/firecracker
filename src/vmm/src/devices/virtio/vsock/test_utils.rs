@@ -207,11 +207,11 @@ impl EventHandlerContext<'_> {
 
     pub fn signal_txq_event(&mut self) {
         self.device.queue_events[TXQ_INDEX].write(1).unwrap();
-        self.device.handle_txq_event(EventSet::IN);
+        self.device.process_tx().unwrap();
     }
     pub fn signal_rxq_event(&mut self) {
         self.device.queue_events[RXQ_INDEX].write(1).unwrap();
-        self.device.handle_rxq_event(EventSet::IN);
+        self.device.process_rx().unwrap();
     }
 }
 
