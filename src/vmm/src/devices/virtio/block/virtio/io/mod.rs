@@ -3,12 +3,14 @@
 
 pub mod async_io;
 pub mod sync_io;
+pub mod tokio_io;
 
 use std::fmt::Debug;
 use std::fs::File;
 
 pub use self::async_io::{AsyncFileEngine, AsyncIoError};
 pub use self::sync_io::{SyncFileEngine, SyncIoError};
+pub use self::tokio_io::{TokioCompletion, TokioFileEngine, TokioIoError};
 use crate::devices::virtio::block::virtio::PendingRequest;
 use crate::devices::virtio::block::virtio::device::FileEngineType;
 use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
@@ -31,6 +33,8 @@ pub enum BlockIoError {
     Sync(SyncIoError),
     /// Async error: {0}
     Async(AsyncIoError),
+    /// Tokio error: {0}
+    Tokio(TokioIoError),
 }
 
 impl BlockIoError {
@@ -54,6 +58,7 @@ pub enum FileEngine {
     #[allow(unused)]
     Async(AsyncFileEngine),
     Sync(SyncFileEngine),
+    Tokio(TokioFileEngine),
 }
 
 impl FileEngine {
@@ -62,7 +67,13 @@ impl FileEngine {
             FileEngineType::Async => Ok(FileEngine::Async(
                 AsyncFileEngine::from_file(file).map_err(BlockIoError::Async)?,
             )),
-            FileEngineType::Sync => Ok(FileEngine::Sync(SyncFileEngine::from_file(file))),
+            FileEngineType::Sync => Ok(FileEngine::Sync(
+                SyncFileEngine::from_file(file),
+            )),
+            FileEngineType::Tokio => Ok(FileEngine::Tokio(
+                TokioFileEngine::from_file(file)
+                    .map_err(|e| BlockIoError::Tokio(TokioIoError::SyncAll(e)))?,
+            )),
         }
     }
 
@@ -70,6 +81,7 @@ impl FileEngine {
         match self {
             FileEngine::Async(engine) => engine.update_file(file).map_err(BlockIoError::Async)?,
             FileEngine::Sync(engine) => engine.update_file(file),
+            FileEngine::Tokio(engine) => engine.update_file(file),
         };
 
         Ok(())
@@ -80,6 +92,7 @@ impl FileEngine {
         match self {
             FileEngine::Async(engine) => engine.file(),
             FileEngine::Sync(engine) => engine.file(),
+            FileEngine::Tokio(engine) => engine.file(),
         }
     }
 
@@ -104,6 +117,13 @@ impl FileEngine {
                 Err(err) => Err(RequestError {
                     req,
                     error: BlockIoError::Sync(err),
+                }),
+            },
+            FileEngine::Tokio(engine) => match engine.read(offset, mem, addr, count) {
+                Ok(count) => Ok(FileEngineOk::Executed(RequestOk { req, count })),
+                Err(err) => Err(RequestError {
+                    req,
+                    error: BlockIoError::Tokio(err),
                 }),
             },
         }
@@ -132,6 +152,13 @@ impl FileEngine {
                     error: BlockIoError::Sync(err),
                 }),
             },
+            FileEngine::Tokio(engine) => match engine.write(offset, mem, addr, count) {
+                Ok(count) => Ok(FileEngineOk::Executed(RequestOk { req, count })),
+                Err(err) => Err(RequestError {
+                    req,
+                    error: BlockIoError::Tokio(err),
+                }),
+            },
         }
     }
 
@@ -154,13 +181,22 @@ impl FileEngine {
                     error: BlockIoError::Sync(err),
                 }),
             },
+            FileEngine::Tokio(engine) => match engine.flush() {
+                Ok(()) => Ok(FileEngineOk::Executed(RequestOk { req, count: 0 })),
+                Err(err) => Err(RequestError {
+                    req,
+                    error: BlockIoError::Tokio(err),
+                }),
+            },
         }
     }
+
 
     pub fn drain(&mut self, discard: bool) -> Result<(), BlockIoError> {
         match self {
             FileEngine::Async(engine) => engine.drain(discard).map_err(BlockIoError::Async),
             FileEngine::Sync(_engine) => Ok(()),
+            FileEngine::Tokio(_) => Ok(())
         }
     }
 
@@ -170,6 +206,21 @@ impl FileEngine {
                 engine.drain_and_flush(discard).map_err(BlockIoError::Async)
             }
             FileEngine::Sync(engine) => engine.flush().map_err(BlockIoError::Sync),
+            FileEngine::Tokio(engine) => engine.drain_and_flush().map_err(BlockIoError::Tokio),
+        }
+    }
+
+    /// Async version of drain_and_flush for the Tokio engine. Falls back to
+    /// synchronous for Sync/Async engines (which are only used in non-tokio paths).
+    pub async fn async_drain_and_flush(&mut self, discard: bool) -> Result<(), BlockIoError> {
+        match self {
+            FileEngine::Async(engine) => {
+                engine.drain_and_flush(discard).map_err(BlockIoError::Async)
+            }
+            FileEngine::Sync(engine) => engine.flush().map_err(BlockIoError::Sync),
+            FileEngine::Tokio(engine) => {
+                engine.async_drain_and_flush().await.map_err(BlockIoError::Tokio)
+            }
         }
     }
 }

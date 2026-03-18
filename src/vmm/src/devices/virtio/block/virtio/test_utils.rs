@@ -122,6 +122,7 @@ pub fn simulate_queue_and_async_completion_events(b: &mut VirtioBlock, expected_
         FileEngine::Sync(_) => {
             simulate_queue_event(b, Some(expected_irq));
         }
+        FileEngine::Tokio(_) => panic!("Tokio engine not used in tests"),
     }
 }
 

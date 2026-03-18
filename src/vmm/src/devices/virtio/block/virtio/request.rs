@@ -92,7 +92,7 @@ impl Status {
 #[derive(Debug)]
 pub struct PendingRequest {
     r#type: RequestType,
-    data_len: u32,
+    pub(crate) data_len: u32,
     status_addr: GuestAddress,
     desc_idx: u16,
 }
@@ -237,7 +237,7 @@ pub struct Request {
     pub data_len: u32,
     pub status_addr: GuestAddress,
     sector: u64,
-    data_addr: GuestAddress,
+    pub(crate) data_addr: GuestAddress,
 }
 
 impl Request {
@@ -350,11 +350,11 @@ impl Request {
         false
     }
 
-    fn offset(&self) -> u64 {
+    pub(crate) fn offset(&self) -> u64 {
         self.sector << SECTOR_SHIFT
     }
 
-    fn to_pending_request(&self, desc_idx: u16) -> PendingRequest {
+    pub(crate) fn to_pending_request(&self, desc_idx: u16) -> PendingRequest {
         PendingRequest {
             r#type: self.r#type,
             data_len: self.data_len,

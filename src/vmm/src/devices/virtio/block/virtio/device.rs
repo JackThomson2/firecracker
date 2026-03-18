@@ -40,7 +40,7 @@ use crate::rate_limiter::{BucketUpdate, RateLimiter};
 use crate::utils::u64_to_usize;
 use crate::vmm_config::RateLimiterConfig;
 use crate::vmm_config::drive::BlockDeviceConfig;
-use crate::vstate::memory::GuestMemoryMmap;
+use crate::vstate::memory::{Bytes, GuestMemoryMmap};
 
 /// The engine file type, either Sync or Async (through io_uring).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -50,6 +50,8 @@ pub enum FileEngineType {
     /// Use a Sync engine, based on blocking system calls.
     #[default]
     Sync,
+    /// Use a Tokio engine, based on spawn_blocking + pread/pwrite.
+    Tokio,
 }
 
 /// Helper object for setting up all `Block` fields derived from its backing file.
@@ -272,7 +274,7 @@ macro_rules! unwrap_async_file_engine_or_return {
     ($file_engine: expr) => {
         match $file_engine {
             FileEngine::Async(engine) => engine,
-            FileEngine::Sync(_) => {
+            FileEngine::Sync(_) | FileEngine::Tokio(_) => {
                 error!("The block device doesn't use an async IO engine");
                 return;
             }
@@ -372,6 +374,8 @@ impl VirtioBlock {
         }
     }
 
+    /// Async version of process_queue_event for the Tokio file engine.
+    /// Parses requests synchronously, then awaits each I/O operation directly.
     /// Process device virtio queue(s).
     pub fn process_virtio_queues(&mut self) -> Result<(), InvalidAvailIdx> {
         self.process_queue(0)
@@ -468,6 +472,7 @@ impl VirtioBlock {
         Ok(())
     }
 
+
     fn process_async_completion_queue(&mut self) {
         let engine = unwrap_async_file_engine_or_return!(&mut self.disk.file_engine);
 
@@ -520,26 +525,30 @@ impl VirtioBlock {
     }
 
     /// Get the async completion fd, if using async IO engine.
+    /// Get the async completion fd, if using the io_uring async IO engine.
+    /// Tokio engine completions come via mpsc channel, not an fd.
     pub fn async_completion_fd(&self) -> Option<std::os::unix::io::RawFd> {
-        if let super::io::FileEngine::Async(ref engine) = self.disk.file_engine {
-            Some(engine.completion_evt().as_raw_fd())
-        } else {
-            None
+        match &self.disk.file_engine {
+            super::io::FileEngine::Async(engine) => Some(engine.completion_evt().as_raw_fd()),
+            _ => None,
         }
     }
 
     pub fn process_async_completion_event(&mut self) {
-        let engine = unwrap_async_file_engine_or_return!(&mut self.disk.file_engine);
-
-        if let Err(err) = engine.completion_evt().read() {
-            error!("Failed to get async completion event: {:?}", err);
-        } else {
-            self.process_async_completion_queue();
-
-            if self.is_io_engine_throttled {
-                self.is_io_engine_throttled = false;
-                self.process_queue(0).unwrap()
+        match &mut self.disk.file_engine {
+            super::io::FileEngine::Async(engine) => {
+                if let Err(err) = engine.completion_evt().read() {
+                    error!("Failed to get async completion event: {:?}", err);
+                    return;
+                }
+                self.process_async_completion_queue();
             }
+            _ => return,
+        }
+
+        if self.is_io_engine_throttled {
+            self.is_io_engine_throttled = false;
+            self.process_queue(0).unwrap()
         }
     }
 
@@ -569,12 +578,20 @@ impl VirtioBlock {
         match self.disk.file_engine {
             FileEngine::Sync(_) => FileEngineType::Sync,
             FileEngine::Async(_) => FileEngineType::Async,
+            FileEngine::Tokio(_) => FileEngineType::Tokio,
         }
     }
 
     fn drain_and_flush(&mut self, discard: bool) {
         if let Err(err) = self.disk.file_engine.drain_and_flush(discard) {
             error!("Failed to drain ops and flush block data: {:?}", err);
+        }
+    }
+
+    /// Async drain and flush for use in async contexts (e.g. snapshot).
+    pub async fn async_drain_and_flush(&mut self, discard: bool) {
+        if let Err(err) = self.disk.file_engine.async_drain_and_flush(discard).await {
+            error!("Failed to async drain ops and flush block data: {:?}", err);
         }
     }
 
