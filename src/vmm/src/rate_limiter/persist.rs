@@ -4,7 +4,6 @@
 //! Defines the structures needed for saving/restoring a RateLimiter.
 
 use serde::{Deserialize, Serialize};
-use utils::time::TimerFd;
 
 use super::*;
 use crate::snapshot::Persist;
@@ -24,7 +23,7 @@ impl Persist<'_> for TokenBucket {
     type ConstructorArgs = ();
     type Error = io::Error;
 
-    fn save(&self) -> Self::State {
+    async fn save(&self) -> Self::State {
         TokenBucketState {
             size: self.size,
             one_time_burst: self.one_time_burst,
@@ -64,11 +63,16 @@ impl Persist<'_> for RateLimiter {
     type ConstructorArgs = ();
     type Error = io::Error;
 
-    fn save(&self) -> Self::State {
-        RateLimiterState {
-            ops: self.ops.as_ref().map(|ops| ops.save()),
-            bandwidth: self.bandwidth.as_ref().map(|bw| bw.save()),
-        }
+    async fn save(&self) -> Self::State {
+        let ops = match &self.ops {
+            Some(ops) => Some(ops.save().await),
+            None => None,
+        };
+        let bandwidth = match &self.bandwidth {
+            Some(bw) => Some(bw.save().await),
+            None => None,
+        };
+        RateLimiterState { ops, bandwidth }
     }
 
     fn restore(_: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
@@ -83,8 +87,7 @@ impl Persist<'_> for RateLimiter {
             } else {
                 None
             },
-            timer_fd: TimerFd::new(),
-            timer_active: false,
+            blocked_until: None,
         };
 
         Ok(rate_limiter)
@@ -96,26 +99,26 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn test_token_bucket_persistence() {
+    #[tokio::test]
+    async fn test_token_bucket_persistence() {
         let mut tb = TokenBucket::new(1000, 2000, 3000).unwrap();
 
         // Check that TokenBucket restores correctly if untouched.
-        let restored_tb = TokenBucket::restore((), &tb.save()).unwrap();
+        let restored_tb = TokenBucket::restore((), &tb.save().await).unwrap();
         assert!(tb.partial_eq(&restored_tb));
 
         // Check that TokenBucket restores correctly after partially consuming tokens.
         tb.reduce(100);
-        let restored_tb = TokenBucket::restore((), &tb.save()).unwrap();
+        let restored_tb = TokenBucket::restore((), &tb.save().await).unwrap();
         assert!(tb.partial_eq(&restored_tb));
 
         // Check that TokenBucket restores correctly after replenishing tokens.
         tb.force_replenish(100);
-        let restored_tb = TokenBucket::restore((), &tb.save()).unwrap();
+        let restored_tb = TokenBucket::restore((), &tb.save().await).unwrap();
         assert!(tb.partial_eq(&restored_tb));
 
         // Test serialization.
-        let tb_state = tb.save();
+        let tb_state = tb.save().await;
         let serialized_data = bitcode::serialize(&tb_state).unwrap();
 
         let restored_state = bitcode::deserialize(&serialized_data).unwrap();
@@ -123,14 +126,14 @@ mod tests {
         assert!(tb.partial_eq(&restored_tb));
     }
 
-    #[test]
-    fn test_rate_limiter_persistence() {
+    #[tokio::test]
+    async fn test_rate_limiter_persistence() {
         let refill_time = 100_000;
         let mut rate_limiter = RateLimiter::new(100, 0, refill_time, 10, 0, refill_time).unwrap();
 
         // Check that RateLimiter restores correctly if untouched.
         let restored_rate_limiter =
-            RateLimiter::restore((), &rate_limiter.save()).expect("Unable to restore rate limiter");
+            RateLimiter::restore((), &rate_limiter.save().await).expect("Unable to restore rate limiter");
 
         assert!(
             rate_limiter
@@ -144,13 +147,13 @@ mod tests {
                 .unwrap()
                 .partial_eq(restored_rate_limiter.bandwidth().unwrap())
         );
-        assert!(!restored_rate_limiter.timer_fd.is_armed());
+        assert!(!restored_rate_limiter.is_blocked());
 
         // Check that RateLimiter restores correctly after partially consuming tokens.
         rate_limiter.consume(10, TokenType::Bytes);
         rate_limiter.consume(10, TokenType::Ops);
         let restored_rate_limiter =
-            RateLimiter::restore((), &rate_limiter.save()).expect("Unable to restore rate limiter");
+            RateLimiter::restore((), &rate_limiter.save().await).expect("Unable to restore rate limiter");
 
         assert!(
             rate_limiter
@@ -164,12 +167,12 @@ mod tests {
                 .unwrap()
                 .partial_eq(restored_rate_limiter.bandwidth().unwrap())
         );
-        assert!(!restored_rate_limiter.timer_fd.is_armed());
+        assert!(!restored_rate_limiter.is_blocked());
 
         // Check that RateLimiter restores correctly after totally consuming tokens.
         rate_limiter.consume(1000, TokenType::Bytes);
         let restored_rate_limiter =
-            RateLimiter::restore((), &rate_limiter.save()).expect("Unable to restore rate limiter");
+            RateLimiter::restore((), &rate_limiter.save().await).expect("Unable to restore rate limiter");
 
         assert!(
             rate_limiter
@@ -185,7 +188,7 @@ mod tests {
         );
 
         // Test serialization.
-        let rate_limiter_state = rate_limiter.save();
+        let rate_limiter_state = rate_limiter.save().await;
         let serialized_data = bitcode::serialize(&rate_limiter_state).unwrap();
 
         let restored_state = bitcode::deserialize(&serialized_data).unwrap();

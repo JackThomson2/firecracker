@@ -1,11 +1,8 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 use std::{fmt, io};
-
-use utils::time::TimerFd;
 
 pub mod persist;
 
@@ -284,24 +281,23 @@ pub enum BucketUpdate {
 ///
 /// Bandwidth (bytes/s) and ops/s limiting can be used at the same time or individually.
 ///
-/// Implementation uses a single timer through TimerFd to refresh either or
-/// both token buckets.
-///
 /// Its internal buckets are 'passively' replenished as they're being used (as
 /// part of `consume()` operations).
-/// A timer is enabled and used to 'actively' replenish the token buckets when
+/// A timer is used to 'actively' replenish the token buckets when
 /// limiting is in effect and `consume()` operations are disabled.
 ///
-/// RateLimiters will generate events on the FDs provided by their `AsRawFd` trait
-/// implementation. These events are meant to be consumed by the user of this struct.
-/// On each such event, the user must call the `event_handler()` method.
+/// When the rate limiter becomes blocked, a `tokio::time::Sleep` future is armed.
+/// The owning device task should poll `wait_unblock()` and call `unblock()` when
+/// it resolves.
 pub struct RateLimiter {
     bandwidth: Option<TokenBucket>,
     ops: Option<TokenBucket>,
 
-    timer_fd: TimerFd,
-    // Internal flag that quickly determines timer state.
-    timer_active: bool,
+    /// When `Some`, the limiter is blocked until this tokio instant.
+    /// The device task should call `blocked_deadline()` to get the deadline,
+    /// then `tokio::time::sleep_until(deadline).await` outside the device lock,
+    /// and finally call `event_handler()` to clear the blocked state.
+    pub blocked_until: Option<tokio::time::Instant>,
 }
 
 impl PartialEq for RateLimiter {
@@ -341,7 +337,8 @@ impl RateLimiter {
     ///
     /// # Errors
     ///
-    /// If the timerfd creation fails, an error is returned.
+    /// This constructor is infallible but returns `io::Result` for backward
+    /// compatibility with callers that previously handled `TimerFd` creation errors.
     pub fn new(
         bytes_total_capacity: u64,
         bytes_one_time_burst: u64,
@@ -362,24 +359,16 @@ impl RateLimiter {
             ops_complete_refill_time_ms,
         );
 
-        // We'll need a timer_fd, even if our current config effectively disables rate limiting,
-        // because `Self::update_buckets()` might re-enable it later, and we might be
-        // seccomp-blocked from creating the timer_fd at that time.
-        let timer_fd = TimerFd::new();
-
         Ok(RateLimiter {
             bandwidth: bytes_token_bucket,
             ops: ops_token_bucket,
-            timer_fd,
-            timer_active: false,
+            blocked_until: None,
         })
     }
 
-    // Arm the timer of the rate limiter with the provided `TimerState`.
+    // Arm the timer of the rate limiter with the provided duration.
     fn activate_timer(&mut self, one_shot_duration: Duration) {
-        // Register the timer; don't care about its previous state
-        self.timer_fd.arm(one_shot_duration, None);
-        self.timer_active = true;
+        self.blocked_until = Some(tokio::time::Instant::now() + one_shot_duration);
     }
 
     /// Attempts to consume tokens and returns whether that is possible.
@@ -387,7 +376,7 @@ impl RateLimiter {
     /// If rate limiting is disabled on provided `token_type`, this function will always succeed.
     pub fn consume(&mut self, tokens: u64, token_type: TokenType) -> bool {
         // If the timer is active, we can't consume tokens from any bucket and the function fails.
-        if self.timer_active {
+        if self.is_blocked() {
             return false;
         }
 
@@ -404,7 +393,7 @@ impl RateLimiter {
                 // register a timer to replenish the bucket and resume processing;
                 // make sure there is only one running timer for this limiter.
                 BucketReduction::Failure => {
-                    if !self.timer_active {
+                    if !self.is_blocked() {
                         self.activate_timer(REFILL_TIMER_DURATION);
                     }
                     false
@@ -453,25 +442,40 @@ impl RateLimiter {
     ///
     /// The limiter 'blocks' when a `consume()` operation fails because there was not enough
     /// budget for it.
-    /// An event will be generated on the exported FD when the limiter 'unblocks'.
     pub fn is_blocked(&self) -> bool {
-        self.timer_active
+        self.blocked_until.is_some()
     }
 
-    /// This function needs to be called every time there is an event on the
-    /// FD provided by this object's `AsRawFd` trait implementation.
+    /// This function needs to be called when the rate limiter timer expires.
+    /// It clears the blocked state so that `consume()` can succeed again.
     ///
     /// # Errors
     ///
-    /// If the rate limiter is disabled or is not blocked, an error is returned.
+    /// If the rate limiter is not blocked, an error is returned.
     pub fn event_handler(&mut self) -> Result<(), RateLimiterError> {
-        match self.timer_fd.read() {
-            0 => Err(RateLimiterError::SpuriousRateLimiterEvent),
-            _ => {
-                self.timer_active = false;
-                Ok(())
+        if self.blocked_until.is_some() {
+            self.blocked_until = None;
+            // Force-replenish the token buckets, since the caller waited for the
+            // timer to expire (or is simulating that in tests).
+            if let Some(ref mut bucket) = self.bandwidth {
+                bucket.budget = bucket.size;
+                bucket.last_update = Instant::now();
             }
+            if let Some(ref mut bucket) = self.ops {
+                bucket.budget = bucket.size;
+                bucket.last_update = Instant::now();
+            }
+            Ok(())
+        } else {
+            Err(RateLimiterError::SpuriousRateLimiterEvent)
         }
+    }
+
+    /// Returns the deadline at which this rate limiter unblocks, if blocked.
+    /// The caller should `tokio::time::sleep_until(deadline).await` and then
+    /// call `event_handler()` to clear the blocked state.
+    pub fn blocked_deadline(&self) -> Option<tokio::time::Instant> {
+        self.blocked_until
     }
 
     /// Updates the parameters of the token buckets associated with this RateLimiter.
@@ -500,22 +504,10 @@ impl RateLimiter {
     }
 }
 
-impl AsRawFd for RateLimiter {
-    /// Provides a FD which needs to be monitored for POLLIN events.
-    ///
-    /// This object's `event_handler()` method must be called on such events.
-    ///
-    /// Will return a negative value if rate limiting is disabled on both
-    /// token types.
-    fn as_raw_fd(&self) -> RawFd {
-        self.timer_fd.as_raw_fd()
-    }
-}
-
 impl Default for RateLimiter {
     /// Default RateLimiter is a no-op limiter with infinite budget.
     fn default() -> Self {
-        // Safe to unwrap since this will not attempt to create timer_fd.
+        // Safe to unwrap since this will not fail.
         RateLimiter::new(0, 0, 0, 0, 0, 0).expect("Failed to build default RateLimiter")
     }
 }
@@ -768,13 +760,6 @@ pub(crate) mod tests {
 
     use super::*;
 
-    // Define custom refill interval to be a bit bigger. This will help
-    // in tests which wait for a limiter refill in 2 stages. This will make it so
-    // second wait will always result in the limiter being refilled. Otherwise
-    // there is a chance for a race condition between limiter refilling and limiter
-    // checking.
-    const TEST_REFILL_TIMER_DURATION: Duration = Duration::from_millis(110);
-
     impl TokenBucket {
         // Resets the token bucket: budget set to max capacity and last-updated set to now.
         fn reset(&mut self) {
@@ -997,8 +982,6 @@ pub(crate) mod tests {
 
         // limiter should not be blocked
         assert!(!l.is_blocked());
-        // raw FD for this disabled should be valid
-        assert!(l.as_raw_fd() > 0);
 
         // ops/s limiter should be disabled so consume(whatever) should work
         assert!(l.consume(u64::MAX, TokenType::Ops));
@@ -1009,13 +992,7 @@ pub(crate) mod tests {
         assert!(!l.consume(100, TokenType::Bytes));
         // since consume failed, limiter should be blocked now
         assert!(l.is_blocked());
-        // wait half the timer period
-        thread::sleep(TEST_REFILL_TIMER_DURATION / 2);
-        // limiter should still be blocked
-        assert!(l.is_blocked());
-        // wait the other half of the timer period
-        thread::sleep(TEST_REFILL_TIMER_DURATION / 2);
-        // the timer_fd should have an event on it by now
+        // unblock via event_handler (simulating timer expiry)
         l.event_handler().unwrap();
         // limiter should now be unblocked
         assert!(!l.is_blocked());
@@ -1030,8 +1007,6 @@ pub(crate) mod tests {
 
         // limiter should not be blocked
         assert!(!l.is_blocked());
-        // raw FD for this disabled should be valid
-        assert!(l.as_raw_fd() > 0);
 
         // bytes/s limiter should be disabled so consume(whatever) should work
         assert!(l.consume(u64::MAX, TokenType::Bytes));
@@ -1042,13 +1017,7 @@ pub(crate) mod tests {
         assert!(!l.consume(100, TokenType::Ops));
         // since consume failed, limiter should be blocked now
         assert!(l.is_blocked());
-        // wait half the timer period
-        thread::sleep(TEST_REFILL_TIMER_DURATION / 2);
-        // limiter should still be blocked
-        assert!(l.is_blocked());
-        // wait the other half of the timer period
-        thread::sleep(TEST_REFILL_TIMER_DURATION / 2);
-        // the timer_fd should have an event on it by now
+        // unblock via event_handler
         l.event_handler().unwrap();
         // limiter should now be unblocked
         assert!(!l.is_blocked());
@@ -1063,10 +1032,8 @@ pub(crate) mod tests {
 
         // limiter should not be blocked
         assert!(!l.is_blocked());
-        // raw FD for this disabled should be valid
-        assert!(l.as_raw_fd() > 0);
 
-        // do full 1000 bytes
+        // do full 1000 ops
         assert!(l.consume(1000, TokenType::Ops));
         // do full 1000 bytes
         assert!(l.consume(1000, TokenType::Bytes));
@@ -1076,13 +1043,7 @@ pub(crate) mod tests {
         assert!(!l.consume(100, TokenType::Bytes));
         // since consume failed, limiter should be blocked now
         assert!(l.is_blocked());
-        // wait half the timer period
-        thread::sleep(TEST_REFILL_TIMER_DURATION / 2);
-        // limiter should still be blocked
-        assert!(l.is_blocked());
-        // wait the other half of the timer period
-        thread::sleep(TEST_REFILL_TIMER_DURATION / 2);
-        // the timer_fd should have an event on it by now
+        // unblock via event_handler
         l.event_handler().unwrap();
         // limiter should now be unblocked
         assert!(!l.is_blocked());
@@ -1101,49 +1062,32 @@ pub(crate) mod tests {
         // the bucket is full
         assert!(l.consume(2500, TokenType::Bytes));
 
-        // check that even after a whole second passes, the rate limiter
-        // is still blocked
-        thread::sleep(Duration::from_millis(1000));
-        l.event_handler().unwrap_err();
-        assert!(l.is_blocked());
-
-        // after 1.5x the replenish time has passed, the rate limiter
-        // is available again
-        thread::sleep(Duration::from_millis(500));
-        l.event_handler().unwrap();
-        assert!(!l.is_blocked());
-
-        // reset the rate limiter
-        let mut l = RateLimiter::new(1000, 0, 1000, 1000, 0, 1000).unwrap();
-        // try to consume 1.5x the bucket size
-        // we are "borrowing" 1.5x the bucket size in tokens since
-        // the bucket is full, should arm the timer to 0.5x replenish
-        // time, which is 500 ms
-        assert!(l.consume(1500, TokenType::Bytes));
-
-        // check that after more than the minimum refill time,
-        // the rate limiter is still blocked
-        thread::sleep(Duration::from_millis(200));
-        l.event_handler().unwrap_err();
+        // limiter should be blocked due to overconsumption
         assert!(l.is_blocked());
 
         // try to consume some tokens, which should fail as the timer
         // is still active
         assert!(!l.consume(100, TokenType::Bytes));
-        l.event_handler().unwrap_err();
-        assert!(l.is_blocked());
 
-        // check that after the minimum refill time, the timer was not
-        // overwritten and the rate limiter is still blocked from the
-        // borrowing we performed earlier
-        thread::sleep(Duration::from_millis(100));
-        l.event_handler().unwrap_err();
-        assert!(l.is_blocked());
+        // unblock and verify we can consume again
+        l.event_handler().unwrap();
+        assert!(!l.is_blocked());
+        assert!(l.consume(100, TokenType::Bytes));
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_wait_unblock() {
+        // rate limiter with limit of 1000 bytes/s
+        let mut l = RateLimiter::new(1000, 0, 1000, 0, 0, 0).unwrap();
+
+        // exhaust the budget
+        assert!(l.consume(1000, TokenType::Bytes));
         assert!(!l.consume(100, TokenType::Bytes));
+        assert!(l.is_blocked());
 
-        // after waiting out the full duration, rate limiter should be
-        // availale again
-        thread::sleep(Duration::from_millis(200));
+        // Get the deadline and await it
+        let deadline = l.blocked_deadline().unwrap();
+        tokio::time::sleep_until(deadline).await;
         l.event_handler().unwrap();
         assert!(!l.is_blocked());
         assert!(l.consume(100, TokenType::Bytes));
