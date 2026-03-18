@@ -221,6 +221,27 @@ pub trait VirtioDevice: AsAny + Send {
 
     /// Process an async event identified by tag. Called when the fd becomes readable.
     fn process_async_event(&mut self, _tag: u32) {}
+
+    /// Return the earliest rate limiter deadline, if any rate limiter is blocked.
+    /// Returns `None` if no rate limiter is currently blocked.
+    fn rate_limiter_deadline(&self) -> Option<tokio::time::Instant> {
+        None
+    }
+
+    /// Clear expired rate limiter(s) and re-process queues.
+    fn process_rate_limiter_unblock(&mut self) {}
+
+    /// If this device supports split RX/TX async tasks, return the info needed
+    /// to spawn them. Only net devices override this.
+    fn take_net_split_info(&mut self) -> Option<std::sync::Arc<super::net::device::NetSplitInfo>> {
+        None
+    }
+
+    /// Return a `Notify` that fires when the device is activated.
+    /// Only net devices override this.
+    fn activate_notify(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        None
+    }
 }
 
 impl fmt::Debug for dyn VirtioDevice {
