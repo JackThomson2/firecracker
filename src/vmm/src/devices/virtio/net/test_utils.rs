@@ -24,6 +24,7 @@ use crate::mmds::ns::MmdsNetworkStack;
 use crate::rate_limiter::RateLimiter;
 use crate::utils::net::mac::MacAddr;
 use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
+use crate::DeviceMutex;
 
 static NEXT_INDEX: AtomicUsize = AtomicUsize::new(1);
 
@@ -286,10 +287,10 @@ pub fn assign_queues(net: &mut Net, rxq: Queue, txq: Queue) {
 #[allow(clippy::undocumented_unsafe_blocks)]
 pub mod test {
     use std::os::unix::ffi::OsStrExt;
-    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::sync::Arc;
     use std::{cmp, fmt};
 
-
+    use crate::DeviceMutex;
     use crate::check_metric_after_block;
     use crate::devices::virtio::device::VirtioDevice;
     use crate::devices::virtio::net::device::vnet_hdr_len;
@@ -305,7 +306,7 @@ pub mod test {
     use crate::vstate::memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
     pub struct TestHelper<'a> {
-        pub net: Arc<Mutex<Net>>,
+        pub net: Arc<DeviceMutex<Net>>,
         pub mem: &'a GuestMemoryMmap,
         pub rxq: VirtQueue<'a>,
         pub txq: VirtQueue<'a>,
@@ -336,7 +337,7 @@ pub mod test {
             );
             assign_queues(&mut net, rxq.create_queue(), txq.create_queue());
 
-            let net = Arc::new(Mutex::new(net));
+            let net = Arc::new(DeviceMutex::new(net));
 
             Self {
                 net,
@@ -346,15 +347,15 @@ pub mod test {
             }
         }
 
-        pub fn net(&mut self) -> MutexGuard<'_, Net> {
-            self.net.lock().unwrap()
+        pub fn net(&mut self) -> tokio::sync::MutexGuard<'_, Net> {
+            self.net.try_lock().expect("uncontended")
         }
 
         pub fn activate_net(&mut self) {
             let interrupt = default_interrupt();
             self.net
-                .lock()
-                .unwrap()
+                .try_lock()
+                .expect("uncontended")
                 .activate(self.mem.clone(), interrupt)
                 .unwrap();
             // Process the activate event.
@@ -383,7 +384,7 @@ pub mod test {
             desc_list: &[(u16, u32, u16)],
         ) {
             // Get queue and event_fd.
-            let net = self.net.lock().unwrap();
+            let net = self.net.try_lock().expect("uncontended");
             let (queue, event_fd) = match queue {
                 NetQueue::Rx => (&self.rxq, &net.queue_evts[RX_INDEX]),
                 NetQueue::Tx => (&self.txq, &net.queue_evts[TX_INDEX]),
@@ -425,7 +426,7 @@ pub mod test {
             check_metric_after_block!(
                 self.net().metrics.rx_packets_count,
                 0,
-                { self.net.lock().unwrap().process_async_event(0); 0 }
+                { self.net.try_lock().expect("uncontended").process_async_event(0); 0 }
             );
             // Check that the descriptor chain has been discarded.
             assert_eq!(
@@ -459,7 +460,7 @@ pub mod test {
             check_metric_after_block!(
                 self.net().metrics.rx_packets_count,
                 1,
-                { self.net.lock().unwrap().process_async_event(0); 0 }
+                { self.net.try_lock().expect("uncontended").process_async_event(0); 0 }
             );
             // Check that the expected frame was sent to the Rx queue eventually.
             assert_eq!(self.rxq.used.idx.get(), used_idx + 1);

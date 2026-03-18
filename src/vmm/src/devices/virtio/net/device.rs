@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 use std::mem::{self};
 use std::net::Ipv4Addr;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::num::Wrapping;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
@@ -35,7 +35,7 @@ use crate::devices::virtio::net::tap::Tap;
 use crate::devices::virtio::net::{
     MAX_BUFFER_SIZE, NET_QUEUE_SIZES, NetError, NetQueue, RX_INDEX, TX_INDEX, generated,
 };
-use crate::devices::virtio::queue::{DescriptorChain, InvalidAvailIdx, Queue};
+use crate::devices::virtio::queue::{DescriptorChain, InvalidAvailIdx, Queue, QueueError};
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
 use crate::devices::{DeviceError, report_net_event_fail};
 use crate::dumbo::pdu::arp::ETH_IPV4_FRAME_LEN;
@@ -267,6 +267,13 @@ pub struct Net {
 
     tx_buffer: IoVecBuffer,
     pub(crate) rx_buffer: RxBuffers,
+    /// Set to true after take_net_split_info succeeds, so the generic
+    /// async event path becomes a no-op.
+    split_active: bool,
+    pub(crate) split_info: Option<std::sync::Arc<NetSplitInfo>>,
+    /// Notified when `activate()` succeeds, so the async event loop can
+    /// perform the RX/TX split immediately.
+    pub(crate) activate_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Net {
@@ -324,6 +331,9 @@ impl Net {
             metrics: NetMetricsPerDevice::alloc(id),
             tx_buffer: Default::default(),
             rx_buffer: RxBuffers::new()?,
+            split_active: false,
+            split_info: None,
+            activate_notify: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -387,16 +397,6 @@ impl Net {
     /// Get tap fd for async event loop.
     pub fn tap_fd(&self) -> RawFd {
         self.tap.as_raw_fd()
-    }
-
-    /// Get rx rate limiter fd for async event loop.
-    pub fn rx_rate_limiter_fd(&self) -> RawFd {
-        self.rx_rate_limiter.as_raw_fd()
-    }
-
-    /// Get tx rate limiter fd for async event loop.
-    pub fn tx_rate_limiter_fd(&self) -> RawFd {
-        self.tx_rate_limiter.as_raw_fd()
     }
 
     /// Trigger queue notification for the guest if we used enough descriptors
@@ -852,7 +852,11 @@ impl Net {
         self.metrics.rx_queue_event_count.inc();
 
         if let Err(err) = self.queue_evts[RX_INDEX].read() {
-            // rate limiters present but with _very high_ allowed rate
+            // With tokio's AsyncFd, spurious wakeups can cause the eventfd
+            // to be already drained (EAGAIN). This is benign — just return.
+            if err.raw_os_error() == Some(EAGAIN) {
+                return;
+            }
             error!("Failed to get rx queue event: {:?}", err);
             self.metrics.event_fails.inc();
             return;
@@ -890,6 +894,9 @@ impl Net {
     pub fn process_tx_queue_event(&mut self) {
         self.metrics.tx_queue_event_count.inc();
         if let Err(err) = self.queue_evts[TX_INDEX].read() {
+            if err.raw_os_error() == Some(EAGAIN) {
+                return;
+            }
             error!("Failed to get tx queue event: {:?}", err);
             self.metrics.event_fails.inc();
         } else if !self.tx_rate_limiter.is_blocked()
@@ -950,7 +957,486 @@ impl Net {
     }
 }
 
-impl VirtioDevice for Net {
+// ---------------------------------------------------------------------------
+// Split RX/TX task support
+// ---------------------------------------------------------------------------
+
+/// Drain an eventfd by reading its counter. This must be called when an
+/// eventfd becomes readable so that level-triggered readiness is cleared,
+/// preventing busy-loops with tokio's `AsyncFd`.
+fn drain_eventfd(fd: RawFd) {
+    let mut buf = [0u8; 8];
+    // SAFETY: fd is a valid eventfd, buf is 8 bytes as required.
+    unsafe { libc::read(fd, buf.as_mut_ptr().cast(), 8) };
+}
+
+/// State for the RX half of a net device, owned by the RX tokio task.
+pub struct NetRxTaskState {
+    pub rx_queue: Queue,
+    pub rx_queue_evt: RawFd,
+    pub tap_fd: RawFd,
+    pub tap: Tap,
+    pub rx_rate_limiter: RateLimiter,
+    pub rx_buffer: RxBuffers,
+    pub rx_frame_buf: [u8; MAX_BUFFER_SIZE],
+    pub mmds_ns: Option<Arc<Mutex<MmdsNetworkStack>>>,
+    pub mmds_rx_notify: Arc<tokio::sync::Notify>,
+    pub metrics: Arc<NetDeviceMetrics>,
+    pub mem: GuestMemoryMmap,
+    pub interrupt: Arc<dyn VirtioInterrupt>,
+    pub acked_features: u64,
+}
+
+impl NetRxTaskState {
+    fn has_feature(&self, feature: u64) -> bool {
+        (self.acked_features & (1 << feature)) != 0
+    }
+
+    fn try_signal_rx_queue(&mut self) -> Result<(), DeviceError> {
+        self.rx_queue.advance_used_ring_idx();
+        if self.rx_queue.prepare_kick() {
+            self.interrupt
+                .trigger(VirtioInterruptType::Queue(RX_INDEX.try_into().unwrap()))
+                .map_err(|err| {
+                    self.metrics.event_fails.inc();
+                    DeviceError::FailedSignalingIrq(err)
+                })?;
+        }
+        Ok(())
+    }
+
+    fn parse_rx_descriptors(&mut self) -> Result<(), InvalidAvailIdx> {
+        let queue = &mut self.rx_queue;
+        while let Some(head) = queue.pop_or_enable_notification()? {
+            let index = head.index;
+            if let Err(err) = unsafe { self.rx_buffer.add_buffer(&self.mem, head) } {
+                self.metrics.rx_fails.inc();
+                if matches!(err, AddRxBufferError::Parsing(IoVecError::IovDequeOverflow)) {
+                    error!("net: Could not add an RX descriptor: {err}");
+                    queue.undo_pop();
+                    break;
+                }
+                error!("net: Could not parse an RX descriptor: {err}");
+                queue
+                    .write_used_element(self.rx_buffer.used_descriptors, index, 0)
+                    .unwrap();
+                self.rx_buffer.used_descriptors += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn rate_limiter_consume_op(rate_limiter: &mut RateLimiter, size: u64) -> bool {
+        if !rate_limiter.consume(1, TokenType::Ops) {
+            return false;
+        }
+        if !rate_limiter.consume(size, TokenType::Bytes) {
+            rate_limiter.manual_replenish(1, TokenType::Ops);
+            return false;
+        }
+        true
+    }
+
+    fn rate_limited_rx_single_frame(&mut self, frame_size: u32) -> bool {
+        if !Self::rate_limiter_consume_op(&mut self.rx_rate_limiter, frame_size as u64) {
+            self.metrics.rx_rate_limiter_throttled.inc();
+            return false;
+        }
+        self.rx_buffer.finish_frame(&mut self.rx_queue);
+        true
+    }
+
+    /// Ensure we have at least MAX_BUFFER_SIZE capacity for receiving.
+    fn ensure_rx_capacity(&mut self) -> Result<bool, NetError> {
+        #[allow(clippy::cast_possible_truncation)]
+        if self.rx_buffer.capacity() < MAX_BUFFER_SIZE as u32 {
+            self.parse_rx_descriptors()?;
+            if self.rx_buffer.capacity() < MAX_BUFFER_SIZE as u32 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Try to deliver an MMDS response frame if one is available.
+    /// Returns Some(len) if a frame was delivered.
+    fn try_read_mmds(&mut self) -> Result<Option<u32>, NetError> {
+        if let Some(ns_lock) = self.mmds_ns.as_ref()
+            && let Ok(mut ns) = ns_lock.lock()
+            && let Some(len) =
+                ns.write_next_frame(frame_bytes_from_buf_mut(&mut self.rx_frame_buf)?)
+        {
+            let len = len.get();
+            METRICS.mmds.tx_frames.inc();
+            METRICS.mmds.tx_bytes.add(len as u64);
+            init_vnet_hdr(&mut self.rx_frame_buf);
+            self.rx_buffer
+                .iovec
+                .write_all_volatile_at(&self.rx_frame_buf[..vnet_hdr_len() + len], 0)?;
+            let len: u32 = (vnet_hdr_len() + len).try_into().unwrap();
+            unsafe {
+                self.rx_buffer.mark_used(len, &mut self.rx_queue);
+            }
+            return Ok(Some(len));
+        }
+        Ok(None)
+    }
+
+    /// Read frames from TAP and deliver them to the guest.
+    ///
+    /// Returns the number of frames delivered.
+    pub fn process_rx_batch(&mut self) -> Result<usize, DeviceError> {
+        // First handle any deferred frame
+        if self.rx_buffer.used_bytes != 0 {
+            if !self.rate_limited_rx_single_frame(self.rx_buffer.used_bytes) {
+                return Ok(0);
+            }
+        }
+
+        // Try MMDS frames first
+        loop {
+            match self.ensure_rx_capacity() {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.metrics.no_rx_avail_buffer.inc();
+                    break;
+                }
+                Err(NetError::InvalidAvailIdx(err)) => {
+                    return Err(DeviceError::InvalidAvailIdx(err));
+                }
+                Err(_) => break,
+            }
+            match self.try_read_mmds() {
+                Ok(Some(bytes)) => {
+                    self.metrics.rx_count.inc();
+                    self.metrics.rx_bytes_count.add(bytes as u64);
+                    self.metrics.rx_packets_count.inc();
+                    if !self.rate_limited_rx_single_frame(bytes) {
+                        break;
+                    }
+                    continue;
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        if self.rx_rate_limiter.is_blocked() {
+            self.try_signal_rx_queue()?;
+            return Ok(0);
+        }
+
+        let mut frames_delivered = 0usize;
+
+        loop {
+            match self.ensure_rx_capacity() {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.metrics.no_rx_avail_buffer.inc();
+                    break;
+                }
+                Err(NetError::InvalidAvailIdx(err)) => {
+                    return Err(DeviceError::InvalidAvailIdx(err));
+                }
+                Err(_) => break,
+            }
+
+            let slice = self.rx_buffer.iovec.as_iovec_mut_slice();
+            match self.tap.read_iovec(slice) {
+                Ok(bytes) => {
+                    let bytes = bytes as u32;
+                    unsafe {
+                        self.rx_buffer.mark_used(bytes, &mut self.rx_queue);
+                    }
+                    self.metrics.rx_count.inc();
+                    self.metrics.rx_bytes_count.add(bytes as u64);
+                    self.metrics.rx_packets_count.inc();
+                    if !self.rate_limited_rx_single_frame(bytes) {
+                        self.try_signal_rx_queue()?;
+                        return Ok(frames_delivered);
+                    }
+                    frames_delivered += 1;
+                }
+                Err(err) => {
+                    match err.raw_os_error() {
+                        Some(e) if e == EAGAIN => (),
+                        _ => {
+                            error!("Failed to read tap: {:?}", err);
+                            self.metrics.tap_read_fails.inc();
+                            return Err(DeviceError::FailedReadTap);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        self.try_signal_rx_queue()?;
+        Ok(frames_delivered)
+    }
+
+    /// Process RX queue event (guest made new buffers available).
+    pub fn process_rx_queue_event(&mut self) {
+        self.metrics.rx_queue_event_count.inc();
+        drain_eventfd(self.rx_queue_evt);
+        self.parse_rx_descriptors().unwrap();
+        if self.rx_rate_limiter.is_blocked() {
+            self.metrics.rx_rate_limiter_throttled.inc();
+        } else {
+            self.process_rx_batch()
+                .unwrap_or_else(|err| { report_net_event_fail(&self.metrics, err); 0 });
+        }
+    }
+
+    /// Process TAP readable event.
+    pub fn process_tap_rx_event(&mut self) {
+        self.metrics.rx_tap_event_count.inc();
+        if self.rx_rate_limiter.is_blocked() {
+            self.metrics.rx_rate_limiter_throttled.inc();
+            return;
+        }
+        self.process_rx_batch()
+            .unwrap_or_else(|err| { report_net_event_fail(&self.metrics, err); 0 });
+    }
+
+    /// Process MMDS notification (TX task sent a frame to MMDS, response may be ready).
+    pub fn process_mmds_event(&mut self) {
+        if self.rx_rate_limiter.is_blocked() {
+            return;
+        }
+        self.process_rx_batch()
+            .unwrap_or_else(|err| { report_net_event_fail(&self.metrics, err); 0 });
+    }
+
+    pub fn rate_limiter_deadline(&self) -> Option<tokio::time::Instant> {
+        self.rx_rate_limiter.blocked_deadline()
+    }
+
+    pub fn process_rate_limiter_unblock(&mut self) {
+        match self.rx_rate_limiter.event_handler() {
+            Ok(_) => {
+                self.process_rx_batch()
+                    .unwrap_or_else(|err| { report_net_event_fail(&self.metrics, err); 0 });
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// Prepare the RX state for snapshot save.
+    pub fn prepare_save(&mut self) {
+        self.rx_buffer.finish_frame(&mut self.rx_queue);
+        self.rx_queue.next_avail -=
+            Wrapping(u16::try_from(self.rx_buffer.parsed_descriptors.len()).unwrap());
+        self.rx_buffer.parsed_descriptors.clear();
+        self.rx_buffer.iovec.clear();
+        self.rx_buffer.used_bytes = 0;
+        self.rx_buffer.used_descriptors = 0;
+    }
+}
+
+/// State for the TX half of a net device, owned by the TX tokio task.
+pub struct NetTxTaskState {
+    pub tx_queue: Queue,
+    pub tx_queue_evt: RawFd,
+    pub tap: Tap,
+    pub tx_rate_limiter: RateLimiter,
+    pub tx_buffer: IoVecBuffer,
+    pub tx_frame_headers: [u8; frame_hdr_len()],
+    pub mmds_ns: Option<Arc<Mutex<MmdsNetworkStack>>>,
+    pub mmds_rx_notify: Arc<tokio::sync::Notify>,
+    pub metrics: Arc<NetDeviceMetrics>,
+    pub mem: GuestMemoryMmap,
+    pub interrupt: Arc<dyn VirtioInterrupt>,
+    pub guest_mac: Option<MacAddr>,
+}
+
+impl NetTxTaskState {
+    fn try_signal_tx_queue(&mut self) -> Result<(), DeviceError> {
+        self.tx_queue.advance_used_ring_idx();
+        if self.tx_queue.prepare_kick() {
+            self.interrupt
+                .trigger(VirtioInterruptType::Queue(TX_INDEX.try_into().unwrap()))
+                .map_err(|err| {
+                    self.metrics.event_fails.inc();
+                    DeviceError::FailedSignalingIrq(err)
+                })?;
+        }
+        Ok(())
+    }
+
+    fn rate_limiter_consume_op(rate_limiter: &mut RateLimiter, size: u64) -> bool {
+        if !rate_limiter.consume(1, TokenType::Ops) {
+            return false;
+        }
+        if !rate_limiter.consume(size, TokenType::Bytes) {
+            rate_limiter.manual_replenish(1, TokenType::Ops);
+            return false;
+        }
+        true
+    }
+
+    fn rate_limiter_replenish_op(rate_limiter: &mut RateLimiter, size: u64) {
+        rate_limiter.manual_replenish(1, TokenType::Ops);
+        rate_limiter.manual_replenish(size, TokenType::Bytes);
+    }
+
+    /// Process all available TX descriptors.
+    pub fn process_tx(&mut self) -> Result<(), DeviceError> {
+        let mut used_any = false;
+        let mut mmds_consumed = false;
+
+        while let Some(head) = self.tx_queue.pop_or_enable_notification()? {
+            self.metrics
+                .tx_remaining_reqs_count
+                .add(self.tx_queue.len().into());
+            let head_index = head.index;
+
+            if unsafe { self.tx_buffer.load_descriptor_chain(&self.mem, head).is_err() } {
+                self.metrics.tx_fails.inc();
+                self.tx_queue.add_used(head_index, 0)?;
+                continue;
+            }
+
+            if self.tx_buffer.len() as usize > MAX_BUFFER_SIZE {
+                error!("net: received too big frame from driver");
+                self.metrics.tx_malformed_frames.inc();
+                self.tx_queue.add_used(head_index, 0)?;
+                continue;
+            }
+
+            if !Self::rate_limiter_consume_op(
+                &mut self.tx_rate_limiter,
+                u64::from(self.tx_buffer.len()),
+            ) {
+                self.tx_queue.undo_pop();
+                self.metrics.tx_rate_limiter_throttled.inc();
+                break;
+            }
+
+            let frame_consumed_by_mmds = self.write_to_mmds_or_tap_shared()
+                .unwrap_or(false);
+            if frame_consumed_by_mmds {
+                mmds_consumed = true;
+            }
+
+            self.tx_queue.add_used(head_index, 0)?;
+            used_any = true;
+        }
+
+        if !used_any {
+            self.metrics.no_tx_avail_buffer.inc();
+        }
+
+        self.tx_buffer.clear();
+        self.try_signal_tx_queue()?;
+
+        // Notify the RX task that MMDS may have a response ready
+        if mmds_consumed {
+            self.mmds_rx_notify.notify_one();
+        }
+
+        Ok(())
+    }
+
+    fn write_to_mmds_or_tap_shared(&mut self) -> Result<bool, NetError> {
+        let max_header_len = self.tx_frame_headers.len();
+        let header_len = self.tx_buffer
+            .read_volatile_at(&mut &mut self.tx_frame_headers[..], 0, max_header_len)
+            .map_err(|err| {
+                error!("Received malformed TX buffer: {:?}", err);
+                self.metrics.tx_malformed_frames.inc();
+                NetError::VnetHeaderMissing
+            })?;
+
+        let headers = frame_bytes_from_buf(&self.tx_frame_headers[..header_len]).inspect_err(|_| {
+            error!("VNET headers missing in TX frame");
+            self.metrics.tx_malformed_frames.inc();
+        })?;
+
+        if let Some(ns_lock) = self.mmds_ns.as_ref() {
+            let mut ns = ns_lock.lock().unwrap();
+            if ns.is_mmds_frame(headers) {
+                let mut frame = vec![0u8; self.tx_buffer.len() as usize - vnet_hdr_len()];
+                self.tx_buffer
+                    .read_exact_volatile_at(&mut frame, vnet_hdr_len())
+                    .unwrap();
+                let _ = ns.detour_frame(&frame);
+                drop(ns);
+                METRICS.mmds.rx_accepted.inc();
+                Self::rate_limiter_replenish_op(
+                    &mut self.tx_rate_limiter,
+                    u64::from(self.tx_buffer.len()),
+                );
+                return Ok(true);
+            }
+        }
+
+        if let Some(guest_mac) = self.guest_mac {
+            let _ = EthernetFrame::from_bytes(headers).map(|eth_frame| {
+                if guest_mac != eth_frame.src_mac() {
+                    self.metrics.tx_spoofed_mac_count.inc();
+                }
+            });
+        }
+
+        let _metric = self.metrics.tap_write_agg.record_latency_metrics();
+        match self.tap.write_iovec(&self.tx_buffer) {
+            Ok(_) => {
+                let len = u64::from(self.tx_buffer.len());
+                self.metrics.tx_bytes_count.add(len);
+                self.metrics.tx_packets_count.inc();
+                self.metrics.tx_count.inc();
+            }
+            Err(err) => {
+                error!("Failed to write to tap: {:?}", err);
+                self.metrics.tap_write_fails.inc();
+            }
+        }
+        Ok(false)
+    }
+
+    /// Process TX queue event.
+    pub fn process_tx_queue_event(&mut self) {
+        self.metrics.tx_queue_event_count.inc();
+        drain_eventfd(self.tx_queue_evt);
+        if self.tx_rate_limiter.is_blocked() {
+            self.metrics.tx_rate_limiter_throttled.inc();
+        } else {
+            self.process_tx()
+                .unwrap_or_else(|err| report_net_event_fail(&self.metrics, err));
+        }
+    }
+
+    pub fn rate_limiter_deadline(&self) -> Option<tokio::time::Instant> {
+        self.tx_rate_limiter.blocked_deadline()
+    }
+
+    pub fn process_rate_limiter_unblock(&mut self) {
+        match self.tx_rate_limiter.event_handler() {
+            Ok(_) => {
+                self.process_tx()
+                    .unwrap_or_else(|err| report_net_event_fail(&self.metrics, err));
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+/// Info returned by `Net::take_net_split_info` for spawning separate RX/TX tasks.
+pub struct NetSplitInfo {
+    pub rx: tokio::sync::Mutex<NetRxTaskState>,
+    pub tx: tokio::sync::Mutex<NetTxTaskState>,
+    pub rx_queue_evt_fd: RawFd,
+    pub tx_queue_evt_fd: RawFd,
+    pub tap_fd: RawFd,
+}
+
+
+impl std::fmt::Debug for NetSplitInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetSplitInfo").finish_non_exhaustive()
+    }
+}impl VirtioDevice for Net {
     impl_device_type!(VirtioDeviceType::Net);
 
     fn id(&self) -> &str {
@@ -1046,6 +1532,7 @@ impl VirtioDevice for Net {
             return Err(ActivateError::EventFd);
         }
         self.device_state = DeviceState::Activated(ActiveState { mem, interrupt });
+        self.activate_notify.notify_one();
         Ok(())
     }
 
@@ -1053,12 +1540,19 @@ impl VirtioDevice for Net {
         self.device_state.is_activated()
     }
 
+    fn mark_queue_memory_dirty(&mut self, mem: &GuestMemoryMmap) -> Result<(), QueueError> {
+        if self.split_active {
+            return Ok(());
+        }
+        for queue in self.queues_mut() {
+            queue.initialize(mem)?
+        }
+        Ok(())
+    }
+
     /// Prepare saving state
     fn prepare_save(&mut self) {
-        // We shouldn't be messing with the queue if the device is not activated.
-        // Anyways, if it isn't there's nothing to prepare; we haven't parsed any
-        // descriptors yet from it and we can't have a deferred frame.
-        if !self.is_activated() {
+        if !self.is_activated() || self.split_active {
             return;
         }
 
@@ -1074,27 +1568,125 @@ impl VirtioDevice for Net {
     }
 
     fn async_fd_tags(&self) -> Vec<(RawFd, u32)> {
-        let mut fds = Vec::new();
-        fds.push((self.queue_evts[0].as_raw_fd(), 1)); // RX queue
-        fds.push((self.queue_evts[1].as_raw_fd(), 2)); // TX queue
-        fds.push((self.tap.as_raw_fd(), 3)); // Tap RX
-        fds.push((self.rx_rate_limiter.as_raw_fd(), 4)); // RX rate limiter
-        fds.push((self.tx_rate_limiter.as_raw_fd(), 5)); // TX rate limiter
-        fds
+        vec![
+            (self.queue_evts[0].as_raw_fd(), 1), // RX queue
+            (self.queue_evts[1].as_raw_fd(), 2), // TX queue
+            (self.tap.as_raw_fd(), 3),            // Tap RX
+        ]
     }
 
     fn process_async_event(&mut self, tag: u32) {
-        if !self.is_activated() {
+        if self.split_active || !self.is_activated() {
             return;
         }
         match tag {
             1 => self.process_rx_queue_event(),
             2 => self.process_tx_queue_event(),
             3 => self.process_tap_rx_event(),
-            4 => self.process_rx_rate_limiter_event(),
-            5 => self.process_tx_rate_limiter_event(),
             _ => {}
         }
+    }
+
+    fn rate_limiter_deadline(&self) -> Option<tokio::time::Instant> {
+        let rx = self.rx_rate_limiter.blocked_deadline();
+        let tx = self.tx_rate_limiter.blocked_deadline();
+        match (rx, tx) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    fn process_rate_limiter_unblock(&mut self) {
+        if self.rx_rate_limiter.event_handler().is_ok() {
+            self.resume_rx()
+                .unwrap_or_else(|err| report_net_event_fail(&self.metrics, err));
+        }
+        if self.tx_rate_limiter.event_handler().is_ok() {
+            self.process_tx()
+                .unwrap_or_else(|err| report_net_event_fail(&self.metrics, err));
+        }
+    }
+
+    fn activate_notify(&self) -> Option<Arc<tokio::sync::Notify>> {
+        Some(self.activate_notify.clone())
+    }
+
+    fn take_net_split_info(&mut self) -> Option<std::sync::Arc<NetSplitInfo>> {
+        let active = self.device_state.active_state()?;
+        self.split_active = true;
+        let mem = active.mem.clone();
+        let interrupt = active.interrupt.clone();
+
+        // Dup the tap fd so RX and TX each have their own handle
+        let tap_fd = self.tap.as_raw_fd();
+        let rx_tap = match self.tap.try_dup() {
+            Ok(t) => t,
+            Err(e) => {
+                error!("Failed to dup tap fd for net RX split: {e}");
+                return None;
+            }
+        };
+        let tx_tap = match self.tap.try_dup() {
+            Ok(t) => t,
+            Err(e) => {
+                error!("Failed to dup tap fd for net TX split: {e}");
+                return None;
+            }
+        };
+
+        let mmds_rx_notify = Arc::new(tokio::sync::Notify::new());
+
+        // Take ownership of the split state. The original Net fields become
+        // empty/default — the split tasks own the real state now.
+        let rx_queue = std::mem::replace(&mut self.queues[RX_INDEX], Queue::new(1));
+        let tx_queue = std::mem::replace(&mut self.queues[TX_INDEX], Queue::new(1));
+        let rx_rate_limiter = std::mem::take(&mut self.rx_rate_limiter);
+        let tx_rate_limiter = std::mem::take(&mut self.tx_rate_limiter);
+        let rx_buffer = std::mem::replace(&mut self.rx_buffer, RxBuffers::new().unwrap());
+        let tx_buffer = std::mem::take(&mut self.tx_buffer);
+        let mmds_ns = self.mmds_ns.take().map(|ns| Arc::new(Mutex::new(ns)));
+
+        let rx_queue_evt_fd = self.queue_evts[RX_INDEX].as_raw_fd();
+        let tx_queue_evt_fd = self.queue_evts[TX_INDEX].as_raw_fd();
+
+        let rx_tap_fd = rx_tap.as_raw_fd();
+
+        let split = std::sync::Arc::new(NetSplitInfo {
+            rx: tokio::sync::Mutex::new(NetRxTaskState {
+                rx_queue,
+                rx_queue_evt: rx_queue_evt_fd,
+                tap_fd: rx_tap_fd,
+                tap: rx_tap,
+                rx_rate_limiter,
+                rx_buffer,
+                rx_frame_buf: self.rx_frame_buf,
+                mmds_ns: mmds_ns.clone(),
+                mmds_rx_notify: mmds_rx_notify.clone(),
+                metrics: self.metrics.clone(),
+                mem: mem.clone(),
+                interrupt: interrupt.clone(),
+                acked_features: self.acked_features,
+            }),
+            tx: tokio::sync::Mutex::new(NetTxTaskState {
+                tx_queue,
+                tx_queue_evt: tx_queue_evt_fd,
+                tap: tx_tap,
+                tx_rate_limiter,
+                tx_buffer,
+                tx_frame_headers: self.tx_frame_headers,
+                mmds_ns,
+                mmds_rx_notify,
+                metrics: self.metrics.clone(),
+                mem,
+                interrupt,
+                guest_mac: self.guest_mac,
+            }),
+            rx_queue_evt_fd,
+            tx_queue_evt_fd,
+            tap_fd,
+        });
+        self.split_info = Some(split.clone());
+        Some(split)
     }
 }
 
@@ -1304,7 +1896,7 @@ pub mod tests {
         check_metric_after_block!(
             th.net().metrics.rx_fails,
             1,
-            th.event_manager.run_with_timeout(100).unwrap()
+            th.simulate_event(NetEvent::Tap)
         );
         th.rxq.check_used_elem(0, 0, 0);
         header_set_num_buffers(frame.as_mut_slice(), 1);
@@ -1427,7 +2019,7 @@ pub mod tests {
         check_metric_after_block!(
             th.net().metrics.rx_packets_count,
             1,
-            th.event_manager.run_with_timeout(100).unwrap()
+            th.simulate_event(NetEvent::Tap)
         );
 
         // Check that the used queue has advanced.
@@ -1487,7 +2079,7 @@ pub mod tests {
         check_metric_after_block!(
             th.net().metrics.rx_packets_count,
             1,
-            th.event_manager.run_with_timeout(100).unwrap()
+            th.simulate_event(NetEvent::Tap)
         );
 
         // Check that the frame wasn't deferred.
@@ -1554,7 +2146,7 @@ pub mod tests {
         check_metric_after_block!(
             th.net().metrics.rx_packets_count,
             2,
-            th.event_manager.run_with_timeout(100).unwrap()
+            th.simulate_event(NetEvent::Tap)
         );
 
         // Check that the frames weren't deferred.
@@ -1616,7 +2208,7 @@ pub mod tests {
         check_metric_after_block!(
             th.net().metrics.rx_packets_count,
             1,
-            th.event_manager.run_with_timeout(100).unwrap()
+            th.simulate_event(NetEvent::Tap)
         );
 
         // Check that the frame wasn't deferred.
@@ -1688,7 +2280,7 @@ pub mod tests {
         let desc_list = [(0, 100, 0), (1, 100, VIRTQ_DESC_F_WRITE), (2, 500, 0)];
         th.add_desc_chain(NetQueue::Tx, 0, &desc_list);
         th.write_tx_frame(&desc_list, 700);
-        th.event_manager.run_with_timeout(100).unwrap();
+        th.simulate_event(NetEvent::TxQueue);
 
         // Check that the used queue advanced.
         assert_eq!(th.txq.used.idx.get(), 1);
@@ -1714,7 +2306,7 @@ pub mod tests {
         check_metric_after_block!(
             th.net().metrics.tx_malformed_frames,
             1,
-            th.event_manager.run_with_timeout(100)
+            th.simulate_event(NetEvent::TxQueue)
         );
 
         // Check that the used queue advanced.
@@ -1745,7 +2337,7 @@ pub mod tests {
         check_metric_after_block!(
             th.net().metrics.tx_malformed_frames,
             1,
-            th.event_manager.run_with_timeout(100)
+            th.simulate_event(NetEvent::TxQueue)
         );
 
         // Check that the used queue advanced.
@@ -1772,7 +2364,7 @@ pub mod tests {
         check_metric_after_block!(
             th.net().metrics.tx_malformed_frames,
             1,
-            th.event_manager.run_with_timeout(100)
+            th.simulate_event(NetEvent::TxQueue)
         );
 
         // Check that the used queue advanced.
@@ -1815,7 +2407,7 @@ pub mod tests {
         check_metric_after_block!(
             th.net().metrics.tx_malformed_frames,
             2,
-            th.event_manager.run_with_timeout(100)
+            th.simulate_event(NetEvent::TxQueue)
         );
 
         // Check that the used queue advanced.
@@ -1850,7 +2442,7 @@ pub mod tests {
         check_metric_after_block!(
             th.net().metrics.tx_packets_count,
             1,
-            th.event_manager.run_with_timeout(100).unwrap()
+            th.simulate_event(NetEvent::TxQueue)
         );
 
         // Check that the used queue advanced.
@@ -1874,7 +2466,7 @@ pub mod tests {
         th.activate_net();
         // force the next write to the tap to return an error by simply closing the fd
         // SAFETY: its a valid fd
-        unsafe { libc::close(th.net.lock().unwrap().tap.as_raw_fd()) };
+        unsafe { libc::close(th.net.try_lock().unwrap().tap.as_raw_fd()) };
 
         let desc_list = [(0, 1000, 0)];
         th.add_desc_chain(NetQueue::Tx, 0, &desc_list);
@@ -1883,7 +2475,7 @@ pub mod tests {
         check_metric_after_block!(
             th.net().metrics.tap_write_fails,
             1,
-            th.event_manager.run_with_timeout(100).unwrap()
+            th.simulate_event(NetEvent::TxQueue)
         );
 
         // Check that the used queue advanced.
@@ -1918,7 +2510,7 @@ pub mod tests {
         check_metric_after_block!(
             th.net().metrics.tx_packets_count,
             2,
-            th.event_manager.run_with_timeout(100).unwrap()
+            th.simulate_event(NetEvent::TxQueue)
         );
 
         // Check that the used queue advanced.
@@ -2109,7 +2701,7 @@ pub mod tests {
         th.activate_net();
         // force the next write to the tap to return an error by simply closing the fd
         // SAFETY: its a valid fd
-        unsafe { libc::close(th.net.lock().unwrap().tap.as_raw_fd()) };
+        unsafe { libc::close(th.net.try_lock().unwrap().tap.as_raw_fd()) };
 
         // The RX queue is empty and there is a deferred frame.
         th.net().rx_buffer.used_descriptors = 1;
@@ -2502,7 +3094,7 @@ pub mod tests {
         let mem = single_region_mem(2 * MAX_BUFFER_SIZE);
         let mut th = TestHelper::get_default(&mem);
         th.activate_net();
-        let net = th.net.lock().unwrap();
+        let net = th.net.try_lock().unwrap();
 
         // Test queues count (TX and RX).
         let queues = net.queues();

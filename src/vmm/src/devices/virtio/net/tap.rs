@@ -207,11 +207,27 @@ impl Tap {
         }
         Ok(usize::try_from(ret).unwrap())
     }
+
 }
 
 impl AsRawFd for Tap {
     fn as_raw_fd(&self) -> RawFd {
         self.tap_file.as_raw_fd()
+    }
+}
+
+impl Tap {
+    /// Duplicate this Tap's file descriptor, creating a new independent Tap handle.
+    /// Both handles refer to the same underlying TAP device.
+    pub fn try_dup(&self) -> Result<Tap, IoError> {
+        let new_fd = unsafe { libc::dup(self.tap_file.as_raw_fd()) };
+        if new_fd < 0 {
+            return Err(IoError::last_os_error());
+        }
+        Ok(Tap {
+            tap_file: unsafe { File::from_raw_fd(new_fd) },
+            if_name: self.if_name,
+        })
     }
 }
 
