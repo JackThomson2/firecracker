@@ -305,44 +305,71 @@ fn spawn_device_task(
     });
 }
 
-/// Spawn a dedicated task for a net device. The task waits for the device
-/// to be activated (via `Notify`), then splits into RX/TX tasks.
-fn spawn_net_activation_task(
+/// Spawn a dedicated thread for a net device. The thread waits for
+/// activation (via `Notify`), then runs a combined RX+TX event loop.
+///
+/// Keeping RX and TX on the same thread avoids cross-thread scheduling
+/// latency in the TCP ACK feedback loop: after the guest processes
+/// received packets and kicks the TX queue, the eventfd fires in the
+/// same epoll instance and is handled on the next select! iteration.
+fn spawn_net_device_task(
     device: Arc<DeviceMutex<dyn VirtioDevice>>,
     notify: Arc<tokio::sync::Notify>,
-    pause_rx: tokio::sync::watch::Receiver<bool>,
+    mut pause_rx: tokio::sync::watch::Receiver<bool>,
 ) {
-    tokio::task::spawn_local(async move {
-        notify.notified().await;
+    let result = std::thread::Builder::new()
+        .name("net-dev".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("net device runtime");
 
-        let mut dev = device.lock().await;
-        if let Some(split) = dev.take_net_split_info() {
-            drop(dev);
-            spawn_net_rx_task(split.clone(), pause_rx.clone());
-            spawn_net_tx_task(split, pause_rx);
-            info!("Net device split into RX/TX tasks");
-        } else {
-            log::error!("Net device activated but take_net_split_info returned None");
-        }
-    });
+            rt.block_on(async move {
+                notify.notified().await;
+
+                let mut dev = device.lock().await;
+                let split = match dev.take_net_split_info() {
+                    Some(s) => s,
+                    None => {
+                        log::error!(
+                            "Net device activated but take_net_split_info returned None"
+                        );
+                        return;
+                    }
+                };
+                drop(dev);
+
+                info!("Net device activated, running combined RX/TX loop");
+                run_net_combined_loop(&split, &mut pause_rx).await;
+            });
+        });
+    if let Err(e) = result {
+        log::error!("Failed to spawn net-dev thread: {e}");
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Split net RX/TX tasks
+// Combined net RX/TX event loop
 // ---------------------------------------------------------------------------
 
-/// Core event loop for the RX half of a net device.
+/// Core event loop for a net device handling both RX and TX on one thread.
 ///
-/// Watches: TAP fd (readable), RX queue eventfd, MMDS notify, rate limiter timer.
-/// Holds the RX mutex for the entire active period, only releasing on pause.
-async fn run_net_rx_loop(
+/// Watches: TAP fd, RX queue eventfd, TX queue eventfd, MMDS notify,
+/// and both RX/TX rate limiter timers.
+///
+/// TX queue events are checked before TAP so that guest-generated ACKs
+/// are sent promptly, keeping the TCP feedback loop tight.
+async fn run_net_combined_loop(
     split: &crate::devices::virtio::net::device::NetSplitInfo,
     pause_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) {
     let rx_queue_afd =
         AsyncFd::with_interest(BorrowedFd(split.rx_queue_evt_fd), Interest::READABLE)
             .expect("AsyncFd for net RX queue evt");
-
+    let tx_queue_afd =
+        AsyncFd::with_interest(BorrowedFd(split.tx_queue_evt_fd), Interest::READABLE)
+            .expect("AsyncFd for net TX queue evt");
     let tap_afd = AsyncFd::with_interest(BorrowedFd(split.tap_fd), Interest::READABLE)
         .expect("AsyncFd for net TAP");
 
@@ -354,77 +381,9 @@ async fn run_net_rx_loop(
         }
 
         let mut rx = split.rx.lock().await;
-        let mut rl_timer = RateLimiterTimer::new();
-
-        loop {
-            tokio::select! {
-                biased;
-
-                _ = pause_rx.changed() => { break; }
-
-                _ = fd_readable(&tap_afd) => {
-                    rx.process_tap_rx_event();
-                    rl_timer.update(rx.rate_limiter_deadline());
-                }
-
-                _ = mmds_notify.notified() => {
-                    rx.process_mmds_event();
-                    rl_timer.update(rx.rate_limiter_deadline());
-                }
-
-                _ = fd_readable(&rx_queue_afd) => {
-                    rx.process_rx_queue_event();
-                    rl_timer.update(rx.rate_limiter_deadline());
-                }
-
-                _ = rl_timer.wait() => {
-                    rx.process_rate_limiter_unblock();
-                    rl_timer.update(rx.rate_limiter_deadline());
-                }
-            }
-        }
-    }
-}
-
-/// Spawn a dedicated RX thread+runtime for a net device.
-fn spawn_net_rx_task(
-    split: std::sync::Arc<crate::devices::virtio::net::device::NetSplitInfo>,
-    mut pause_rx: tokio::sync::watch::Receiver<bool>,
-) {
-    let result = std::thread::Builder::new()
-        .name("net-rx".into())
-        .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("net RX runtime");
-
-            rt.block_on(run_net_rx_loop(&split, &mut pause_rx));
-        });
-    if let Err(e) = result {
-        log::error!("Failed to spawn net-rx thread: {e}");
-    }
-}
-
-/// Core event loop for the TX half of a net device.
-///
-/// Watches: TX queue eventfd, rate limiter timer.
-/// Holds the TX mutex for the entire active period, only releasing on pause.
-async fn run_net_tx_loop(
-    split: &crate::devices::virtio::net::device::NetSplitInfo,
-    pause_rx: &mut tokio::sync::watch::Receiver<bool>,
-) {
-    let tx_queue_afd =
-        AsyncFd::with_interest(BorrowedFd(split.tx_queue_evt_fd), Interest::READABLE)
-            .expect("AsyncFd for net TX queue evt");
-
-    loop {
-        if !wait_while_paused(pause_rx).await {
-            return;
-        }
-
         let mut tx = split.tx.lock().await;
-        let mut rl_timer = RateLimiterTimer::new();
+        let mut rx_rl_timer = RateLimiterTimer::new();
+        let mut tx_rl_timer = RateLimiterTimer::new();
 
         loop {
             tokio::select! {
@@ -434,31 +393,36 @@ async fn run_net_tx_loop(
 
                 _ = fd_readable(&tx_queue_afd) => {
                     tx.process_tx_queue_event();
-                    rl_timer.update(tx.rate_limiter_deadline());
+                    tx_rl_timer.update(tx.rate_limiter_deadline());
                 }
 
-                _ = rl_timer.wait() => {
+                _ = fd_readable(&tap_afd) => {
+                    rx.process_tap_rx_event();
+                    rx_rl_timer.update(rx.rate_limiter_deadline());
+                }
+
+                _ = mmds_notify.notified() => {
+                    rx.process_mmds_event();
+                    rx_rl_timer.update(rx.rate_limiter_deadline());
+                }
+
+                _ = fd_readable(&rx_queue_afd) => {
+                    rx.process_rx_queue_event();
+                    rx_rl_timer.update(rx.rate_limiter_deadline());
+                }
+
+                _ = rx_rl_timer.wait() => {
+                    rx.process_rate_limiter_unblock();
+                    rx_rl_timer.update(rx.rate_limiter_deadline());
+                }
+
+                _ = tx_rl_timer.wait() => {
                     tx.process_rate_limiter_unblock();
-                    rl_timer.update(tx.rate_limiter_deadline());
+                    tx_rl_timer.update(tx.rate_limiter_deadline());
                 }
             }
         }
     }
-}
-
-/// Spawn a dedicated TX thread+runtime for a net device.
-fn spawn_net_tx_task(
-    split: std::sync::Arc<crate::devices::virtio::net::device::NetSplitInfo>,
-    mut pause_rx: tokio::sync::watch::Receiver<bool>,
-) {
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("net TX runtime");
-
-        rt.block_on(run_net_tx_loop(&split, &mut pause_rx));
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -528,7 +492,7 @@ pub fn spawn_device_tasks_from_handlers(
         let dev = device.try_lock().expect("uncontended");
         if let Some(notify) = dev.activate_notify() {
             drop(dev);
-            spawn_net_activation_task(device, notify, pause_rx.clone());
+            spawn_net_device_task(device, notify, pause_rx.clone());
         } else {
             drop(dev);
             spawn_device_task(device, fd_tags, pause_rx.clone());
