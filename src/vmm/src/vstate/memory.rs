@@ -869,7 +869,6 @@ mod tests {
 
     use super::*;
     use crate::arch::host_page_size;
-    use crate::snapshot::Snapshot;
     use crate::test_utils::single_region_mem;
     use crate::utils::mib_to_bytes;
     use crate::vstate::memory::test_utils::into_region_ext;
@@ -993,15 +992,13 @@ mod tests {
     fn check_serde<M: GuestMemoryExtension>(guest_memory: &M) {
         let original_state = guest_memory.describe();
 
-        // Test direct bitcode serialization
-        let serialized_data = bitcode::serialize(&original_state).unwrap();
-        let restored_state: GuestMemoryState = bitcode::deserialize(&serialized_data).unwrap();
+        // Test FastSnapshot roundtrip
+        use crate::snapshot::fast::FastSnapshot;
+        let mut buf = Vec::new();
+        original_state.encode(&mut buf);
+        let mut offset = 0;
+        let restored_state = GuestMemoryState::decode(&buf, &mut offset).unwrap();
         assert_eq!(original_state, restored_state);
-
-        // Test with Snapshot wrapper
-        let snapshot_data = bitcode::serialize(&Snapshot::new(original_state.clone())).unwrap();
-        let restored_snapshot = Snapshot::load_without_crc_check(&snapshot_data).unwrap();
-        assert_eq!(original_state, restored_snapshot.data);
     }
 
     #[test]

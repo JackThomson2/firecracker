@@ -225,8 +225,8 @@ pub fn reg_size(reg_id: u64) -> usize {
 /// Storage for aarch64 registers with different sizes.
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct Aarch64RegisterVec {
-    ids: Vec<u64>,
-    data: Vec<u8>,
+    pub(crate) ids: Vec<u64>,
+    pub(crate) data: Vec<u8>,
 }
 
 impl Aarch64RegisterVec {

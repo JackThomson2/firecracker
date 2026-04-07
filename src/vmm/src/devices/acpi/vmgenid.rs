@@ -125,6 +125,7 @@ impl VmGenId {
 /// Logic to save/restore the state of a VMGenID device
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
+#[repr(C)]
 pub struct VMGenIDState {
     /// GSI used for VMGenID device
     pub gsi: u32,

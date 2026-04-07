@@ -36,9 +36,8 @@ pub fn save_vmstate(microvm_state: MicrovmState, output_path: &PathBuf) -> Resul
         .truncate(true)
         .open(output_path)
         .map_err(UtilsError::OutputFileOpen)?;
-    let mut snapshot = Snapshot::new(microvm_state);
-    snapshot
-        .save(&mut output_file)
+    let snapshot = Snapshot::new(microvm_state);
+    snapshot.save(&mut output_file)
         .map_err(UtilsError::VmStateSave)?;
     Ok(())
 }

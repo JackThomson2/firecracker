@@ -15,10 +15,11 @@ use crate::utils::net::mac::{MAC_ADDR_LEN, MacAddr};
 
 /// State of a MmdsNetworkStack.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[repr(C)]
 pub struct MmdsNetworkStackState {
-    mac_addr: [u8; MAC_ADDR_LEN as usize],
-    ipv4_addr: u32,
-    tcp_port: u16,
+    pub(crate) mac_addr: [u8; MAC_ADDR_LEN as usize],
+    pub(crate) ipv4_addr: u32,
+    pub(crate) tcp_port: u16,
 }
 
 impl Persist<'_> for MmdsNetworkStack {

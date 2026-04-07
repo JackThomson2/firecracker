@@ -20,31 +20,32 @@ use crate::vstate::memory::GuestMemoryMmap;
 /// Information about the balloon config's that are saved
 /// at snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[repr(C)]
 pub struct BalloonConfigSpaceState {
-    num_pages: u32,
-    actual_pages: u32,
+    pub(crate) num_pages: u32,
+    pub(crate) actual_pages: u32,
 }
 
 /// Information about the balloon stats that are saved
 /// at snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BalloonStatsState {
-    swap_in: Option<u64>,
-    swap_out: Option<u64>,
-    major_faults: Option<u64>,
-    minor_faults: Option<u64>,
-    free_memory: Option<u64>,
-    total_memory: Option<u64>,
-    available_memory: Option<u64>,
-    disk_caches: Option<u64>,
-    hugetlb_allocations: Option<u64>,
-    hugetlb_failures: Option<u64>,
-    oom_kill: Option<u64>,
-    alloc_stall: Option<u64>,
-    async_scan: Option<u64>,
-    direct_scan: Option<u64>,
-    async_reclaim: Option<u64>,
-    direct_reclaim: Option<u64>,
+    pub(crate) swap_in: Option<u64>,
+    pub(crate) swap_out: Option<u64>,
+    pub(crate) major_faults: Option<u64>,
+    pub(crate) minor_faults: Option<u64>,
+    pub(crate) free_memory: Option<u64>,
+    pub(crate) total_memory: Option<u64>,
+    pub(crate) available_memory: Option<u64>,
+    pub(crate) disk_caches: Option<u64>,
+    pub(crate) hugetlb_allocations: Option<u64>,
+    pub(crate) hugetlb_failures: Option<u64>,
+    pub(crate) oom_kill: Option<u64>,
+    pub(crate) alloc_stall: Option<u64>,
+    pub(crate) async_scan: Option<u64>,
+    pub(crate) direct_scan: Option<u64>,
+    pub(crate) async_reclaim: Option<u64>,
+    pub(crate) direct_reclaim: Option<u64>,
 }
 
 impl BalloonStatsState {
@@ -99,11 +100,11 @@ impl BalloonStatsState {
 /// at snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BalloonState {
-    stats_polling_interval_s: u16,
-    stats_desc_index: Option<u16>,
-    latest_stats: BalloonStatsState,
-    config_space: BalloonConfigSpaceState,
-    hinting_state: HintingState,
+    pub(crate) stats_polling_interval_s: u16,
+    pub(crate) stats_desc_index: Option<u16>,
+    pub(crate) latest_stats: BalloonStatsState,
+    pub(crate) config_space: BalloonConfigSpaceState,
+    pub(crate) hinting_state: HintingState,
     pub virtio_state: VirtioDeviceState,
 }
 

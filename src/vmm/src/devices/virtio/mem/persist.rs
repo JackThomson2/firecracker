@@ -23,13 +23,13 @@ use crate::vstate::memory::{GuestMemoryMmap, GuestRegionMmap};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VirtioMemState {
     pub virtio_state: VirtioDeviceState,
-    addr: u64,
-    region_size: u64,
-    block_size: u64,
-    usable_region_size: u64,
-    requested_size: u64,
-    slot_size: usize,
-    plugged_blocks: Vec<bool>,
+    pub(crate) addr: u64,
+    pub(crate) region_size: u64,
+    pub(crate) block_size: u64,
+    pub(crate) usable_region_size: u64,
+    pub(crate) requested_size: u64,
+    pub(crate) slot_size: usize,
+    pub(crate) plugged_blocks: Vec<bool>,
 }
 
 #[derive(Debug)]

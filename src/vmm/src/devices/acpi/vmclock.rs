@@ -156,6 +156,7 @@ impl VmClock {
 ///
 /// We could avoid this and reuse [`VmClock`] itself if `GuestAddress` was `Serialize`/`Deserialize`
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
+#[repr(C)]
 pub struct VmClockState {
     /// Guest address in which we write the [`VmClock`] info
     pub guest_address: u64,

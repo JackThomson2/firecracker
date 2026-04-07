@@ -25,7 +25,12 @@ const FUNCTION_MASK_BIT: u8 = 14;
 const MSIX_ENABLE_BIT: u8 = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-/// MSI-X table entries
+#[repr(C)]
+/// MSI-X table entries.
+///
+/// `repr(C)` fixes the in-memory layout so the raw memcpy path in
+/// `snapshot::fast` can encode/decode this as a POD blob without risk of
+/// compiler-chosen field reordering breaking snapshot compatibility.
 pub struct MsixTableEntry {
     /// Lower 32 bits of the vector address
     pub msg_addr_lo: u32,
@@ -58,11 +63,11 @@ impl Default for MsixTableEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// State for (de)serializing MSI-X configuration
 pub struct MsixConfigState {
-    table_entries: Vec<MsixTableEntry>,
-    pba_entries: Vec<u64>,
-    masked: bool,
-    enabled: bool,
-    vectors: Vec<u32>,
+    pub(crate) table_entries: Vec<MsixTableEntry>,
+    pub(crate) pba_entries: Vec<u64>,
+    pub(crate) masked: bool,
+    pub(crate) enabled: bool,
+    pub(crate) vectors: Vec<u32>,
 }
 
 /// MSI-X configuration

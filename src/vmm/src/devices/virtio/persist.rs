@@ -31,30 +31,31 @@ pub enum PersistError {
 
 /// Queue information saved in snapshot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(C)]
 pub struct QueueState {
     /// The maximal size in elements offered by the device
-    max_size: u16,
+    pub(crate) max_size: u16,
 
     /// The queue size in elements the driver selected
-    size: u16,
+    pub(crate) size: u16,
 
     /// Indicates if the queue is finished with configuration
-    ready: bool,
+    pub(crate) ready: bool,
 
     /// Guest physical address of the descriptor table
-    desc_table: u64,
+    pub(crate) desc_table: u64,
 
     /// Guest physical address of the available ring
-    avail_ring: u64,
+    pub(crate) avail_ring: u64,
 
     /// Guest physical address of the used ring
-    used_ring: u64,
+    pub(crate) used_ring: u64,
 
-    next_avail: Wrapping<u16>,
-    next_used: Wrapping<u16>,
+    pub(crate) next_avail: Wrapping<u16>,
+    pub(crate) next_used: Wrapping<u16>,
 
     /// The number of added used buffers since last guest kick
-    num_added: Wrapping<u16>,
+    pub(crate) num_added: Wrapping<u16>,
 }
 
 /// Auxiliary structure for restoring queues.
@@ -192,15 +193,16 @@ impl VirtioDeviceState {
 
 /// Transport information saved in snapshot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(C)]
 pub struct MmioTransportState {
     // The register where feature bits are stored.
-    features_select: u32,
+    pub(crate) features_select: u32,
     // The register where features page is selected.
-    acked_features_select: u32,
-    queue_select: u32,
-    device_status: u32,
-    config_generation: u32,
-    interrupt_status: u32,
+    pub(crate) acked_features_select: u32,
+    pub(crate) queue_select: u32,
+    pub(crate) device_status: u32,
+    pub(crate) config_generation: u32,
+    pub(crate) interrupt_status: u32,
 }
 
 /// Auxiliary structure for initializing the transport when resuming from a snapshot.

@@ -15,14 +15,14 @@ use crate::snapshot::Persist;
 /// vhost-user block device state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VhostUserBlockState {
-    id: String,
-    partuuid: Option<String>,
-    cache_type: CacheType,
-    root_device: bool,
-    socket_path: String,
-    vu_acked_protocol_features: u64,
-    config_space: Vec<u8>,
-    virtio_state: VirtioDeviceState,
+    pub(crate) id: String,
+    pub(crate) partuuid: Option<String>,
+    pub(crate) cache_type: CacheType,
+    pub(crate) root_device: bool,
+    pub(crate) socket_path: String,
+    pub(crate) vu_acked_protocol_features: u64,
+    pub(crate) config_space: Vec<u8>,
+    pub(crate) virtio_state: VirtioDeviceState,
 }
 
 impl Persist<'_> for VhostUserBlock {

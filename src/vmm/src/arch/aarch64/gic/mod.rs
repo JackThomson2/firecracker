@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod gicv2;
-mod gicv3;
-mod regs;
+pub(crate) mod gicv3;
+pub(crate) mod regs;
 
 use gicv2::GICv2;
 use gicv3::GICv3;

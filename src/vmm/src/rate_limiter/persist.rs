@@ -11,12 +11,13 @@ use crate::snapshot::Persist;
 
 /// State for saving a TokenBucket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[repr(C)]
 pub struct TokenBucketState {
-    size: u64,
-    one_time_burst: u64,
-    refill_time: u64,
-    budget: u64,
-    elapsed_ns: u64,
+    pub(crate) size: u64,
+    pub(crate) one_time_burst: u64,
+    pub(crate) refill_time: u64,
+    pub(crate) budget: u64,
+    pub(crate) elapsed_ns: u64,
 }
 
 impl Persist<'_> for TokenBucket {
@@ -55,8 +56,8 @@ impl Persist<'_> for TokenBucket {
 /// State for saving a RateLimiter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimiterState {
-    ops: Option<TokenBucketState>,
-    bandwidth: Option<TokenBucketState>,
+    pub(crate) ops: Option<TokenBucketState>,
+    pub(crate) bandwidth: Option<TokenBucketState>,
 }
 
 impl Persist<'_> for RateLimiter {

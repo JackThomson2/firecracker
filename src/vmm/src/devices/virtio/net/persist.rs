@@ -26,7 +26,7 @@ use crate::vstate::memory::GuestMemoryMmap;
 /// at snapshot.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct NetConfigSpaceState {
-    guest_mac: Option<MacAddr>,
+    pub(crate) guest_mac: Option<MacAddr>,
 }
 
 /// Information about the network device that are saved
@@ -35,11 +35,11 @@ pub struct NetConfigSpaceState {
 pub struct NetState {
     pub id: String,
     pub tap_if_name: String,
-    rx_rate_limiter_state: RateLimiterState,
-    tx_rate_limiter_state: RateLimiterState,
+    pub(crate) rx_rate_limiter_state: RateLimiterState,
+    pub(crate) tx_rate_limiter_state: RateLimiterState,
     /// The associated MMDS network stack.
     pub mmds_ns: Option<MmdsNetworkStackState>,
-    config_space: NetConfigSpaceState,
+    pub(crate) config_space: NetConfigSpaceState,
     pub virtio_state: VirtioDeviceState,
 }
 

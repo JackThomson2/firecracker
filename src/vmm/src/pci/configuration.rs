@@ -71,20 +71,21 @@ fn decode_64_bits_bar_size(bar_size_hi: u32, bar_size_lo: u32) -> u64 {
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
-struct PciBar {
-    addr: u32,
-    size: u32,
-    used: bool,
+#[repr(C)]
+pub(crate) struct PciBar {
+    pub(crate) addr: u32,
+    pub(crate) size: u32,
+    pub(crate) used: bool,
 }
 
 /// PCI configuration space state for (de)serialization
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PciConfigurationState {
-    registers: Vec<u32>,
-    writable_bits: Vec<u32>,
-    bars: Vec<PciBar>,
-    last_capability: Option<(u8, u8)>,
-    msix_cap_reg_idx: Option<u16>,
+    pub(crate) registers: Vec<u32>,
+    pub(crate) writable_bits: Vec<u32>,
+    pub(crate) bars: Vec<PciBar>,
+    pub(crate) last_capability: Option<(u8, u8)>,
+    pub(crate) msix_cap_reg_idx: Option<u16>,
 }
 
 #[derive(Debug)]

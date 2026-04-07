@@ -198,8 +198,8 @@ fn snapshot_state_to_file(
         .open(snapshot_path)
         .map_err(|err| SnapshotBackingFile("open", err))?;
 
-    let snapshot = Snapshot::new(microvm_state);
-    snapshot.save(&mut snapshot_file)?;
+    let snapshot = Snapshot::new(());
+    Snapshot::save_ref(&snapshot.header, microvm_state, &mut snapshot_file)?;
     snapshot_file
         .flush()
         .map_err(|err| SnapshotBackingFile("flush", err))?;

@@ -99,7 +99,6 @@ pub(crate) mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
-    use crate::snapshot::Snapshot;
 
     #[test]
     fn test_boot_config() {
@@ -128,14 +127,12 @@ pub(crate) mod tests {
             kernel_image_path: "./vmlinux.bin".to_string(),
         };
 
-        // Use bitcode serialization directly for the test data
-        let serialized_data = bitcode::serialize(&boot_src_cfg).unwrap();
-        let restored_boot_cfg: BootSourceConfig = bitcode::deserialize(&serialized_data).unwrap();
+        // Test FastSnapshot roundtrip
+        use crate::snapshot::fast::FastSnapshot;
+        let mut buf = Vec::new();
+        boot_src_cfg.encode(&mut buf);
+        let mut offset = 0;
+        let restored_boot_cfg = BootSourceConfig::decode(&buf, &mut offset).unwrap();
         assert_eq!(boot_src_cfg, restored_boot_cfg);
-
-        // Also test with Snapshot wrapper
-        let snapshot_data = bitcode::serialize(&Snapshot::new(boot_src_cfg.clone())).unwrap();
-        let restored_snapshot = Snapshot::load_without_crc_check(&snapshot_data).unwrap();
-        assert_eq!(boot_src_cfg, restored_snapshot.data);
     }
 }
