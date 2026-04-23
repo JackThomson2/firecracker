@@ -6,6 +6,7 @@
 import json
 import logging
 import platform
+import time
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,20 @@ from integration_tests.functional.test_balloon import (
 )
 
 pytestmark = pytest.mark.nonci
+
+
+def _check_guest_clock_advances(ssh_connection, sleep_sec=1, tolerance_sec=1):
+    # Can't compare guest time to host time here: phase1 and restore run as
+    # separate pipeline steps with elapsed time between them, and snapshot
+    # restore preserves the guest's KVM-clock from capture time. Instead,
+    # sample twice and verify the clock advanced by roughly sleep_sec.
+    _, first, _ = ssh_connection.check_output("date +%s")
+    time.sleep(sleep_sec)
+    _, second, _ = ssh_connection.check_output("date +%s")
+    elapsed = int(second.strip()) - int(first.strip())
+    assert (
+        abs(elapsed - sleep_sec) <= tolerance_sec
+    ), f"Guest clock advanced by {elapsed}s over {sleep_sec}s sleep"
 
 
 def _test_balloon(microvm):
@@ -132,5 +147,8 @@ def test_snap_restore_from_artifacts(
 
     logger.info("Testing entropy...")
     check_entropy(vm.ssh)
+
+    logger.info("Testing guest clock advances...")
+    _check_guest_clock_advances(vm.ssh)
 
     vm.kill()
