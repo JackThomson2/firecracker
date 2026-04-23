@@ -2,119 +2,67 @@
 # Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Generate Buildkite Cross Snapshot/Restore pipelines dynamically
+"""Tester pipeline: aarch64 5.10 -> 6.1 snapshot restore only.
 
-1. Generate snapshots for each instance and kernel version
-2. wait
-3. Restore snapshots across instances and kernels
+Throwaway pipeline to probe whether aarch64 snapshots taken on a 5.10
+host can be restored on a 6.1 host, across all Graviton instance types
+and every guest kernel variant phase1 parametrizes. Expected to fail;
+kept separate from pipeline_cross.py so it doesn't pollute the real
+cross-restore matrix.
 """
 
-import itertools
-
-from common import DEFAULT_PLATFORMS, BKPipeline
+from common import BKPipeline
 
 if __name__ == "__main__":
     pipeline = BKPipeline()
     per_instance = pipeline.per_instance.copy()
     per_instance.pop("instances")
     per_instance.pop("platforms")
-    instances_x86_64 = [
-        "m5n.metal",
-        "m6i.metal",
-        "m7i.metal-24xl",
-        "m7i.metal-48xl",
-        "m8i.metal-48xl",
-        "m6a.metal",
-        "m7a.metal-48xl",
-    ]
+
     instances_aarch64 = ["m6g.metal", "m7g.metal", "m8g.metal-24xl"]
-    restore_only_platforms = [("al2023", "linux_6.18")]
-    x86_64_platforms = DEFAULT_PLATFORMS + restore_only_platforms
+    src_platform = ("al2", "linux_5.10")
+    dst_platform = ("al2023", "linux_6.1")
+
     commands = [
         "./tools/devtool -y test --no-build --no-archive -- -m nonci -n4 integration_tests/functional/test_snapshot_phase1.py",
-        # punch holes in mem snapshot tiles and tar them so they are preserved in S3
         "find test_results/test_snapshot_phase1 -type f -name mem |xargs -P4 -t -n1 fallocate -d",
         "mv -v test_results/test_snapshot_phase1 snapshot_artifacts",
         "mkdir -pv snapshots",
         "tar cSvf snapshots/{instance}_{kv}.tar snapshot_artifacts",
     ]
     pipeline.build_group(
-        "snapshot-create",
-        commands,
-        timeout=30,
-        artifact_paths="snapshots/**/*",
-        instances=instances_x86_64,
-        platforms=DEFAULT_PLATFORMS,
-    )
-
-    # https://github.com/firecracker-microvm/firecracker/blob/main/docs/kernel-policy.md#experimental-snapshot-compatibility-across-kernel-versions
-    aarch64_platforms = [("al2023", "linux_6.1")]
-    pipeline.build_group(
-        "snapshot-create-aarch64",
+        "snapshot-create-aarch64-5.10",
         commands,
         timeout=30,
         artifact_paths="snapshots/**/*",
         instances=instances_aarch64,
-        platforms=aarch64_platforms,
+        platforms=[src_platform],
     )
     pipeline.add_step("wait")
 
-    # allow-list of what instances can be restored on what other instances (in
-    # addition to itself). aarch64 is restricted to same-instance restores.
-    supported = {
-        "m5n.metal": ["m6i.metal"],
-        "m6i.metal": ["m5n.metal"],
-    }
-    aarch64_all_platforms = aarch64_platforms + restore_only_platforms
-    perms_aarch64 = itertools.product(
-        instances_aarch64, aarch64_platforms, instances_aarch64, aarch64_all_platforms
-    )
-
-    perms_x86_64 = itertools.product(
-        instances_x86_64, DEFAULT_PLATFORMS, instances_x86_64, x86_64_platforms
-    )
+    src_kv = src_platform[1]
+    dst_os, dst_kv = dst_platform
     steps = []
-    for (
-        src_instance,
-        (_, src_kv),
-        dst_instance,
-        (dst_os, dst_kv),
-    ) in itertools.chain(perms_x86_64, perms_aarch64):
-        # the integration tests already test src == dst, so we skip it
-        if src_instance == dst_instance and src_kv == dst_kv:
-            continue
-        # newer -> older is not supported, and does not work
-        if src_kv > dst_kv:
-            continue
-        # only test cross-kernel restore between adjacent kernel versions
-        if src_kv == "linux_5.10" and dst_kv == "linux_6.18":
-            continue
-        if src_instance != dst_instance and dst_instance not in supported.get(
-            src_instance, []
-        ):
-            continue
-
-        pytest_keyword_for_instance = {
-            "m5n.metal": "-k 'not None'",
-            "m6i.metal": "-k 'not None'",
-            "m6a.metal": "",
-        }
-        k_val = pytest_keyword_for_instance.get(dst_instance, "")
-        step = {
-            "command": [
-                f"buildkite-agent artifact download snapshots/{src_instance}_{src_kv}.tar .",
-                f"tar xSvf snapshots/{src_instance}_{src_kv}.tar",
-                *pipeline.devtool_test(
-                    pytest_opts=f"-m nonci -n8 --dist worksteal {k_val} integration_tests/functional/test_snapshot_restore_cross_kernel.py",
-                ),
-            ],
-            "label": f"snapshot-restore-src-{src_instance}-{src_kv}-dst-{dst_instance}-{dst_kv}",
-            "timeout": 30,
-            "agents": {"instance": dst_instance, "kv": dst_kv, "os": dst_os},
-            **per_instance,
-        }
-        steps.append(step)
+    for instance in instances_aarch64:
+        steps.append(
+            {
+                "command": [
+                    f"buildkite-agent artifact download snapshots/{instance}_{src_kv}.tar .",
+                    f"tar xSvf snapshots/{instance}_{src_kv}.tar",
+                    *pipeline.devtool_test(
+                        pytest_opts=(
+                            "-m nonci -n8 --dist worksteal "
+                            "integration_tests/functional/test_snapshot_restore_cross_kernel.py"
+                        ),
+                    ),
+                ],
+                "label": f"snapshot-restore-src-{instance}-{src_kv}-dst-{instance}-{dst_kv}",
+                "timeout": 30,
+                "agents": {"instance": instance, "kv": dst_kv, "os": dst_os},
+                **per_instance,
+            }
+        )
     pipeline.add_step(
-        {"group": "snapshot-restore-across-instances-and-kernels", "steps": steps}
+        {"group": "snapshot-restore-aarch64-5.10-to-6.1", "steps": steps}
     )
     print(pipeline.to_json())
