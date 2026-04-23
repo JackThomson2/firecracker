@@ -14,6 +14,7 @@ import pytest
 from framework.defs import FC_WORKSPACE_DIR
 from framework.utils import (
     check_entropy,
+    check_network_data_integrity,
     generate_mmds_get_request,
     generate_mmds_session_token,
     guest_run_fio_iteration,
@@ -132,6 +133,9 @@ def test_snap_restore_from_artifacts(
     for idx, iface in enumerate(vm.iface.values()):
         logger.info("Testing net device %s...", iface["iface"].dev_name)
         vm.ssh_iface(idx).check_output("true")
+
+    logger.info("Testing network data integrity...")
+    check_network_data_integrity(vm.ssh)
 
     logger.info("Testing data store behavior...")
     _test_mmds(vm, vm.iface["eth3"]["iface"])
