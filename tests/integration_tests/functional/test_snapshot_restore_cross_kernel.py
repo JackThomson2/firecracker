@@ -76,7 +76,7 @@ def get_snapshot_dirs():
         cpu_templates = ["None"]
     cpu_templates += get_supported_cpu_templates()
     for cpu_template in cpu_templates:
-        for snapshot_dir in snapshot_root_dir.glob(f"*_{cpu_template}_guest_snapshot"):
+        for snapshot_dir in snapshot_root_dir.glob(f"**/*_{cpu_template}_guest_snapshot"):
             assert snapshot_dir.is_dir()
             yield pytest.param(snapshot_dir, id=snapshot_dir.name)
 
