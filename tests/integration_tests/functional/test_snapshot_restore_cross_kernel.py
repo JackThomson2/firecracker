@@ -76,7 +76,9 @@ def get_snapshot_dirs():
         cpu_templates = ["None"]
     cpu_templates += get_supported_cpu_templates()
     for cpu_template in cpu_templates:
-        for snapshot_dir in snapshot_root_dir.glob(f"**/*_{cpu_template}_guest_snapshot"):
+        for snapshot_dir in snapshot_root_dir.glob(
+            f"**/*_{cpu_template}_guest_snapshot"
+        ):
             assert snapshot_dir.is_dir()
             yield pytest.param(snapshot_dir, id=snapshot_dir.name)
 
@@ -124,9 +126,7 @@ def test_snap_restore_from_artifacts(
     logger.info("Testing vsock device...")
     check_vsock_device(vm, bin_vsock_path, test_fc_session_root_path, vm.ssh)
 
-    # Run fio on the guest.
-    # TODO: check the result of FIO or use fsck to check that the root device is
-    # not corrupted. No obvious errors will be returned here.
+    logger.info("Testing block device via fio...")
     guest_run_fio_iteration(vm.ssh, 0)
 
     vm.kill()
