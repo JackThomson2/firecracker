@@ -201,9 +201,7 @@ impl From<PendingRx> for PendingRxSet {
     }
 }
 
-pub use self::connection::{VsockConnection, VsockConnectionBackend};
-
-impl VsockConnectionBackend for std::os::unix::net::UnixStream {}
+pub use self::connection::VsockConnection;
 
 type MuxerConnection = self::connection::VsockConnection<std::os::unix::net::UnixStream>;
 

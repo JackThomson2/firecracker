@@ -96,17 +96,10 @@ use crate::devices::virtio::vsock::packet::{VsockPacketHeader, VsockPacketRx, Vs
 use crate::logger::{IncMetric, debug, error, info, warn};
 use crate::utils::wrap_usize_to_u32;
 
-/// Trait that vsock connection backends need to implement.
-///
-/// Used as an alias for `ReadVolatile + Write + WriteVolatile + AsRawFd`
-/// (sadly, trait aliases are not supported,
-/// <https://github.com/rust-lang/rfcs/pull/1733#issuecomment-243840014>).
-pub trait VsockConnectionBackend: ReadVolatile + Write + WriteVolatile + AsRawFd {}
-
 /// A self-managing connection object, that handles communication between a guest-side AF_VSOCK
 /// socket and a host-side `ReadVolatile + Write + WriteVolatile + AsRawFd` stream.
 #[derive(Debug)]
-pub struct VsockConnection<S: VsockConnectionBackend> {
+pub struct VsockConnection<S: ReadVolatile + Write + WriteVolatile + AsRawFd> {
     /// The current connection state.
     state: ConnState,
     /// The local CID. Most of the time this will be the constant `2` (the vsock host CID).
@@ -143,7 +136,7 @@ pub struct VsockConnection<S: VsockConnectionBackend> {
 
 impl<S> VsockChannel for VsockConnection<S>
 where
-    S: VsockConnectionBackend + Debug,
+    S: ReadVolatile + Write + WriteVolatile + AsRawFd + Debug,
 {
     /// Fill in a vsock packet, to be delivered to our peer (the guest driver).
     ///
@@ -407,7 +400,7 @@ where
 
 impl<S> AsRawFd for VsockConnection<S>
 where
-    S: VsockConnectionBackend + Debug,
+    S: ReadVolatile + Write + WriteVolatile + AsRawFd + Debug,
 {
     /// Get the file descriptor that this connection wants polled.
     ///
@@ -420,7 +413,7 @@ where
 
 impl<S> VsockEpollListener for VsockConnection<S>
 where
-    S: VsockConnectionBackend + Debug,
+    S: ReadVolatile + Write + WriteVolatile + AsRawFd + Debug,
 {
     /// Get the event set that this connection is interested in.
     ///
@@ -499,7 +492,7 @@ where
 
 impl<S> VsockConnection<S>
 where
-    S: VsockConnectionBackend + Debug,
+    S: ReadVolatile + Write + WriteVolatile + AsRawFd + Debug,
 {
     /// Create a new guest-initiated connection object.
     pub fn new_peer_init(
@@ -805,11 +798,9 @@ mod tests {
         }
     }
 
-    impl VsockConnectionBackend for TestStream {}
-
     impl<S> VsockConnection<S>
     where
-        S: VsockConnectionBackend + Debug,
+        S: ReadVolatile + Write + WriteVolatile + AsRawFd + Debug,
     {
         /// Get the fwd_cnt value from the connection.
         pub(crate) fn fwd_cnt(&self) -> Wrapping<u32> {
