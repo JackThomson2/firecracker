@@ -116,7 +116,7 @@ impl TestContext {
             guest_txvq,
             guest_evvq,
             device: Vsock::with_queues(self.cid, muxer, queues).unwrap(),
-            _uds_guard: Some(uds_guard),
+            _uds_guard: uds_guard,
         }
     }
 }
@@ -134,7 +134,7 @@ pub struct EventHandlerContext<'a> {
     pub guest_txvq: GuestQ<'a>,
     pub guest_evvq: GuestQ<'a>,
     /// Held so the muxer's UDS file is unlinked when the context drops.
-    pub _uds_guard: Option<UdsGuard>,
+    pub _uds_guard: UdsGuard,
 }
 
 /// RAII guard that unlinks a UDS path on drop. Decoupling the guard from
