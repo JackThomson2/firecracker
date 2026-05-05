@@ -107,11 +107,16 @@ impl TestContext {
         // the memory is write-only.
 
         let queues = vec![rxvq, txvq, evvq];
+        let muxer = fresh_muxer(self.cid);
+        let uds_guard = UdsGuard {
+            path: muxer.host_sock_path().to_owned(),
+        };
         EventHandlerContext {
             guest_rxvq,
             guest_txvq,
             guest_evvq,
-            device: Vsock::with_queues(self.cid, fresh_muxer(self.cid), queues).unwrap(),
+            device: Vsock::with_queues(self.cid, muxer, queues).unwrap(),
+            _uds_guard: Some(uds_guard),
         }
     }
 }
@@ -128,6 +133,22 @@ pub struct EventHandlerContext<'a> {
     pub guest_rxvq: GuestQ<'a>,
     pub guest_txvq: GuestQ<'a>,
     pub guest_evvq: GuestQ<'a>,
+    /// Held so the muxer's UDS file is unlinked when the context drops.
+    pub _uds_guard: Option<UdsGuard>,
+}
+
+/// RAII guard that unlinks a UDS path on drop. Decoupling the guard from
+/// `EventHandlerContext::device` lets tests move `device` (e.g. into an
+/// `Arc<Mutex>`) while the guard still cleans up the original socket file.
+#[derive(Debug)]
+pub struct UdsGuard {
+    path: String,
+}
+
+impl Drop for UdsGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 impl EventHandlerContext<'_> {

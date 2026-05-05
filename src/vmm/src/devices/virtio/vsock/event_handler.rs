@@ -589,10 +589,10 @@ mod tests {
             mut device,
             guest_rxvq,
             guest_txvq,
+            _uds_guard,
             ..
         } = ctx;
         device.backend.enq_rst(0, 0);
-        let host_sock_path = device.backend().host_sock_path().to_owned();
 
         let vsock = Arc::new(Mutex::new(device));
         let _id = event_manager.add_subscriber(vsock.clone());
@@ -645,6 +645,6 @@ mod tests {
             assert_eq!(guest_txvq.used.idx.get(), 1);
         }
 
-        let _ = std::fs::remove_file(&host_sock_path);
+        // _uds_guard goes out of scope here, unlinking the muxer's UDS path.
     }
 }
