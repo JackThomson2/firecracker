@@ -46,7 +46,7 @@ pub struct TestContext {
     pub mem: GuestMemoryMmap,
     pub interrupt: Arc<dyn VirtioInterrupt>,
     pub mem_size: usize,
-    pub device: Vsock<VsockMuxer>,
+    pub device: Vsock,
 }
 
 impl Drop for TestContext {
@@ -129,7 +129,7 @@ impl Default for TestContext {
 
 #[derive(Debug)]
 pub struct EventHandlerContext<'a> {
-    pub device: Vsock<VsockMuxer>,
+    pub device: Vsock,
     pub guest_rxvq: GuestQ<'a>,
     pub guest_txvq: GuestQ<'a>,
     pub guest_evvq: GuestQ<'a>,
@@ -212,18 +212,15 @@ pub fn read_packet_data(pkt: &VsockPacketTx, how_much: u32) -> Vec<u8> {
     buf
 }
 
-impl<B> Vsock<B> {
-    pub fn write_element_in_queue(vsock: &Vsock<B>, idx: usize, val: u64) {
+impl Vsock {
+    pub fn write_element_in_queue(vsock: &Vsock, idx: usize, val: u64) {
         if idx > vsock.queue_events.len() - 1 {
             panic!("Index bigger than the number of queues of this device");
         }
         vsock.queue_events[idx].write(val).unwrap();
     }
 
-    pub fn get_element_from_interest_list(vsock: &Vsock<B>, idx: usize) -> u64
-    where
-        B: AsRawFd,
-    {
+    pub fn get_element_from_interest_list(vsock: &Vsock, idx: usize) -> u64 {
         match idx {
             0..=2 => u64::try_from(vsock.queue_events[idx].as_raw_fd()).unwrap(),
             3 => u64::try_from(vsock.backend.as_raw_fd()).unwrap(),

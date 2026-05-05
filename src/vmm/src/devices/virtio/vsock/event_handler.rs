@@ -5,13 +5,11 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
-use std::fmt::Debug;
-
 /// The vsock object implements the runtime logic of our vsock device:
 /// 1. Respond to TX queue events by wrapping virtio buffers into `VsockPacket`s, then sending
-///    those packets to the `VsockBackend`;
-/// 2. Forward backend FD event notifications to the `VsockBackend`;
-/// 3. Fetch incoming packets from the `VsockBackend` and place them into the virtio RX queue;
+///    those packets to the muxer backend;
+/// 2. Forward backend FD event notifications to the muxer;
+/// 3. Fetch incoming packets from the muxer and place them into the virtio RX queue;
 /// 4. Whenever we have processed some virtio buffers (either TX or RX), let the driver know by
 ///    raising our assigned IRQ.
 ///
@@ -29,7 +27,6 @@ use std::fmt::Debug;
 use event_manager::{EventOps, Events, MutEventSubscriber};
 use vmm_sys_util::epoll::EventSet;
 
-use super::VsockBackend;
 use super::device::{EVQ_INDEX, RXQ_INDEX, TXQ_INDEX, Vsock};
 use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::queue::InvalidAvailIdx;
@@ -37,10 +34,7 @@ use crate::devices::virtio::vsock::defs::VSOCK_NUM_QUEUES;
 use crate::devices::virtio::vsock::metrics::METRICS;
 use crate::logger::{IncMetric, error, warn};
 
-impl<B> Vsock<B>
-where
-    B: Debug + VsockBackend + 'static,
-{
+impl Vsock {
     const PROCESS_ACTIVATE: u32 = 0;
     const PROCESS_RXQ: u32 = 1;
     const PROCESS_TXQ: u32 = 2;
@@ -197,10 +191,7 @@ where
     }
 }
 
-impl<B> MutEventSubscriber for Vsock<B>
-where
-    B: Debug + VsockBackend + 'static,
-{
+impl MutEventSubscriber for Vsock {
     fn process(&mut self, event: Events, ops: &mut EventOps) {
         let source = event.data();
         let evset = event.event_set();
@@ -251,6 +242,7 @@ mod tests {
 
     use super::super::*;
     use super::*;
+    use crate::devices::virtio::vsock::packet::{VsockPacketRx, VsockPacketTx};
     use crate::devices::virtio::vsock::test_utils::{EventHandlerContext, TestContext};
 
     #[test]

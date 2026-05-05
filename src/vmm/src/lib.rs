@@ -147,7 +147,7 @@ use crate::devices::virtio::mem::{VIRTIO_MEM_DEV_ID, VirtioMemError, VirtioMemSt
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::pmem::device::Pmem;
 use crate::devices::virtio::rng::Entropy;
-use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
+use crate::devices::virtio::vsock::Vsock;
 use crate::logger::{METRICS, MetricsError};
 use crate::mmds::data_store::Mmds;
 use crate::persist::{MicrovmState, MicrovmStateError, VmInfo};
@@ -403,7 +403,7 @@ impl Vmm {
                     }
                 }
                 VirtioDeviceType::Vsock => {
-                    if let Some(v) = device.as_any().downcast_ref::<Vsock<VsockUnixBackend>>() {
+                    if let Some(v) = device.as_any().downcast_ref::<Vsock>() {
                         vsock = Some(VsockDeviceConfig::from(v));
                     }
                 }

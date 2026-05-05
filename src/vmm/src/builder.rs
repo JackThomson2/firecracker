@@ -36,7 +36,7 @@ use crate::devices::virtio::mem::{VIRTIO_MEM_DEFAULT_SLOT_SIZE_MIB, VirtioMem};
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::pmem::device::Pmem;
 use crate::devices::virtio::rng::Entropy;
-use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
+use crate::devices::virtio::vsock::Vsock;
 #[cfg(feature = "gdb")]
 use crate::gdb;
 use crate::initrd::{InitrdConfig, InitrdError};
@@ -755,7 +755,7 @@ fn attach_unixsock_vsock_device(
     device_manager: &mut DeviceManager,
     vm: &Arc<Vm>,
     cmdline: &mut LoaderKernelCmdline,
-    unix_vsock: &Arc<Mutex<Vsock<VsockUnixBackend>>>,
+    unix_vsock: &Arc<Mutex<Vsock>>,
     event_manager: &mut EventManager,
 ) -> Result<(), AttachDeviceError> {
     let id = String::from(unix_vsock.lock().expect("Poisoned lock").id());

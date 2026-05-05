@@ -288,8 +288,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 VirtioDeviceType::Vsock => {
                     let vsock = locked_device
                         .as_mut_any()
-                        // Currently, VsockUnixBackend is the only implementation of VsockBackend.
-                        .downcast_mut::<Vsock<VsockUnixBackend>>()
+                        .downcast_mut::<Vsock>()
                         .unwrap();
 
                     // Save state after potential notification to the guest. This

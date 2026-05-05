@@ -23,15 +23,11 @@ pub mod persist;
 pub mod test_utils;
 mod txbuf;
 
-use std::os::unix::io::AsRawFd;
-
 use vm_memory::GuestMemoryError;
-use vmm_sys_util::epoll::EventSet;
 
 pub use self::defs::VSOCK_DEV_ID;
 pub use self::device::Vsock;
 pub use self::muxer::VsockMuxer as VsockUnixBackend;
-use self::packet::{VsockPacketRx, VsockPacketTx};
 use super::iov_deque::IovDequeError;
 use crate::devices::virtio::iovec::IoVecError;
 use crate::devices::virtio::persist::PersistError as VirtioStateError;
@@ -283,44 +279,6 @@ impl From<IoVecError> for VsockError {
         }
     }
 }
-
-/// A passive, event-driven object, that needs to be notified whenever an epoll-able event occurs.
-/// An event-polling control loop will use `as_raw_fd()` and `get_polled_evset()` to query
-/// the listener for the file descriptor and the set of events it's interested in. When such an
-/// event occurs, the control loop will route the event to the listener via `notify()`.
-pub trait VsockEpollListener: AsRawFd {
-    /// Get the set of events for which the listener wants to be notified.
-    fn get_polled_evset(&self) -> EventSet;
-
-    /// Notify the listener that one ore more events have occurred.
-    fn notify(&mut self, evset: EventSet);
-}
-
-/// Any channel that handles vsock packet traffic: sending and receiving packets. Since we're
-/// implementing the device model here, our responsibility is to always process the sending of
-/// packets (i.e. the TX queue). So, any locally generated data, addressed to the driver (e.g.
-/// a connection response or RST), will have to be queued, until we get to processing the RX queue.
-///
-/// Note: `recv_pkt()` and `send_pkt()` are named analogous to `Read::read()` and `Write::write()`,
-///       respectively. I.e.
-///       - `recv_pkt(&mut pkt)` will read data from the channel, and place it into `pkt`; and
-///       - `send_pkt(&pkt)` will fetch data from `pkt`, and place it into the channel.
-pub trait VsockChannel {
-    /// Read/receive an incoming packet from the channel.
-    fn recv_pkt(&mut self, pkt: &mut VsockPacketRx) -> Result<(), VsockError>;
-
-    /// Write/send a packet through the channel.
-    fn send_pkt(&mut self, pkt: &VsockPacketTx) -> Result<(), VsockError>;
-
-    /// Checks whether there is pending incoming data inside the channel, meaning that a subsequent
-    /// call to `recv_pkt()` won't fail.
-    fn has_pending_rx(&self) -> bool;
-}
-
-/// The vsock backend, which is basically an epoll-event-driven vsock channel.
-/// Currently, the only implementation we have is `crate::devices::virtio::vsock::muxer::VsockMuxer`,
-/// which translates guest-side vsock connections to host-side Unix domain socket connections.
-pub trait VsockBackend: VsockChannel + VsockEpollListener + Send {}
 
 #[cfg(test)]
 mod csm_tests {

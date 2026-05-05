@@ -471,7 +471,7 @@ mod tests {
         MmioTransport,
         Arc<IrqTrigger>,
         GuestMemoryMmap,
-        Arc<Mutex<Vsock<VsockUnixBackend>>>,
+        Arc<Mutex<Vsock>>,
     ) {
         let mem = default_mem();
         let interrupt = Arc::new(IrqTrigger::new());

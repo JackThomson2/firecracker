@@ -359,8 +359,7 @@ impl<'a> Persist<'a> for PciDevices {
                 VirtioDeviceType::Vsock => {
                     let vsock_dev = locked_virtio_dev
                         .as_mut_any()
-                        // Currently, VsockUnixBackend is the only implementation of VsockBackend.
-                        .downcast_mut::<Vsock<VsockUnixBackend>>()
+                        .downcast_mut::<Vsock>()
                         .unwrap();
 
                     // Save state after potential notification to the guest. This

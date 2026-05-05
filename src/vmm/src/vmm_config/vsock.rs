@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::devices::virtio::vsock::{Vsock, VsockError, VsockUnixBackend};
 
-type MutexVsockUnix = Arc<Mutex<Vsock<VsockUnixBackend>>>;
+type MutexVsockUnix = Arc<Mutex<Vsock>>;
 
 /// Errors associated with `NetworkInterfaceConfig`.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -51,8 +51,8 @@ impl From<&VsockAndUnixPath> for VsockDeviceConfig {
     }
 }
 
-impl From<&Vsock<VsockUnixBackend>> for VsockDeviceConfig {
-    fn from(vsock: &Vsock<VsockUnixBackend>) -> Self {
+impl From<&Vsock> for VsockDeviceConfig {
+    fn from(vsock: &Vsock) -> Self {
         VsockDeviceConfig {
             vsock_id: None, // deprecated
             guest_cid: u32::try_from(vsock.cid()).unwrap(),
@@ -74,7 +74,7 @@ impl VsockBuilder {
     }
 
     /// Inserts an existing vsock device.
-    pub fn set_device(&mut self, device: Arc<Mutex<Vsock<VsockUnixBackend>>>) {
+    pub fn set_device(&mut self, device: Arc<Mutex<Vsock>>) {
         self.inner = Some(VsockAndUnixPath {
             uds_path: device
                 .lock()
@@ -110,7 +110,7 @@ impl VsockBuilder {
     /// Creates a Vsock device from a VsockDeviceConfig.
     pub fn create_unixsock_vsock(
         cfg: VsockDeviceConfig,
-    ) -> Result<Vsock<VsockUnixBackend>, VsockConfigError> {
+    ) -> Result<Vsock, VsockConfigError> {
         let backend = VsockUnixBackend::new(u64::from(cfg.guest_cid), cfg.uds_path)
             .map_err(VsockConfigError::CreateVsockBackend)?;
 

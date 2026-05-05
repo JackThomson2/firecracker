@@ -3,7 +3,6 @@
 
 //! Defines state and support structures for persisting Vsock devices and backends.
 
-use std::fmt::Debug;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -42,13 +41,13 @@ pub struct VsockBackendState {
     pub local_port_last: u32,
 }
 
-/// A helper structure that holds the constructor arguments for VsockUnixBackend
+/// A helper structure that holds the constructor arguments for the Vsock device.
 #[derive(Debug)]
-pub struct VsockConstructorArgs<B> {
+pub struct VsockConstructorArgs {
     /// Pointer to guest memory.
     pub mem: GuestMemoryMmap,
     /// The vsock Unix Backend.
-    pub backend: B,
+    pub backend: VsockUnixBackend,
 }
 
 /// A helper structure that holds the constructor arguments for VsockUnixBackend
@@ -80,12 +79,9 @@ impl Persist<'_> for VsockUnixBackend {
     }
 }
 
-impl<B> Persist<'_> for Vsock<B>
-where
-    B: VsockBackend + 'static + Debug,
-{
+impl Persist<'_> for Vsock {
     type State = VsockFrontendState;
-    type ConstructorArgs = VsockConstructorArgs<B>;
+    type ConstructorArgs = VsockConstructorArgs;
     type Error = VsockError;
 
     fn save(&self) -> Self::State {

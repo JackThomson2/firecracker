@@ -20,7 +20,6 @@
 //! - an event queue FD; and
 //! - a backend FD.
 
-use std::fmt::Debug;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -28,8 +27,9 @@ use vmm_sys_util::eventfd::EventFd;
 
 use super::super::super::DeviceError;
 use super::defs::uapi;
+use super::muxer::VsockMuxer;
 use super::packet::{VSOCK_PKT_HDR_SIZE, VsockPacketRx, VsockPacketTx};
-use super::{VsockBackend, defs};
+use super::defs;
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::generated::virtio_config::{VIRTIO_F_IN_ORDER, VIRTIO_F_VERSION_1};
@@ -57,11 +57,11 @@ pub(crate) const AVAIL_FEATURES: u64 =
 
 /// Structure representing the vsock device.
 #[derive(Debug)]
-pub struct Vsock<B> {
+pub struct Vsock {
     cid: u64,
     pub(crate) queues: Vec<VirtQueue>,
     pub(crate) queue_events: Vec<EventFd>,
-    pub(crate) backend: B,
+    pub(crate) backend: VsockMuxer,
     pub(crate) avail_features: u64,
     pub(crate) acked_features: u64,
     // This EventFd is the only one initially registered for a vsock device, and is used to convert
@@ -96,17 +96,14 @@ pub struct Vsock<B> {
 //    unregister any EPOLLIN listeners, since otherwise it will keep spinning, unable to consume its
 //    EPOLLIN events.
 
-impl<B> Vsock<B>
-where
-    B: VsockBackend + Debug,
-{
+impl Vsock {
     /// Auxiliary function for creating a new virtio-vsock device with the given VM CID, vsock
     /// backend and empty virtio queues.
     pub fn with_queues(
         cid: u64,
-        backend: B,
+        backend: VsockMuxer,
         queues: Vec<VirtQueue>,
-    ) -> Result<Vsock<B>, VsockError> {
+    ) -> Result<Vsock, VsockError> {
         let mut queue_events = Vec::new();
         for _ in 0..queues.len() {
             queue_events.push(EventFd::new(libc::EFD_NONBLOCK).map_err(VsockError::EventFd)?);
@@ -128,7 +125,7 @@ where
     }
 
     /// Create a new virtio-vsock device with the given VM CID and vsock backend.
-    pub fn new(cid: u64, backend: B) -> Result<Vsock<B>, VsockError> {
+    pub fn new(cid: u64, backend: VsockMuxer) -> Result<Vsock, VsockError> {
         let queues: Vec<VirtQueue> = defs::VSOCK_QUEUE_SIZES
             .iter()
             .map(|&max_size| VirtQueue::new(max_size))
@@ -142,7 +139,7 @@ where
     }
 
     /// Access the backend behind the device.
-    pub fn backend(&self) -> &B {
+    pub fn backend(&self) -> &VsockMuxer {
         &self.backend
     }
 
@@ -306,10 +303,7 @@ where
     }
 }
 
-impl<B> VirtioDevice for Vsock<B>
-where
-    B: VsockBackend + Debug + 'static,
-{
+impl VirtioDevice for Vsock {
     impl_device_type!(VirtioDeviceType::Vsock);
 
     fn id(&self) -> &str {

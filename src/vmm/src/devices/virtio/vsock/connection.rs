@@ -88,9 +88,7 @@ use vmm_sys_util::epoll::EventSet;
 
 use super::defs::uapi;
 use super::txbuf::TxBuf;
-use super::{
-    ConnState, PendingRx, PendingRxSet, VsockChannel, VsockEpollListener, VsockError, defs,
-};
+use super::{ConnState, PendingRx, PendingRxSet, VsockError, defs};
 use crate::devices::virtio::vsock::metrics::METRICS;
 use crate::devices::virtio::vsock::packet::{VsockPacketHeader, VsockPacketRx, VsockPacketTx};
 use crate::logger::{IncMetric, debug, error, info, warn};
@@ -134,14 +132,14 @@ pub struct VsockConnection<S: ReadVolatile + Write + WriteVolatile + AsRawFd> {
     expiry: Option<Instant>,
 }
 
-impl<S> VsockChannel for VsockConnection<S>
+impl<S> VsockConnection<S>
 where
     S: ReadVolatile + Write + WriteVolatile + AsRawFd + Debug,
 {
     /// Fill in a vsock packet, to be delivered to our peer (the guest driver).
     ///
-    /// As per the `VsockChannel` trait, this should only be called when there is data to be
-    /// fetched from the channel (i.e. `has_pending_rx()` is true). Otherwise, it will error
+    /// This should only be called when there is data to be fetched from the
+    /// channel (i.e. `has_pending_rx()` is true). Otherwise, it will error
     /// out with `VsockError::NoData`.
     /// Pending RX indications are set by other mutable actions performed on the channel. For
     /// instance, `send_pkt()` could set an Rst indication, if called with a VSOCK_OP_SHUTDOWN
@@ -153,7 +151,7 @@ where
     /// - `Err(VsockError::NoData)`: there was no data available with which to fill in the packet;
     /// - `Err(VsockError::PktBufMissing)`: the packet would've been filled in with data, but it is
     ///   missing the data buffer.
-    fn recv_pkt(&mut self, pkt: &mut VsockPacketRx) -> Result<(), VsockError> {
+    pub fn recv_pkt(&mut self, pkt: &mut VsockPacketRx) -> Result<(), VsockError> {
         // Perform some generic initialization that is the same for any packet operation (e.g.
         // source, destination, credit, etc).
         self.init_pkt_hdr(&mut pkt.hdr);
@@ -285,7 +283,7 @@ where
     ///
     /// Returns:
     /// always `Ok(())`: the packet has been consumed;
-    fn send_pkt(&mut self, pkt: &VsockPacketTx) -> Result<(), VsockError> {
+    pub fn send_pkt(&mut self, pkt: &VsockPacketTx) -> Result<(), VsockError> {
         // Update the peer credit information.
         self.peer_buf_alloc = pkt.hdr.buf_alloc();
         self.peer_fwd_cnt = Wrapping(pkt.hdr.fwd_cnt());
@@ -393,35 +391,17 @@ where
     }
 
     /// Check if the connection has any pending packet addressed to the peer.
-    fn has_pending_rx(&self) -> bool {
+    pub fn has_pending_rx(&self) -> bool {
         !self.pending_rx.is_empty()
     }
-}
 
-impl<S> AsRawFd for VsockConnection<S>
-where
-    S: ReadVolatile + Write + WriteVolatile + AsRawFd + Debug,
-{
-    /// Get the file descriptor that this connection wants polled.
-    ///
-    /// The connection is interested in being notified about EPOLLIN / EPOLLOUT events on the
-    /// host stream.
-    fn as_raw_fd(&self) -> RawFd {
-        self.stream.as_raw_fd()
-    }
-}
-
-impl<S> VsockEpollListener for VsockConnection<S>
-where
-    S: ReadVolatile + Write + WriteVolatile + AsRawFd + Debug,
-{
     /// Get the event set that this connection is interested in.
     ///
     /// A connection will want to be notified when:
     /// - data is available to be read from the host stream, so that it can store an RW pending RX
     ///   indication; and
     /// - data can be written to the host stream, and the TX buffer needs to be flushed.
-    fn get_polled_evset(&self) -> EventSet {
+    pub fn get_polled_evset(&self) -> EventSet {
         let mut evset = EventSet::empty();
         if !self.tx_buf.is_empty() {
             // There's data waiting in the TX buffer, so we are interested in being notified
@@ -438,8 +418,14 @@ where
         evset
     }
 
+    /// File descriptor of the host stream backing this connection. Used by
+    /// the muxer to register / unregister the connection with epoll.
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
+    }
+
     /// Notify the connection about an event (or set of events) that it was interested in.
-    fn notify(&mut self, evset: EventSet) {
+    pub fn notify(&mut self, evset: EventSet) {
         if evset.contains(EventSet::IN) {
             // Data can be read from the host stream. Setting a Rw pending indication, so that
             // the muxer will know to call `recv_pkt()` later.

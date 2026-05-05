@@ -41,9 +41,7 @@ use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use super::defs::uapi;
 use super::muxer_killq::MuxerKillQ;
 use super::muxer_rxq::MuxerRxQ;
-use super::{
-    ConnState, MuxerConnection, VsockBackend, VsockChannel, VsockEpollListener, VsockError, defs,
-};
+use super::{ConnState, MuxerConnection, VsockError, defs};
 use crate::devices::virtio::vsock::metrics::METRICS;
 use crate::devices::virtio::vsock::packet::{VsockPacketRx, VsockPacketTx};
 use crate::logger::{IncMetric, debug, error, info, warn};
@@ -116,13 +114,13 @@ pub struct VsockMuxer {
     pub(crate) local_port_last: u32,
 }
 
-impl VsockChannel for VsockMuxer {
+impl VsockMuxer {
     /// Deliver a vsock packet to the guest vsock driver.
     ///
     /// Retuns:
     /// - `Ok(())`: `pkt` has been successfully filled in; or
     /// - `Err(VsockError::NoData)`: there was no available data with which to fill in the packet.
-    fn recv_pkt(&mut self, pkt: &mut VsockPacketRx) -> Result<(), VsockError> {
+    pub fn recv_pkt(&mut self, pkt: &mut VsockPacketRx) -> Result<(), VsockError> {
         // We'll look for instructions on how to build the RX packet in the RX queue. If the
         // queue is empty, that doesn't necessarily mean we don't have any pending RX, since
         // the queue might be out-of-sync. If that's the case, we'll attempt to sync it first,
@@ -196,7 +194,7 @@ impl VsockChannel for VsockMuxer {
     /// Returns:
     /// always `Ok(())` - the packet has been consumed, and its virtio TX buffers can be
     /// returned to the guest vsock driver.
-    fn send_pkt(&mut self, pkt: &VsockPacketTx) -> Result<(), VsockError> {
+    pub fn send_pkt(&mut self, pkt: &VsockPacketTx) -> Result<(), VsockError> {
         let conn_key = ConnMapKey {
             local_port: pkt.hdr.dst_port(),
             peer_port: pkt.hdr.src_port(),
@@ -258,32 +256,20 @@ impl VsockChannel for VsockMuxer {
 
     /// Check if the muxer has any pending RX data, with which to fill a guest-provided RX
     /// buffer.
-    fn has_pending_rx(&self) -> bool {
+    pub fn has_pending_rx(&self) -> bool {
         !self.rxq.is_empty() || !self.rxq.is_synced()
     }
-}
 
-impl AsRawFd for VsockMuxer {
-    /// Get the FD to be registered for polling upstream (in the main VMM epoll loop, in this
-    /// case).
-    ///
-    /// This will be the muxer's nested epoll FD.
-    fn as_raw_fd(&self) -> RawFd {
-        self.epoll.as_raw_fd()
-    }
-}
-
-impl VsockEpollListener for VsockMuxer {
     /// Get the epoll events to be polled upstream.
     ///
     /// Since the polled FD is a nested epoll FD, we're only interested in EPOLLIN events (i.e.
     /// some event occurred on one of the FDs registered under our epoll FD).
-    fn get_polled_evset(&self) -> EventSet {
+    pub fn get_polled_evset(&self) -> EventSet {
         EventSet::IN
     }
 
     /// Notify the muxer about a pending event having occured under its nested epoll FD.
-    fn notify(&mut self, _: EventSet) {
+    pub fn notify(&mut self, _: EventSet) {
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         match self.epoll.wait(0, epoll_events.as_mut_slice()) {
             Ok(ev_cnt) => {
@@ -305,7 +291,15 @@ impl VsockEpollListener for VsockMuxer {
     }
 }
 
-impl VsockBackend for VsockMuxer {}
+impl AsRawFd for VsockMuxer {
+    /// Get the FD to be registered for polling upstream (in the main VMM epoll loop, in this
+    /// case).
+    ///
+    /// This will be the muxer's nested epoll FD.
+    fn as_raw_fd(&self) -> RawFd {
+        self.epoll.as_raw_fd()
+    }
+}
 
 impl VsockMuxer {
     /// Muxer constructor.
