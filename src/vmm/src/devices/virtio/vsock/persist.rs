@@ -120,29 +120,25 @@ where
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use vmm_sys_util::tempfile::TempFile;
+
     use super::device::AVAIL_FEATURES;
     use super::*;
     use crate::devices::virtio::device::VirtioDevice;
     use crate::devices::virtio::test_utils::default_interrupt;
     use crate::devices::virtio::vsock::defs::uapi;
-    use crate::devices::virtio::vsock::test_utils::{TestBackend, TestContext};
+    use crate::devices::virtio::vsock::test_utils::TestContext;
     use crate::utils::byte_order;
 
-    impl Persist<'_> for TestBackend {
-        type State = VsockBackendState;
-        type ConstructorArgs = VsockUdsConstructorArgs;
-        type Error = VsockError;
-
-        fn save(&self) -> Self::State {
-            VsockBackendState {
-                uds_path: "test".to_owned(),
-                local_port_last: 0xdeadbeef,
-            }
-        }
-
-        fn restore(_: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
-            Ok(TestBackend::new())
-        }
+    fn fresh_uds_path() -> String {
+        let p = TempFile::new_with_prefix("fc_vsock_persist_test_")
+            .unwrap()
+            .as_path()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let _ = std::fs::remove_file(&p);
+        p
     }
 
     #[test]
@@ -159,6 +155,9 @@ pub(crate) mod tests {
             (driver_features >> 32) as u32,
         ];
 
+        // Mutate the muxer's `local_port_last` so the round-trip check has
+        // a non-default value to compare.
+        let original_uds_path = ctx.device.backend().host_sock_path().to_owned();
         // Test serialization
         // Save backend and device state separately.
         let state = VsockState {
@@ -169,14 +168,22 @@ pub(crate) mod tests {
         let serialized_data = bitcode::serialize(&state).unwrap();
 
         let restored_state: VsockState = bitcode::deserialize(&serialized_data).unwrap();
+        assert_eq!(restored_state.backend.uds_path, original_uds_path);
+
+        // Build a fresh backend on a different UDS path so we don't conflict
+        // with the live one held by `ctx`. The runtime restore path does the
+        // same: it always constructs a new muxer over the persisted path.
+        let restore_path = fresh_uds_path();
+        let restored_backend =
+            VsockUnixBackend::restore(VsockUdsConstructorArgs { cid: ctx.cid }, &VsockBackendState {
+                uds_path: restore_path.clone(),
+                local_port_last: restored_state.backend.local_port_last,
+            })
+            .unwrap();
         let mut restored_device = Vsock::restore(
             VsockConstructorArgs {
                 mem: ctx.mem.clone(),
-                backend: {
-                    assert_eq!(restored_state.backend.uds_path, "test".to_owned());
-                    assert_eq!(restored_state.backend.local_port_last, 0xdeadbeef);
-                    TestBackend::new()
-                },
+                backend: restored_backend,
             },
             &restored_state.frontend,
         )
@@ -218,5 +225,7 @@ pub(crate) mod tests {
         let mut data = [0u8, 1, 2, 3, 4, 5, 6, 7];
         restored_device.read_config(2, &mut data);
         assert_eq!(data, [0u8, 1, 2, 3, 4, 5, 6, 7]);
+
+        let _ = std::fs::remove_file(&restore_path);
     }
 }

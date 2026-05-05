@@ -778,7 +778,7 @@ impl VsockMuxer {
     /// Enqueue errors aren't propagated up the call chain, since there is nothing we can do to
     /// handle them. We do, however, log a warning, since not being able to enqueue an RST
     /// packet means we have to drop it, which is not normal operation.
-    fn enq_rst(&mut self, local_port: u32, peer_port: u32) {
+    pub(crate) fn enq_rst(&mut self, local_port: u32, peer_port: u32) {
         let pushed = self.rxq.push(MuxerRx::RstPkt {
             local_port,
             peer_port,

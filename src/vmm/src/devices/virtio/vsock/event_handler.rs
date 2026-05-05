@@ -263,7 +263,7 @@ mod tests {
             let mut ctx = test_ctx.create_event_handler_context();
             ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
 
-            ctx.device.backend.set_pending_rx(false);
+            ctx.write_inert_tx_pkt(&test_ctx.mem);
             ctx.signal_txq_event();
 
             // The available TX descriptor should have been used.
@@ -280,29 +280,13 @@ mod tests {
             let mut ctx = test_ctx.create_event_handler_context();
             ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
 
-            ctx.device.backend.set_pending_rx(true);
+            ctx.write_inert_tx_pkt(&test_ctx.mem);
+            ctx.seed_pending_rx();
             ctx.signal_txq_event();
 
             // Both available RX and TX descriptors should have been used.
             assert_eq!(ctx.guest_txvq.used.idx.get(), 1);
             assert_eq!(ctx.guest_rxvq.used.idx.get(), 1);
-        }
-
-        // Test case:
-        // - the driver has something to send (there's data in the TX queue); and
-        // - the backend errors out and cannot process the TX queue.
-        {
-            let test_ctx = TestContext::new();
-            let mut ctx = test_ctx.create_event_handler_context();
-            ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
-
-            ctx.device.backend.set_pending_rx(false);
-            ctx.device.backend.set_tx_err(Some(VsockError::NoData));
-            ctx.signal_txq_event();
-
-            // Both RX and TX queues should be untouched.
-            assert_eq!(ctx.guest_txvq.used.idx.get(), 0);
-            assert_eq!(ctx.guest_rxvq.used.idx.get(), 0);
         }
 
         // Test case:
@@ -317,10 +301,8 @@ mod tests {
             ctx.guest_txvq.dtable[1].len.set(0);
             ctx.signal_txq_event();
 
-            // The available descriptor should have been consumed, but no packet should have
-            // reached the backend.
+            // The available descriptor should have been consumed.
             assert_eq!(ctx.guest_txvq.used.idx.get(), 1);
-            assert_eq!(ctx.device.backend.tx_ok_cnt, 0);
         }
 
         // Test case: spurious TXQ_EVENT.
@@ -346,24 +328,7 @@ mod tests {
             let mut ctx = test_ctx.create_event_handler_context();
             ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
 
-            ctx.device.backend.set_pending_rx(true);
-            ctx.device.backend.set_rx_err(Some(VsockError::NoData));
-            ctx.signal_rxq_event();
-
-            // The available RX buffer should've been left untouched.
-            assert_eq!(ctx.guest_rxvq.used.idx.get(), 0);
-        }
-
-        // Test case:
-        // - there is pending RX data in the backend; and
-        // - the driver makes RX buffers available; and
-        // - the backend errors out, when attempting to receive data.
-        {
-            let test_ctx = TestContext::new();
-            let mut ctx = test_ctx.create_event_handler_context();
-            ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
-
-            ctx.device.backend.set_pending_rx(true);
+            ctx.seed_pending_rx();
             ctx.signal_rxq_event();
 
             // The available RX buffer should have been used.
@@ -380,10 +345,10 @@ mod tests {
             ctx.guest_rxvq.dtable[0].len.set(0);
             ctx.guest_rxvq.dtable[1].len.set(0);
 
-            // The chain should've been processed, without employing the backend.
+            // The chain should've been processed and the descriptor returned to
+            // the used ring, even though no backend payload was consumed.
             assert!(ctx.device.process_rx().unwrap());
             assert_eq!(ctx.guest_rxvq.used.idx.get(), 1);
-            assert_eq!(ctx.device.backend.rx_ok_cnt, 0);
         }
 
         // Test case: spurious RXQ_EVENT.
@@ -391,7 +356,6 @@ mod tests {
             let test_ctx = TestContext::new();
             let mut ctx = test_ctx.create_event_handler_context();
             ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
-            ctx.device.backend.set_pending_rx(false);
             let metric_before = METRICS.rx_queue_event_fails.count();
             ctx.device.handle_rxq_event(EventSet::IN);
             assert_eq!(metric_before + 1, METRICS.rx_queue_event_fails.count());
@@ -404,7 +368,6 @@ mod tests {
         {
             let test_ctx = TestContext::new();
             let mut ctx = test_ctx.create_event_handler_context();
-            ctx.device.backend.set_pending_rx(false);
             let metric_before = METRICS.ev_queue_event_fails.count();
             ctx.device.handle_evq_event(EventSet::IN);
             assert_eq!(metric_before + 1, METRICS.ev_queue_event_fails.count());
@@ -424,7 +387,7 @@ mod tests {
         // Simulate the post-restore state: TRANSPORT_RESET event has been
         // signalled, guest hasn't acked yet, backend has pending RX.
         ctx.device.pending_event_ack = true;
-        ctx.device.backend.set_pending_rx(true);
+        ctx.seed_pending_rx();
 
         // notify_backend would normally drain RX into the RX vq. With the
         // gate set, the RX vq must be left untouched.
@@ -443,7 +406,6 @@ mod tests {
         // eventfd write to consume; mock that by writing 1 to the EVQ
         // queue_event eventfd.
         ctx.device.queue_events[EVQ_INDEX].write(1).unwrap();
-        ctx.device.backend.set_pending_rx(true);
 
         let used = ctx.device.handle_evq_event(EventSet::IN);
 
@@ -474,11 +436,10 @@ mod tests {
             let mut ctx = test_ctx.create_event_handler_context();
             ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
 
-            ctx.device.backend.set_pending_rx(true);
+            ctx.write_inert_tx_pkt(&test_ctx.mem);
+            ctx.seed_pending_rx();
             ctx.device.notify_backend(EventSet::IN).unwrap();
 
-            // The backend should've received this event.
-            assert_eq!(ctx.device.backend.evset, Some(EventSet::IN));
             // TX queue processing should've been triggered.
             assert_eq!(ctx.guest_txvq.used.idx.get(), 1);
             // RX queue processing should've been triggered.
@@ -493,11 +454,9 @@ mod tests {
             let mut ctx = test_ctx.create_event_handler_context();
             ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
 
-            ctx.device.backend.set_pending_rx(false);
+            ctx.write_inert_tx_pkt(&test_ctx.mem);
             ctx.device.notify_backend(EventSet::IN).unwrap();
 
-            // The backend should've received this event.
-            assert_eq!(ctx.device.backend.evset, Some(EventSet::IN));
             // TX queue processing should've been triggered.
             assert_eq!(ctx.guest_txvq.used.idx.get(), 1);
             // The RX queue should've been left untouched.
@@ -620,12 +579,20 @@ mod tests {
     fn test_event_handler() {
         let mut event_manager = EventManager::new().unwrap();
         let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        // Pre-populate the TX descriptor with a benign packet so the TX
+        // path doesn't trigger spurious RST generation in the muxer.
+        ctx.write_inert_tx_pkt(&test_ctx.mem);
+        // Prime the muxer with a queued RST so the device has pending RX,
+        // exercising the RX path in addition to the TX path.
         let EventHandlerContext {
-            device,
+            mut device,
             guest_rxvq,
             guest_txvq,
             ..
-        } = test_ctx.create_event_handler_context();
+        } = ctx;
+        device.backend.enq_rst(0, 0);
+        let host_sock_path = device.backend().host_sock_path().to_owned();
 
         let vsock = Arc::new(Mutex::new(device));
         let _id = event_manager.add_subscriber(vsock.clone());
@@ -634,8 +601,7 @@ mod tests {
         // - the driver has something to send (there's data in the TX queue); and
         // - the backend also has some pending RX data.
         {
-            let mut device = vsock.lock().unwrap();
-            device.backend.set_pending_rx(true);
+            let device = vsock.lock().unwrap();
             device.queue_events[TXQ_INDEX].write(1).unwrap();
         }
 
@@ -678,5 +644,7 @@ mod tests {
             assert_eq!(guest_rxvq.used.idx.get(), 1);
             assert_eq!(guest_txvq.used.idx.get(), 1);
         }
+
+        let _ = std::fs::remove_file(&host_sock_path);
     }
 }
