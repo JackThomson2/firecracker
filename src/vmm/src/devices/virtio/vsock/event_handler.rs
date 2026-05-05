@@ -766,7 +766,7 @@ mod tests {
         use std::io::Write as _;
         use std::os::unix::net::UnixStream;
 
-        const N_CONNECTIONS: usize = 256;
+        const N_CONNECTIONS: usize = 1000;
 
         let mut event_manager = EventManager::new().unwrap();
         let test_ctx = TestContext::new();
