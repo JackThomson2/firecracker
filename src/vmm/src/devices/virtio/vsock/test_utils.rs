@@ -223,7 +223,10 @@ impl Vsock {
     pub fn get_element_from_interest_list(vsock: &Vsock, idx: usize) -> u64 {
         match idx {
             0..=2 => u64::try_from(vsock.queue_events[idx].as_raw_fd()).unwrap(),
-            3 => u64::try_from(vsock.backend.as_raw_fd()).unwrap(),
+            3 => {
+                use std::os::unix::io::AsRawFd;
+                u64::try_from(vsock.backend.host_sock_raw_fd()).unwrap()
+            }
             4 => u64::try_from(vsock.activate_evt.as_raw_fd()).unwrap(),
             _ => panic!("Index bigger than interest list"),
         }

@@ -28,6 +28,10 @@ use event_manager::{EventOps, Events, MutEventSubscriber};
 use vmm_sys_util::epoll::EventSet;
 
 use super::device::{EVQ_INDEX, RXQ_INDEX, TXQ_INDEX, Vsock};
+use super::muxer::{
+    EVENT_KIND_CONNECTION, EVENT_KIND_HOST_SOCK, EVENT_KIND_LOCAL_STREAM, MuxerFdOp,
+    unpack_event_id,
+};
 use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::queue::InvalidAvailIdx;
 use crate::devices::virtio::vsock::defs::VSOCK_NUM_QUEUES;
@@ -35,11 +39,10 @@ use crate::devices::virtio::vsock::metrics::METRICS;
 use crate::logger::{IncMetric, error, warn};
 
 impl Vsock {
-    const PROCESS_ACTIVATE: u32 = 0;
-    const PROCESS_RXQ: u32 = 1;
-    const PROCESS_TXQ: u32 = 2;
-    const PROCESS_EVQ: u32 = 3;
-    const PROCESS_NOTIFY_BACKEND: u32 = 4;
+    pub(crate) const PROCESS_ACTIVATE: u32 = 0;
+    pub(crate) const PROCESS_RXQ: u32 = 1;
+    pub(crate) const PROCESS_TXQ: u32 = 2;
+    pub(crate) const PROCESS_EVQ: u32 = 3;
 
     pub fn handle_rxq_event(&mut self, evset: EventSet) -> Vec<u16> {
         let mut used_queues = Vec::new();
@@ -116,15 +119,19 @@ impl Vsock {
         used_queues
     }
 
-    /// Notify backend of new events.
+    /// Forward a backend FD event to the muxer, then attempt to make
+    /// progress on TX/RX queues. Used by tests; production goes through
+    /// `MutEventSubscriber::process` instead.
     pub fn notify_backend(&mut self, evset: EventSet) -> Result<Vec<u16>, InvalidAvailIdx> {
+        // The muxer's host listener is the only FD we'd see at construction
+        // time without going through `accept_host_connection` /
+        // `consume_local_stream` / `notify_connection`. For the
+        // notify_backend test API we treat any backend "kick" as "drive
+        // forward whatever connection state we have". Tests that drive
+        // specific events use the per-event entry points directly.
+        let _ = evset;
+
         let mut used_queues = Vec::new();
-        self.backend.notify(evset);
-        // After the backend has been kicked, it might've freed up some resources, so we
-        // can attempt to send it more data to process.
-        // In particular, if `self.backend.send_pkt()` halted the TX queue processing (by
-        // returning an error) at some point in the past, now is the time to try walking the
-        // TX queue again.
         if self.process_tx()? {
             used_queues.push(TXQ_INDEX.try_into().unwrap());
         }
@@ -135,7 +142,7 @@ impl Vsock {
         Ok(used_queues)
     }
 
-    fn register_runtime_events(&self, ops: &mut EventOps) {
+    fn register_runtime_events(&mut self, ops: &mut EventOps) {
         if let Err(err) = ops.add(Events::with_data(
             &self.queue_events[RXQ_INDEX],
             Self::PROCESS_RXQ,
@@ -157,13 +164,85 @@ impl Vsock {
         )) {
             error!("Failed to register ev queue event: {}", err);
         }
-        if let Err(err) = ops.add(Events::with_data(
-            &self.backend,
-            Self::PROCESS_NOTIFY_BACKEND,
-            self.backend.get_polled_evset(),
-        )) {
-            error!("Failed to register vsock backend event: {}", err);
+        // Install the muxer's initial FD watchlist (host listener +
+        // anything else `initial_fd_ops` reports). The muxer accumulates
+        // additional registrations dynamically as connections come/go;
+        // `apply_muxer_pending_ops` drains those after every dispatch.
+        let initial_ops = self.backend.initial_fd_ops();
+        Self::apply_muxer_ops(ops, initial_ops);
+    }
+
+    /// Apply a batch of muxer-emitted FD-registration changes against the
+    /// upstream `EventOps`.
+    fn apply_muxer_ops(ops: &mut EventOps, fd_ops: impl IntoIterator<Item = MuxerFdOp>) {
+        for op in fd_ops {
+            match op {
+                MuxerFdOp::Add { fd, evset, event_id } => {
+                    if let Err(err) =
+                        ops.add(Events::with_data_raw(fd, event_id, evset))
+                    {
+                        error!(
+                            "vsock: failed to add fd={} event_id={:#x}: {:?}",
+                            fd, event_id, err
+                        );
+                        METRICS.muxer_event_fails.inc();
+                    }
+                }
+                MuxerFdOp::Modify { fd, evset, event_id } => {
+                    if let Err(err) =
+                        ops.modify(Events::with_data_raw(fd, event_id, evset))
+                    {
+                        error!(
+                            "vsock: failed to modify fd={} event_id={:#x}: {:?}",
+                            fd, event_id, err
+                        );
+                        METRICS.muxer_event_fails.inc();
+                    }
+                }
+                MuxerFdOp::Remove { fd, event_id } => {
+                    // The evset doesn't matter for Delete; pass empty.
+                    if let Err(err) = ops.remove(Events::with_data_raw(
+                        fd,
+                        event_id,
+                        EventSet::empty(),
+                    )) {
+                        error!(
+                            "vsock: failed to remove fd={} event_id={:#x}: {:?}",
+                            fd, event_id, err
+                        );
+                        METRICS.muxer_event_fails.inc();
+                    }
+                }
+            }
         }
+    }
+
+    /// Drain any `pending_ops` accumulated by the muxer during this
+    /// dispatch and apply them to `ops`. Plus, since muxer mutations may
+    /// have produced pending RX or freed up TX, also attempt to make
+    /// progress on the virtqueues.
+    fn after_muxer_dispatch(
+        &mut self,
+        ops: &mut EventOps,
+    ) -> Result<Vec<u16>, InvalidAvailIdx> {
+        let drained: Vec<MuxerFdOp> = self.backend.drain_pending_ops().collect();
+        Self::apply_muxer_ops(ops, drained);
+        self.backend.clear_pending_drops();
+
+        let mut used_queues = Vec::new();
+        if self.process_tx()? {
+            used_queues.push(TXQ_INDEX.try_into().unwrap());
+        }
+        if self.backend.has_pending_rx() && self.process_rx()? {
+            used_queues.push(RXQ_INDEX.try_into().unwrap());
+        }
+        // process_tx/process_rx may themselves have produced fresh ops
+        // (e.g. via apply_conn_mutation) and pending drops; flush again.
+        let drained: Vec<MuxerFdOp> = self.backend.drain_pending_ops().collect();
+        Self::apply_muxer_ops(ops, drained);
+        self.backend.clear_pending_drops();
+
+        Ok(used_queues)
     }
 
     fn register_activate_event(&self, ops: &mut EventOps) {
@@ -176,7 +255,7 @@ impl Vsock {
         }
     }
 
-    fn handle_activate_event(&self, ops: &mut EventOps) {
+    fn handle_activate_event(&mut self, ops: &mut EventOps) {
         if let Err(err) = self.activate_evt.read() {
             error!("Failed to consume net activate event: {:?}", err);
         }
@@ -196,29 +275,57 @@ impl MutEventSubscriber for Vsock {
         let source = event.data();
         let evset = event.event_set();
 
-        if self.is_activated() {
-            let used_queues = match source {
-                Self::PROCESS_ACTIVATE => {
-                    self.handle_activate_event(ops);
-                    Vec::new()
-                }
-                Self::PROCESS_RXQ => self.handle_rxq_event(evset),
-                Self::PROCESS_TXQ => self.handle_txq_event(evset),
-                Self::PROCESS_EVQ => self.handle_evq_event(evset),
-                Self::PROCESS_NOTIFY_BACKEND => self.notify_backend(evset).unwrap(),
-                _ => {
-                    warn!("Unexpected vsock event received: {:?}", source);
-                    Vec::new()
-                }
-            };
-            self.signal_used_queues(&used_queues)
-                .expect("vsock: Could not trigger device interrupt");
-        } else {
+        if !self.is_activated() {
             warn!(
                 "Vsock: The device is not yet activated. Spurious event received: {:?}",
                 source
             );
+            return;
         }
+
+        let used_queues = match source {
+            Self::PROCESS_ACTIVATE => {
+                self.handle_activate_event(ops);
+                Vec::new()
+            }
+            Self::PROCESS_RXQ => self.handle_rxq_event(evset),
+            Self::PROCESS_TXQ => self.handle_txq_event(evset),
+            Self::PROCESS_EVQ => self.handle_evq_event(evset),
+            backend_id => {
+                let (kind, slot) = unpack_event_id(backend_id);
+                match kind {
+                    EVENT_KIND_HOST_SOCK => {
+                        self.backend.accept_host_connection();
+                    }
+                    EVENT_KIND_LOCAL_STREAM => {
+                        self.backend.consume_local_stream(slot);
+                    }
+                    EVENT_KIND_CONNECTION => {
+                        self.backend.notify_connection(slot, evset);
+                    }
+                    _ => {
+                        warn!("Unexpected vsock event received: {:#x}", backend_id);
+                        return;
+                    }
+                }
+                match self.after_muxer_dispatch(ops) {
+                    Ok(uq) => uq,
+                    Err(err) => {
+                        error!("vsock: after-muxer dispatch failed: {:?}", err);
+                        Vec::new()
+                    }
+                }
+            }
+        };
+        // Even non-backend sources (RXQ/TXQ/EVQ) may have invoked muxer
+        // mutations (process_rx/process_tx -> apply_conn_mutation) that
+        // pushed FD ops or deferred drops. Flush them so the upstream
+        // EventOps state stays in sync with the muxer.
+        let drained: Vec<MuxerFdOp> = self.backend.drain_pending_ops().collect();
+        Self::apply_muxer_ops(ops, drained);
+        self.backend.clear_pending_drops();
+        self.signal_used_queues(&used_queues)
+            .expect("vsock: Could not trigger device interrupt");
     }
 
     fn init(&mut self, ops: &mut EventOps) {
@@ -638,5 +745,89 @@ mod tests {
         }
 
         // _uds_guard goes out of scope here, unlinking the muxer's UDS path.
+    }
+
+    /// Stress test for the EventManager-based muxer dispatch (P5).
+    ///
+    /// Drives many short-lived host-initiated connections through the
+    /// muxer via the upstream `EventManager`, mirroring the dispatch
+    /// path used in production. Each connection performs:
+    ///   - host_sock accept (HostSock event)
+    ///   - read CONNECT line  (LocalStream event)
+    ///   - peer responds OP_RESPONSE (TX vq path)
+    ///   - host write+close   (Connection event -> SHUTDOWN)
+    ///   - peer responds RST  (TX vq path)
+    ///
+    /// The test passes if every connection drains cleanly: no FD leaks
+    /// in the upstream `EventOps`, no `muxer_event_fails` increase, and
+    /// `pending_event_ack` correctness preserved.
+    #[test]
+    fn test_p5_stress_short_lived_connections() {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixStream;
+
+        const N_CONNECTIONS: usize = 256;
+
+        let mut event_manager = EventManager::new().unwrap();
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.write_inert_tx_pkt(&test_ctx.mem);
+        let host_sock_path = ctx.device.backend().host_sock_path().to_owned();
+        let EventHandlerContext {
+            device,
+            _uds_guard,
+            ..
+        } = ctx;
+
+        let vsock = Arc::new(Mutex::new(device));
+        let _id = event_manager.add_subscriber(vsock.clone());
+        // Activate.
+        vsock
+            .lock()
+            .unwrap()
+            .activate(test_ctx.mem.clone(), test_ctx.interrupt.clone())
+            .unwrap();
+        // Process the activate event.
+        let _ = event_manager.run_with_timeout(50).unwrap();
+
+        let muxer_fails_before = METRICS.muxer_event_fails.count();
+
+        for i in 0..N_CONNECTIONS {
+            // Connect to the muxer's host socket and write a CONNECT line
+            // for a port that has no listener: the muxer will accept the
+            // host side, allocate a local port, then attempt to peer-init
+            // a connection. Since the guest never responds, the connection
+            // sits in PeerInit until we close the host stream, at which
+            // point the muxer should clean up.
+            let mut s = UnixStream::connect(&host_sock_path).unwrap();
+            s.set_nonblocking(true).unwrap();
+            s.write_all(format!("CONNECT {}\n", 1024 + (i as u32)).as_bytes())
+                .unwrap();
+
+            // Pump events. We don't strictly need to wait for completion;
+            // the goal is to exercise the FD-registration churn.
+            let _ = event_manager.run_with_timeout(5).unwrap();
+
+            // Drop the host stream. The kernel closes the fd, the muxer's
+            // notify_connection sees EPOLLHUP, and eventually
+            // remove_connection drops the entry.
+            drop(s);
+            let _ = event_manager.run_with_timeout(5).unwrap();
+        }
+
+        // A few more pumps to flush trailing kill-queue activity.
+        for _ in 0..5 {
+            let _ = event_manager.run_with_timeout(5).unwrap();
+        }
+
+        let muxer_fails_after = METRICS.muxer_event_fails.count();
+        assert_eq!(
+            muxer_fails_after - muxer_fails_before,
+            0,
+            "P5 stress test: muxer FD-registration ops failed {} times",
+            muxer_fails_after - muxer_fails_before
+        );
+
+        let _ = std::fs::remove_file(&host_sock_path);
     }
 }

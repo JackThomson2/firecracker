@@ -27,8 +27,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
-use super::muxer::ConnMapKey;
-use super::{MuxerConnection, defs};
+use super::defs;
+use super::muxer::{ConnMapKey, MuxerConnEntry};
 
 /// A kill queue item, holding the connection key and the scheduled time for termination.
 #[derive(Debug, Clone, Copy)]
@@ -66,11 +66,11 @@ impl MuxerKillQ {
     /// set to expire at some point in the future.
     /// Note: if more than `Self::SIZE` connections are found, the queue will be created in an
     ///       out-of-sync state, and will be discarded after it is emptied.
-    pub fn from_conn_map(conn_map: &HashMap<ConnMapKey, MuxerConnection>) -> Self {
+    pub fn from_conn_map(conn_map: &HashMap<ConnMapKey, MuxerConnEntry>) -> Self {
         let mut q_buf: Vec<MuxerKillQItem> = Vec::with_capacity(Self::SIZE);
         let mut synced = true;
-        for (key, conn) in conn_map.iter() {
-            if !conn.will_expire() {
+        for (key, entry) in conn_map.iter() {
+            if !entry.conn.will_expire() {
                 continue;
             }
             if q_buf.len() >= Self::SIZE {
@@ -79,7 +79,7 @@ impl MuxerKillQ {
             }
             q_buf.push(MuxerKillQItem {
                 key: *key,
-                kill_time: conn.expiry().unwrap(),
+                kill_time: entry.conn.expiry().unwrap(),
             });
         }
         q_buf.sort_unstable_by_key(|it| it.kill_time);
