@@ -72,8 +72,8 @@ pub struct Vsock<B> {
     pub(crate) activate_evt: EventFd,
     pub(crate) device_state: DeviceState,
 
-    pub rx_packet: VsockPacketRx,
-    pub tx_packet: VsockPacketTx,
+    pub(crate) rx_packet: VsockPacketRx,
+    pub(crate) tx_packet: VsockPacketTx,
 
     /// True between sending VIRTIO_VSOCK_EVENT_TRANSPORT_RESET on the event
     /// queue (during snapshot resume) and the guest driver acking it. While
