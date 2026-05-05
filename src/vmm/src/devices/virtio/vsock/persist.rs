@@ -137,6 +137,69 @@ pub(crate) mod tests {
         p
     }
 
+    /// Golden-bytes assertion guarding the on-wire `VsockState`
+    /// encoding. A serde rename or field reorder anywhere in the
+    /// `VsockState` / `VsockBackendState` / `VsockFrontendState` /
+    /// `VirtioDeviceState` chain would change `bitcode::serialize`'s
+    /// output and break snapshot restore for production fleets that
+    /// have an existing snapshot. If this test fails, you almost
+    /// certainly broke the wire format. Bump the format version
+    /// deliberately and update the golden bytes only when that is the
+    /// intent.
+    #[test]
+    fn test_persist_wire_format_golden() {
+        // Build a fully deterministic state, then compare the
+        // bitcode-serialized bytes against a fixed expected sequence.
+        let backend_state = VsockBackendState {
+            uds_path: "/tmp/v.sock".to_owned(),
+            local_port_last: 0xdead_beef,
+        };
+        let frontend_state = VsockFrontendState {
+            cid: 0x1234_5678_9abc_def0,
+            virtio_state: VirtioDeviceState {
+                device_type: VirtioDeviceType::Vsock,
+                avail_features: 0x0102_0304_0506_0708,
+                acked_features: 0x0807_0605_0403_0201,
+                queues: Vec::new(),
+                activated: false,
+            },
+        };
+        let state = VsockState {
+            backend: backend_state,
+            frontend: frontend_state,
+        };
+
+        let bytes = bitcode::serialize(&state).unwrap();
+
+        // If this assertion fails: do NOT just paste the new bytes in.
+        // Audit the diff, decide whether the wire format change is
+        // intentional, and if so bump the snapshot version.
+        let expected: &[u8] = &[
+            0x0b, 0x2f, 0x74, 0x6d, 0x70, 0x2f, 0x76, 0x2e, 0x73, 0x6f, 0x63, 0x6b,
+            0x00, 0xef, 0xbe, 0xad, 0xde, 0x00, 0xf0, 0xde, 0xbc, 0x9a, 0x78, 0x56,
+            0x34, 0x12, 0x04, 0x00, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x00, 0x00,
+        ];
+        assert_eq!(
+            bytes.as_slice(),
+            expected,
+            "VsockState wire format changed. Expected {} bytes, got {} bytes:\nexpected: {:02x?}\n     got: {:02x?}",
+            expected.len(),
+            bytes.len(),
+            expected,
+            bytes,
+        );
+
+        // And the round-trip must agree.
+        let decoded: VsockState = bitcode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.backend.uds_path, "/tmp/v.sock");
+        assert_eq!(decoded.backend.local_port_last, 0xdead_beef);
+        assert_eq!(decoded.frontend.cid, 0x1234_5678_9abc_def0);
+        assert_eq!(decoded.frontend.virtio_state.avail_features, 0x0102_0304_0506_0708);
+        assert_eq!(decoded.frontend.virtio_state.acked_features, 0x0807_0605_0403_0201);
+        assert!(!decoded.frontend.virtio_state.activated);
+    }
+
     #[test]
     fn test_persist_uds_backend() {
         let ctx = TestContext::new();
