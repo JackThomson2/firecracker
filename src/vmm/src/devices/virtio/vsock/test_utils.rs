@@ -4,7 +4,6 @@
 #![cfg(test)]
 #![doc(hidden)]
 
-use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 
 use vmm_sys_util::epoll::EventSet;
@@ -212,23 +211,3 @@ pub fn read_packet_data(pkt: &VsockPacketTx, how_much: u32) -> Vec<u8> {
     buf
 }
 
-impl Vsock {
-    pub fn write_element_in_queue(vsock: &Vsock, idx: usize, val: u64) {
-        if idx > vsock.queue_events.len() - 1 {
-            panic!("Index bigger than the number of queues of this device");
-        }
-        vsock.queue_events[idx].write(val).unwrap();
-    }
-
-    pub fn get_element_from_interest_list(vsock: &Vsock, idx: usize) -> u64 {
-        match idx {
-            0..=2 => u64::try_from(vsock.queue_events[idx].as_raw_fd()).unwrap(),
-            3 => {
-                use std::os::unix::io::AsRawFd;
-                u64::try_from(vsock.backend.host_sock_raw_fd()).unwrap()
-            }
-            4 => u64::try_from(vsock.activate_evt.as_raw_fd()).unwrap(),
-            _ => panic!("Index bigger than interest list"),
-        }
-    }
-}
