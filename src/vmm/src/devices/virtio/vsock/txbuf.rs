@@ -8,7 +8,7 @@ use std::num::Wrapping;
 
 use vm_memory::{VolatileMemoryError, VolatileSlice, WriteVolatile};
 
-use super::{VsockCsmError, defs};
+use super::{VsockError, defs};
 use crate::utils::wrap_usize_to_u32;
 use crate::vstate::memory::{BitmapSlice, Bytes};
 
@@ -48,10 +48,10 @@ impl TxBuf {
     ///
     /// Either the entire source slice will be pushed to the ring-buffer, or none of it, if
     /// there isn't enough room, in which case `Err(Error::TxBufFull)` is returned.
-    pub fn push(&mut self, src: &VolatileSlice<impl BitmapSlice>) -> Result<(), VsockCsmError> {
+    pub fn push(&mut self, src: &VolatileSlice<impl BitmapSlice>) -> Result<(), VsockError> {
         // Error out if there's no room to push the entire slice.
         if self.len() + src.len() > Self::SIZE {
-            return Err(VsockCsmError::TxBufFull);
+            return Err(VsockError::CsmTxBufFull);
         }
 
         let data = self
@@ -87,7 +87,7 @@ impl TxBuf {
     ///
     /// Return the number of bytes that have been transferred out of the ring-buffer and into
     /// the writable stream.
-    pub fn flush_to<W: Write + Debug>(&mut self, sink: &mut W) -> Result<usize, VsockCsmError> {
+    pub fn flush_to<W: Write + Debug>(&mut self, sink: &mut W) -> Result<usize, VsockError> {
         // Nothing to do, if this buffer holds no data.
         if self.is_empty() {
             return Ok(0);
@@ -110,7 +110,7 @@ impl TxBuf {
         // later).
         let written = sink
             .write(&data[tail_ofs..(tail_ofs + len_to_write)])
-            .map_err(VsockCsmError::TxBufFlush)?;
+            .map_err(VsockError::CsmTxBufFlush)?;
 
         // Move the buffer tail ahead by the amount (of bytes) we were able to flush out.
         self.tail += wrap_usize_to_u32(written);
@@ -268,7 +268,7 @@ mod tests {
             .push(&VolatileSlice::from(tmp.as_mut_slice()))
             .unwrap();
         match txbuf.push(&VolatileSlice::from([1, 2].as_mut_slice())) {
-            Err(VsockCsmError::TxBufFull) => (),
+            Err(VsockError::CsmTxBufFull) => (),
             other => panic!("Unexpected result: {:?}", other),
         }
         match txbuf.write_volatile(&VolatileSlice::from([1, 2].as_mut_slice())) {
@@ -314,7 +314,7 @@ mod tests {
         let io_err = IoError::from_raw_os_error(EACCESS);
         sink.set_err(io_err);
         match txbuf.flush_to(&mut sink) {
-            Err(VsockCsmError::TxBufFlush(ref err))
+            Err(VsockError::CsmTxBufFlush(ref err))
                 if err.kind() == ErrorKind::PermissionDenied => {}
             other => panic!("Unexpected result: {:?}", other),
         }

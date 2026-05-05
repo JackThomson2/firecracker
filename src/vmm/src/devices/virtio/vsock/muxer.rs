@@ -42,8 +42,7 @@ use super::defs::uapi;
 use super::muxer_killq::MuxerKillQ;
 use super::muxer_rxq::MuxerRxQ;
 use super::{
-    ConnState, MuxerConnection, VsockBackend, VsockChannel, VsockEpollListener, VsockError,
-    VsockUnixBackendError, defs,
+    ConnState, MuxerConnection, VsockBackend, VsockChannel, VsockEpollListener, VsockError, defs,
 };
 use crate::devices::virtio::vsock::metrics::METRICS;
 use crate::devices::virtio::vsock::packet::{VsockPacketRx, VsockPacketTx};
@@ -310,18 +309,18 @@ impl VsockBackend for VsockMuxer {}
 
 impl VsockMuxer {
     /// Muxer constructor.
-    pub fn new(cid: u64, host_sock_path: String) -> Result<Self, VsockUnixBackendError> {
+    pub fn new(cid: u64, host_sock_path: String) -> Result<Self, VsockError> {
         // Open/bind on the host Unix socket, so we can accept host-initiated
         // connections.
         let host_sock = UnixListener::bind(&host_sock_path)
             .and_then(|sock| sock.set_nonblocking(true).map(|_| sock))
-            .map_err(VsockUnixBackendError::UnixBind)?;
+            .map_err(VsockError::UdsUnixBind)?;
 
         let mut muxer = Self {
             cid,
             host_sock,
             host_sock_path,
-            epoll: Epoll::new().map_err(VsockUnixBackendError::EpollFdCreate)?,
+            epoll: Epoll::new().map_err(VsockError::UdsEpollFdCreate)?,
             rxq: MuxerRxQ::new(),
             conn_map: HashMap::with_capacity(defs::MAX_CONNECTIONS),
             listener_map: HashMap::with_capacity(defs::MAX_CONNECTIONS + 1),
@@ -372,12 +371,12 @@ impl VsockMuxer {
                 }
                 self.host_sock
                     .accept()
-                    .map_err(VsockUnixBackendError::UnixAccept)
+                    .map_err(VsockError::UdsUnixAccept)
                     .and_then(|(stream, _)| {
                         stream
                             .set_nonblocking(true)
                             .map(|_| stream)
-                            .map_err(VsockUnixBackendError::UnixAccept)
+                            .map_err(VsockError::UdsUnixAccept)
                     })
                     .and_then(|stream| {
                         // Before forwarding this connection to a listening AF_VSOCK socket on
@@ -429,7 +428,7 @@ impl VsockMuxer {
     }
 
     /// Parse a host "connect" command, and extract the destination vsock port.
-    fn read_local_stream_port(stream: &mut UnixStream) -> Result<u32, VsockUnixBackendError> {
+    fn read_local_stream_port(stream: &mut UnixStream) -> Result<u32, VsockError> {
         let mut buf = [0u8; 32];
 
         // This is the minimum number of bytes that we should be able to read, when parsing a
@@ -439,7 +438,7 @@ impl VsockMuxer {
         // Bring in the minimum number of bytes that we should be able to read.
         stream
             .read_exact(&mut buf[..MIN_READ_LEN])
-            .map_err(VsockUnixBackendError::UnixRead)?;
+            .map_err(VsockError::UdsUnixRead)?;
 
         // Now, finish reading the destination port number, by bringing in one byte at a time,
         // until we reach an EOL terminator (or our buffer space runs out).  Yeah, not
@@ -448,34 +447,34 @@ impl VsockMuxer {
         while buf[blen - 1] != b'\n' && blen < buf.len() {
             stream
                 .read_exact(&mut buf[blen..=blen])
-                .map_err(VsockUnixBackendError::UnixRead)?;
+                .map_err(VsockError::UdsUnixRead)?;
             blen += 1;
         }
 
         let mut word_iter = std::str::from_utf8(&buf[..blen])
-            .map_err(|_| VsockUnixBackendError::InvalidPortRequest)?
+            .map_err(|_| VsockError::UdsInvalidPortRequest)?
             .split_whitespace();
 
         word_iter
             .next()
-            .ok_or(VsockUnixBackendError::InvalidPortRequest)
+            .ok_or(VsockError::UdsInvalidPortRequest)
             .and_then(|word| {
                 if word.to_lowercase() == "connect" {
                     Ok(())
                 } else {
-                    Err(VsockUnixBackendError::InvalidPortRequest)
+                    Err(VsockError::UdsInvalidPortRequest)
                 }
             })
             .and_then(|_| {
                 word_iter
                     .next()
-                    .ok_or(VsockUnixBackendError::InvalidPortRequest)
+                    .ok_or(VsockError::UdsInvalidPortRequest)
             })
             .and_then(|word| {
                 word.parse::<u32>()
-                    .map_err(|_| VsockUnixBackendError::InvalidPortRequest)
+                    .map_err(|_| VsockError::UdsInvalidPortRequest)
             })
-            .map_err(|_| VsockUnixBackendError::InvalidPortRequest)
+            .map_err(|_| VsockError::UdsInvalidPortRequest)
     }
 
     /// Add a new connection to the active connection pool.
@@ -483,7 +482,7 @@ impl VsockMuxer {
         &mut self,
         key: ConnMapKey,
         conn: MuxerConnection,
-    ) -> Result<(), VsockUnixBackendError> {
+    ) -> Result<(), VsockError> {
         // We might need to make room for this new connection, so let's sweep the kill queue
         // first.  It's fine to do this here because:
         // - unless the kill queue is out of sync, this is a pretty inexpensive operation; and
@@ -495,7 +494,7 @@ impl VsockMuxer {
                 "vsock: muxer connection limit reached ({})",
                 defs::MAX_CONNECTIONS
             );
-            return Err(VsockUnixBackendError::TooManyConnections);
+            return Err(VsockError::UdsTooManyConnections);
         }
 
         self.add_listener(
@@ -552,7 +551,7 @@ impl VsockMuxer {
         &mut self,
         fd: RawFd,
         listener: EpollListener,
-    ) -> Result<(), VsockUnixBackendError> {
+    ) -> Result<(), VsockError> {
         let evset = match listener {
             EpollListener::Connection { evset, .. } => evset,
             EpollListener::LocalStream(_) => EventSet::IN,
@@ -568,7 +567,7 @@ impl VsockMuxer {
             .map(|_| {
                 self.listener_map.insert(fd, listener);
             })
-            .map_err(VsockUnixBackendError::EpollAdd)?;
+            .map_err(VsockError::UdsEpollAdd)?;
 
         Ok(())
     }
@@ -622,7 +621,7 @@ impl VsockMuxer {
 
         UnixStream::connect(port_path)
             .and_then(|stream| stream.set_nonblocking(true).map(|_| stream))
-            .map_err(VsockUnixBackendError::UnixConnect)
+            .map_err(VsockError::UdsUnixConnect)
             .and_then(|stream| {
                 self.add_connection(
                     ConnMapKey {

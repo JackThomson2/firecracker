@@ -89,8 +89,7 @@ use vmm_sys_util::epoll::EventSet;
 use super::defs::uapi;
 use super::txbuf::TxBuf;
 use super::{
-    ConnState, PendingRx, PendingRxSet, VsockChannel, VsockCsmError, VsockEpollListener,
-    VsockError, defs,
+    ConnState, PendingRx, PendingRxSet, VsockChannel, VsockEpollListener, VsockError, defs,
 };
 use crate::devices::virtio::vsock::metrics::METRICS;
 use crate::devices::virtio::vsock::packet::{VsockPacketHeader, VsockPacketRx, VsockPacketTx};
@@ -472,7 +471,7 @@ where
                         self.local_port, self.peer_port, err
                     );
                     match err {
-                        VsockCsmError::TxBufFlush(inner)
+                        VsockError::CsmTxBufFlush(inner)
                             if inner.kind() == ErrorKind::WouldBlock =>
                         {
                             // This should never happen (EWOULDBLOCK after EPOLLOUT), but
@@ -596,8 +595,8 @@ where
     /// Warning: this will bypass the connection state machine and write directly to the
     /// underlying stream. No account of this write is kept, which includes bypassing
     /// vsock flow control.
-    pub fn send_bytes_raw(&mut self, buf: &[u8]) -> Result<usize, VsockCsmError> {
-        self.stream.write(buf).map_err(VsockCsmError::StreamWrite)
+    pub fn send_bytes_raw(&mut self, buf: &[u8]) -> Result<usize, VsockError> {
+        self.stream.write(buf).map_err(VsockError::CsmStreamWrite)
     }
 
     /// Send some raw data (a byte-slice) to the host stream.

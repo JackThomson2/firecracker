@@ -116,16 +116,6 @@ mod defs {
     }
 }
 
-/// Connection state machine error type.
-#[derive(Debug, thiserror::Error, displaydoc::Display)]
-pub enum VsockCsmError {
-    /// Attempted to push data to a full TX buffer
-    TxBufFull,
-    /// An I/O error occurred, when attempting to flush the connection TX buffer: {0}
-    TxBufFlush(std::io::Error),
-    /// An I/O error occurred, when attempting to write data to the host-side stream: {0}
-    StreamWrite(std::io::Error),
-}
 
 /// A vsock connection state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,28 +207,10 @@ impl VsockConnectionBackend for std::os::unix::net::UnixStream {}
 
 type MuxerConnection = self::connection::VsockConnection<std::os::unix::net::UnixStream>;
 
-/// Vsock backend related errors.
-#[derive(Debug, thiserror::Error, displaydoc::Display)]
-pub enum VsockUnixBackendError {
-    /// Error registering a new epoll-listening FD: {0}
-    EpollAdd(std::io::Error),
-    /// Error creating an epoll FD: {0}
-    EpollFdCreate(std::io::Error),
-    /// The host made an invalid vsock port connection request.
-    InvalidPortRequest,
-    /// Error accepting a new connection from the host-side Unix socket: {0}
-    UnixAccept(std::io::Error),
-    /// Error binding to the host-side Unix socket: {0}
-    UnixBind(std::io::Error),
-    /// Error connecting to a host-side Unix socket: {0}
-    UnixConnect(std::io::Error),
-    /// Error reading from host-side Unix socket: {0}
-    UnixRead(std::io::Error),
-    /// Muxer connection limit reached.
-    TooManyConnections,
-}
-
-/// Vsock device related errors.
+/// Vsock device related errors. Covers the virtio device layer, the
+/// connection state machine ("Csm*" variants, formerly `VsockCsmError`),
+/// and the AF_UNIX backend ("Uds*" variants, formerly
+/// `VsockUnixBackendError`).
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 #[rustfmt::skip]
 pub enum VsockError {
@@ -269,12 +241,36 @@ pub enum VsockError {
     UnwritableDescriptor,
     /// Invalid virtio configuration: {0}
     VirtioState(VirtioStateError),
-    /// Vsock uds backend error: {0}
-    VsockUdsBackend(VsockUnixBackendError),
     /// Underlying IovDeque error: {0}
     IovDeque(IovDequeError),
     /// Tried to push to full IovDeque.
     IovDequeOverflow,
+
+    // --- Connection state-machine errors (formerly VsockCsmError) ---
+    /// Attempted to push data to a full TX buffer
+    CsmTxBufFull,
+    /// An I/O error occurred, when attempting to flush the connection TX buffer: {0}
+    CsmTxBufFlush(std::io::Error),
+    /// An I/O error occurred, when attempting to write data to the host-side stream: {0}
+    CsmStreamWrite(std::io::Error),
+
+    // --- AF_UNIX backend errors (formerly VsockUnixBackendError) ---
+    /// Error registering a new epoll-listening FD: {0}
+    UdsEpollAdd(std::io::Error),
+    /// Error creating an epoll FD: {0}
+    UdsEpollFdCreate(std::io::Error),
+    /// The host made an invalid vsock port connection request.
+    UdsInvalidPortRequest,
+    /// Error accepting a new connection from the host-side Unix socket: {0}
+    UdsUnixAccept(std::io::Error),
+    /// Error binding to the host-side Unix socket: {0}
+    UdsUnixBind(std::io::Error),
+    /// Error connecting to a host-side Unix socket: {0}
+    UdsUnixConnect(std::io::Error),
+    /// Error reading from host-side Unix socket: {0}
+    UdsUnixRead(std::io::Error),
+    /// Muxer connection limit reached.
+    UdsTooManyConnections,
 }
 
 impl From<IoVecError> for VsockError {
@@ -335,17 +331,18 @@ mod csm_tests {
     #[test]
     fn test_display_error() {
         assert_eq!(
-            format!("{}", VsockCsmError::TxBufFull),
+            format!("{}", VsockError::CsmTxBufFull),
             "Attempted to push data to a full TX buffer"
         );
 
         assert_eq!(
-            VsockCsmError::TxBufFlush(std::io::Error::from(std::io::ErrorKind::Other)).to_string(),
+            VsockError::CsmTxBufFlush(std::io::Error::from(std::io::ErrorKind::Other)).to_string(),
             "An I/O error occurred, when attempting to flush the connection TX buffer: other error"
         );
 
         assert_eq!(
-            VsockCsmError::StreamWrite(std::io::Error::from(std::io::ErrorKind::Other)).to_string(),
+            VsockError::CsmStreamWrite(std::io::Error::from(std::io::ErrorKind::Other))
+                .to_string(),
             "An I/O error occurred, when attempting to write data to the host-side stream: other \
              error"
         );

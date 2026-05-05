@@ -44,7 +44,7 @@ use crate::devices::virtio::pmem::persist::PmemPersistError;
 use crate::devices::virtio::rng::persist::EntropyPersistError;
 use crate::devices::virtio::transport::mmio::{IrqTrigger, MmioTransport};
 use crate::devices::virtio::transport::pci::device::CAPABILITY_BAR_SIZE;
-use crate::devices::virtio::vsock::{VsockError, VsockUnixBackendError};
+use crate::devices::virtio::vsock::VsockError;
 use crate::logger::{error, info, warn};
 use crate::rate_limiter::TokenBucket;
 use crate::resources::VmResources;
@@ -648,8 +648,6 @@ pub enum DevicePersistError {
     Net(#[from] NetPersistError),
     /// Vsock: {0}
     Vsock(#[from] VsockError),
-    /// VsockUnixBackend: {0}
-    VsockUnixBackend(#[from] VsockUnixBackendError),
     /// MmdsConfig: {0}
     MmdsConfig(#[from] MmdsConfigError),
     /// Entropy: {0}
