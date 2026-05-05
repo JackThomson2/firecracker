@@ -86,10 +86,12 @@ use vm_memory::GuestMemoryError;
 use vm_memory::io::{ReadVolatile, WriteVolatile};
 use vmm_sys_util::epoll::EventSet;
 
-use super::super::defs::uapi;
-use super::super::{VsockChannel, VsockEpollListener, VsockError};
+use super::defs::uapi;
 use super::txbuf::TxBuf;
-use super::{ConnState, PendingRx, PendingRxSet, VsockCsmError, defs};
+use super::{
+    ConnState, PendingRx, PendingRxSet, VsockChannel, VsockCsmError, VsockEpollListener,
+    VsockError, defs,
+};
 use crate::devices::virtio::vsock::metrics::METRICS;
 use crate::devices::virtio::vsock::packet::{VsockPacketHeader, VsockPacketRx, VsockPacketTx};
 use crate::logger::{IncMetric, debug, error, info, warn};
@@ -685,8 +687,8 @@ mod tests {
     use vm_memory::{VolatileMemoryError, VolatileSlice};
     use vmm_sys_util::eventfd::EventFd;
 
-    use super::super::super::defs::uapi;
     use super::super::defs as csm_defs;
+    use super::super::defs::uapi;
     use super::*;
     use crate::devices::virtio::vsock::device::{RXQ_INDEX, TXQ_INDEX};
     use crate::devices::virtio::vsock::test_utils;

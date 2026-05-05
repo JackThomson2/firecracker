@@ -11,14 +11,17 @@
 //! mediates communication between AF_UNIX sockets (on the host end) and AF_VSOCK
 //! sockets (on the guest end).
 
-mod csm;
+mod connection;
 mod device;
 mod event_handler;
 pub mod metrics;
+mod muxer;
+mod muxer_killq;
+mod muxer_rxq;
 mod packet;
 pub mod persist;
 pub mod test_utils;
-mod unix;
+mod txbuf;
 
 use std::os::unix::io::AsRawFd;
 
@@ -27,8 +30,8 @@ use vmm_sys_util::epoll::EventSet;
 
 pub use self::defs::VSOCK_DEV_ID;
 pub use self::device::Vsock;
+pub use self::muxer::VsockMuxer as VsockUnixBackend;
 use self::packet::{VsockPacketRx, VsockPacketTx};
-pub use self::unix::{VsockUnixBackend, VsockUnixBackendError};
 use super::iov_deque::IovDequeError;
 use crate::devices::virtio::iovec::IoVecError;
 use crate::devices::virtio::persist::PersistError as VirtioStateError;
@@ -53,6 +56,28 @@ mod defs {
 
     /// Max vsock packet data/buffer size.
     pub const MAX_PKT_BUF_SIZE: u32 = 64 * 1024;
+
+    /// Vsock connection TX buffer capacity.
+    pub const CONN_TX_BUF_SIZE: u32 = 64 * 1024;
+
+    /// When the guest thinks we have less than this amount of free buffer space,
+    /// we will send them a credit update packet.
+    pub const CONN_CREDIT_UPDATE_THRESHOLD: u32 = 4 * 1024;
+
+    /// Connection request timeout, in millis.
+    pub const CONN_REQUEST_TIMEOUT_MS: u64 = 2000;
+
+    /// Connection graceful shutdown timeout, in millis.
+    pub const CONN_SHUTDOWN_TIMEOUT_MS: u64 = 2000;
+
+    /// Maximum number of established connections that the muxer can handle.
+    pub const MAX_CONNECTIONS: usize = 1023;
+
+    /// Size of the muxer RX packet queue.
+    pub const MUXER_RXQ_SIZE: u32 = 256;
+
+    /// Size of the muxer connection kill queue.
+    pub const MUXER_KILLQ_SIZE: u32 = 128;
 
     pub mod uapi {
         /// Vsock packet operation IDs.
@@ -89,6 +114,128 @@ mod defs {
 
         pub const VSOCK_HOST_CID: u64 = 2;
     }
+}
+
+/// Connection state machine error type.
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum VsockCsmError {
+    /// Attempted to push data to a full TX buffer
+    TxBufFull,
+    /// An I/O error occurred, when attempting to flush the connection TX buffer: {0}
+    TxBufFlush(std::io::Error),
+    /// An I/O error occurred, when attempting to write data to the host-side stream: {0}
+    StreamWrite(std::io::Error),
+}
+
+/// A vsock connection state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnState {
+    /// The connection has been initiated by the host end, but is yet to be confirmed by the guest.
+    LocalInit,
+    /// The connection has been initiated by the guest, but we are yet to confirm it, by sending
+    /// a response packet (VSOCK_OP_RESPONSE).
+    PeerInit,
+    /// The connection handshake has been performed successfully, and data can now be exchanged.
+    Established,
+    /// The host (AF_UNIX) socket was closed.
+    LocalClosed,
+    /// A VSOCK_OP_SHUTDOWN packet was received from the guest. The tuple represents the guest R/W
+    /// indication: (will_not_recv_anymore_data, will_not_send_anymore_data).
+    PeerClosed(bool, bool),
+    /// The connection is scheduled to be forcefully terminated as soon as possible.
+    Killed,
+}
+
+/// An RX indication, used by `VsockConnection` to schedule future `recv_pkt()` responses.
+/// For instance, after being notified that there is available data to be read from the host stream
+/// (via `notify()`), the connection will store a `PendingRx::Rw` to be later inspected by
+/// `recv_pkt()`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PendingRx {
+    /// We need to yield a connection request packet (VSOCK_OP_REQUEST).
+    Request = 0,
+    /// We need to yield a connection response packet (VSOCK_OP_RESPONSE).
+    Response = 1,
+    /// We need to yield a forceful connection termination packet (VSOCK_OP_RST).
+    Rst = 2,
+    /// We need to yield a data packet (VSOCK_OP_RW), by reading from the AF_UNIX socket.
+    Rw = 3,
+    /// We need to yield a credit update packet (VSOCK_OP_CREDIT_UPDATE).
+    CreditUpdate = 4,
+}
+impl PendingRx {
+    /// Transform the enum value into a bitmask, that can be used for set operations.
+    fn into_mask(self) -> u16 {
+        1u16 << (self as u16)
+    }
+}
+
+/// A set of RX indications (`PendingRx` items).
+#[derive(Debug)]
+struct PendingRxSet {
+    data: u16,
+}
+
+impl PendingRxSet {
+    /// Insert an item into the set.
+    fn insert(&mut self, it: PendingRx) {
+        self.data |= it.into_mask();
+    }
+
+    /// Remove an item from the set and return:
+    /// - true, if the item was in the set; or
+    /// - false, if the item wasn't in the set.
+    fn remove(&mut self, it: PendingRx) -> bool {
+        let ret = self.contains(it);
+        self.data &= !it.into_mask();
+        ret
+    }
+
+    /// Check if an item is present in this set.
+    fn contains(&self, it: PendingRx) -> bool {
+        self.data & it.into_mask() != 0
+    }
+
+    /// Check if the set is empty.
+    fn is_empty(&self) -> bool {
+        self.data == 0
+    }
+}
+
+/// Create a set containing only one item.
+impl From<PendingRx> for PendingRxSet {
+    fn from(it: PendingRx) -> Self {
+        Self {
+            data: it.into_mask(),
+        }
+    }
+}
+
+pub use self::connection::{VsockConnection, VsockConnectionBackend};
+
+impl VsockConnectionBackend for std::os::unix::net::UnixStream {}
+
+type MuxerConnection = self::connection::VsockConnection<std::os::unix::net::UnixStream>;
+
+/// Vsock backend related errors.
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum VsockUnixBackendError {
+    /// Error registering a new epoll-listening FD: {0}
+    EpollAdd(std::io::Error),
+    /// Error creating an epoll FD: {0}
+    EpollFdCreate(std::io::Error),
+    /// The host made an invalid vsock port connection request.
+    InvalidPortRequest,
+    /// Error accepting a new connection from the host-side Unix socket: {0}
+    UnixAccept(std::io::Error),
+    /// Error binding to the host-side Unix socket: {0}
+    UnixBind(std::io::Error),
+    /// Error connecting to a host-side Unix socket: {0}
+    UnixConnect(std::io::Error),
+    /// Error reading from host-side Unix socket: {0}
+    UnixRead(std::io::Error),
+    /// Muxer connection limit reached.
+    TooManyConnections,
 }
 
 /// Vsock device related errors.
@@ -177,6 +324,30 @@ pub trait VsockChannel {
 }
 
 /// The vsock backend, which is basically an epoll-event-driven vsock channel.
-/// Currently, the only implementation we have is `crate::devices::virtio::unix::muxer::VsockMuxer`,
+/// Currently, the only implementation we have is `crate::devices::virtio::vsock::muxer::VsockMuxer`,
 /// which translates guest-side vsock connections to host-side Unix domain socket connections.
 pub trait VsockBackend: VsockChannel + VsockEpollListener + Send {}
+
+#[cfg(test)]
+mod csm_tests {
+    use super::*;
+
+    #[test]
+    fn test_display_error() {
+        assert_eq!(
+            format!("{}", VsockCsmError::TxBufFull),
+            "Attempted to push data to a full TX buffer"
+        );
+
+        assert_eq!(
+            VsockCsmError::TxBufFlush(std::io::Error::from(std::io::ErrorKind::Other)).to_string(),
+            "An I/O error occurred, when attempting to flush the connection TX buffer: other error"
+        );
+
+        assert_eq!(
+            VsockCsmError::StreamWrite(std::io::Error::from(std::io::ErrorKind::Other)).to_string(),
+            "An I/O error occurred, when attempting to write data to the host-side stream: other \
+             error"
+        );
+    }
+}

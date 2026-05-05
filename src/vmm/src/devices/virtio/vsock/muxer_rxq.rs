@@ -17,9 +17,8 @@
 /// out-of-sync is drained, the muxer will discard it, and attempt to rebuild a synced one.
 use std::collections::{HashMap, VecDeque};
 
-use super::super::VsockChannel;
 use super::muxer::{ConnMapKey, MuxerRx};
-use super::{MuxerConnection, defs};
+use super::{MuxerConnection, VsockChannel, defs};
 
 /// The muxer RX queue.
 #[derive(Debug)]

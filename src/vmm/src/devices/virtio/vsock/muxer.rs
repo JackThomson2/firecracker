@@ -38,12 +38,13 @@ use std::os::unix::net::{UnixListener, UnixStream};
 
 use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 
-use super::super::csm::ConnState;
-use super::super::defs::uapi;
-use super::super::{VsockBackend, VsockChannel, VsockEpollListener, VsockError};
+use super::defs::uapi;
 use super::muxer_killq::MuxerKillQ;
 use super::muxer_rxq::MuxerRxQ;
-use super::{MuxerConnection, VsockUnixBackendError, defs};
+use super::{
+    ConnState, MuxerConnection, VsockBackend, VsockChannel, VsockEpollListener, VsockError,
+    VsockUnixBackendError, defs,
+};
 use crate::devices::virtio::vsock::metrics::METRICS;
 use crate::devices::virtio::vsock::packet::{VsockPacketRx, VsockPacketTx};
 use crate::logger::{IncMetric, debug, error, info, warn};
@@ -801,7 +802,7 @@ mod tests {
 
     use vmm_sys_util::tempfile::TempFile;
 
-    use super::super::super::csm::defs as csm_defs;
+    use super::super::defs as csm_defs;
     use super::*;
     use crate::devices::virtio::vsock::device::{RXQ_INDEX, TXQ_INDEX};
     use crate::devices::virtio::vsock::test_utils;
