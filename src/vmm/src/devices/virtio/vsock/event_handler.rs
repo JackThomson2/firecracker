@@ -93,17 +93,33 @@ where
         used_queues
     }
 
-    pub fn handle_evq_event(&mut self, evset: EventSet) {
+    pub fn handle_evq_event(&mut self, evset: EventSet) -> Vec<u16> {
+        let mut used_queues = Vec::new();
         if evset != EventSet::IN {
             warn!("vsock: evq unexpected event {:?}", evset);
             METRICS.ev_queue_event_fails.inc();
-            return;
+            return used_queues;
         }
 
         if let Err(err) = self.queue_events[EVQ_INDEX].read() {
             error!("Failed to consume vsock evq event: {:?}", err);
             METRICS.ev_queue_event_fails.inc();
         }
+
+        // Guest just re-armed the event vq, which it does at the end of
+        // `virtio_transport_event_work()` after processing the
+        // TRANSPORT_RESET. The connected-socket sweep is therefore done
+        // and it is safe to deliver RX packets again. Drain any RX that
+        // accumulated in the muxer while we were waiting.
+        self.pending_event_ack = false;
+        if self.backend.has_pending_rx() {
+            match self.process_rx() {
+                Ok(true) => used_queues.push(RXQ_INDEX.try_into().unwrap()),
+                Ok(false) => {}
+                Err(err) => error!("vsock: process_rx after evq ack failed: {:?}", err),
+            }
+        }
+        used_queues
     }
 
     /// Notify backend of new events.
@@ -197,10 +213,7 @@ where
                 }
                 Self::PROCESS_RXQ => self.handle_rxq_event(evset),
                 Self::PROCESS_TXQ => self.handle_txq_event(evset),
-                Self::PROCESS_EVQ => {
-                    self.handle_evq_event(evset);
-                    Vec::new()
-                }
+                Self::PROCESS_EVQ => self.handle_evq_event(evset),
                 Self::PROCESS_NOTIFY_BACKEND => self.notify_backend(evset).unwrap(),
                 _ => {
                     warn!("Unexpected vsock event received: {:?}", source);
@@ -396,6 +409,59 @@ mod tests {
             ctx.device.handle_evq_event(EventSet::IN);
             assert_eq!(metric_before + 1, METRICS.ev_queue_event_fails.count());
         }
+    }
+
+    /// While `pending_event_ack` is set, `process_rx` must not consume any
+    /// RX descriptors, even if the backend reports pending RX. The flag is
+    /// cleared by `handle_evq_event`, which must then drain the queued RX.
+    /// See the `pending_event_ack` field doc on `Vsock` for context.
+    #[test]
+    fn test_pending_event_ack_gates_rx() {
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+
+        // Simulate the post-restore state: TRANSPORT_RESET event has been
+        // signalled, guest hasn't acked yet, backend has pending RX.
+        ctx.device.pending_event_ack = true;
+        ctx.device.backend.set_pending_rx(true);
+
+        // notify_backend would normally drain RX into the RX vq. With the
+        // gate set, the RX vq must be left untouched.
+        let used = ctx.device.notify_backend(EventSet::IN).unwrap();
+        assert!(
+            !used.contains(&RXQ_INDEX.try_into().unwrap()),
+            "RX vq must not be signalled while pending_event_ack is set"
+        );
+        assert_eq!(
+            ctx.guest_rxvq.used.idx.get(),
+            0,
+            "RX vq used ring must be untouched while pending_event_ack is set"
+        );
+
+        // The guest now acks the event vq. handle_evq_event needs an actual
+        // eventfd write to consume; mock that by writing 1 to the EVQ
+        // queue_event eventfd.
+        ctx.device.queue_events[EVQ_INDEX].write(1).unwrap();
+        ctx.device.backend.set_pending_rx(true);
+
+        let used = ctx.device.handle_evq_event(EventSet::IN);
+
+        // Flag must be cleared, and the RX drained as part of handling
+        // the ack.
+        assert!(
+            !ctx.device.pending_event_ack,
+            "pending_event_ack must be cleared by guest's evq ack"
+        );
+        assert!(
+            used.contains(&RXQ_INDEX.try_into().unwrap()),
+            "evq ack should drain pending RX and signal the RX vq"
+        );
+        assert_eq!(
+            ctx.guest_rxvq.used.idx.get(),
+            1,
+            "RX vq must be drained immediately after evq ack"
+        );
     }
 
     #[test]

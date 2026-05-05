@@ -74,6 +74,21 @@ pub struct Vsock<B> {
 
     pub rx_packet: VsockPacketRx,
     pub tx_packet: VsockPacketTx,
+
+    /// True between sending VIRTIO_VSOCK_EVENT_TRANSPORT_RESET on the event
+    /// queue (during snapshot resume) and the guest driver acking it. While
+    /// set, we refuse to drain the muxer into the RX virtqueue, so that the
+    /// guest's `virtio_transport_event_work()` (which iterates the
+    /// connected-socket list to reset every transport-bound socket) cannot
+    /// race with `virtio_transport_recv_listen()` for a freshly-arrived
+    /// CONNECT. Without this gate, on PCI MSI-X the RX and EVQ vectors land
+    /// on different vCPUs, so `rx_work` and `event_work` run concurrently;
+    /// `rx_work` may insert a brand-new child socket into the connected
+    /// table just before `event_work` iterates it, so the child gets
+    /// reset to `TCP_CLOSE`/`ECONNRESET` after the virtio handshake had
+    /// already returned `OP_RESPONSE` to the host. The host then sends data
+    /// onto a (silently) dead socket, and the guest replies with `OP_RST`.
+    pub(crate) pending_event_ack: bool,
 }
 
 // TODO: Detect / handle queue deadlock:
@@ -108,6 +123,7 @@ where
             device_state: DeviceState::Inactive,
             rx_packet: VsockPacketRx::new()?,
             tx_packet: VsockPacketTx::default(),
+            pending_event_ack: false,
         })
     }
 
@@ -157,6 +173,13 @@ where
     /// have pending. Return `true` if descriptors have been added to the used ring, and `false`
     /// otherwise.
     pub fn process_rx(&mut self) -> Result<bool, InvalidAvailIdx> {
+        // While a TRANSPORT_RESET event is queued on the event vq and the
+        // guest has not yet acked it, do not deliver any RX packets. See
+        // the `pending_event_ack` field doc for the race this prevents.
+        if self.pending_event_ack {
+            return Ok(false);
+        }
+
         // This is safe since we checked in the event handler that the device is activated.
         let mem = &self.device_state.active_state().unwrap().mem;
 
@@ -266,6 +289,12 @@ where
             error!("Failed to add used descriptor {}: {}", head.index, err);
         });
         queue.advance_used_ring_idx();
+
+        // From now until the guest driver re-arms the event vq (which it
+        // does at the end of `virtio_transport_event_work()` after the
+        // connected-socket sweep), refuse to deliver RX packets. See
+        // `pending_event_ack` doc for why.
+        self.pending_event_ack = true;
 
         // NOTE: kick() will be called on resume and it will trigger the interrupt again. As calling
         // it multiple times should not cause any harm, it would be safer to call it here as well
@@ -388,6 +417,11 @@ where
         // The only reason we still `kick` it is to make guest process
         // `TRANSPORT_RESET_EVENT` event we sent during snapshot creation.
         if self.is_activated() {
+            // The TRANSPORT_RESET event we are about to (re-)signal must
+            // be processed by the guest before any new RX packet reaches
+            // it. See `pending_event_ack` doc for the race this prevents.
+            self.pending_event_ack = true;
+
             info!(
                 "[{:?}:{}] signaling event queue",
                 self.device_type(),
