@@ -62,7 +62,7 @@ impl LogRateLimiter {
                     .expect("invalid rate limiter configuration"),
             )
         });
-        let mut bucket = mutex.lock().expect("rate limiter lock poisoned");
+        let bucket = mutex.lock().expect("rate limiter lock poisoned");
         matches!(
             bucket.reduce(1),
             crate::rate_limiter::BucketReduction::Success

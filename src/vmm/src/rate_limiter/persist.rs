@@ -1,7 +1,11 @@
 // Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Defines the structures needed for saving/restoring a RateLimiter.
+//! Save / restore for the GCRA-backed RateLimiter.
+//!
+//! Snapshot wire format reflects the GCRA state directly: tat is stored
+//! as the deficit at save time (ns until the bucket becomes idle), and
+//! reapplied to "now" on restore.
 
 use serde::{Deserialize, Serialize};
 use utils::time::TimerFd;
@@ -14,9 +18,10 @@ use crate::snapshot::Persist;
 pub struct TokenBucketState {
     size: u64,
     one_time_burst: u64,
-    refill_time: u64,
-    budget: u64,
-    elapsed_ns: u64,
+    initial_one_time_burst: u64,
+    refill_time_ms: u64,
+    /// Bucket deficit at save time, in ns. `0` = bucket idle/full.
+    deficit_ns: u64,
 }
 
 impl Persist<'_> for TokenBucket {
@@ -25,30 +30,33 @@ impl Persist<'_> for TokenBucket {
     type Error = io::Error;
 
     fn save(&self) -> Self::State {
+        let now = now_ns();
+        let tat = self.tat_ns.load(Ordering::Relaxed);
+        let deficit_ns = tat.saturating_sub(now);
         TokenBucketState {
             size: self.size,
-            one_time_burst: self.one_time_burst,
-            refill_time: self.refill_time,
-            budget: self.budget,
-            // This should be safe for a duration of about 584 years.
-            elapsed_ns: u64::try_from(self.last_update.elapsed().as_nanos()).unwrap(),
+            one_time_burst: self.one_time_burst.load(Ordering::Relaxed),
+            initial_one_time_burst: self.initial_one_time_burst,
+            refill_time_ms: self.refill_time_ms,
+            deficit_ns,
         }
     }
 
     fn restore(_: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
-        let now = Instant::now();
-        let last_update = now
-            .checked_sub(Duration::from_nanos(state.elapsed_ns))
-            .unwrap_or(now);
-
-        let mut token_bucket =
-            TokenBucket::new(state.size, state.one_time_burst, state.refill_time)
-                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-
-        token_bucket.budget = state.budget;
-        token_bucket.last_update = last_update;
-
-        Ok(token_bucket)
+        let bucket = TokenBucket::new(
+            state.size,
+            state.initial_one_time_burst,
+            state.refill_time_ms,
+        )
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        bucket
+            .one_time_burst
+            .store(state.one_time_burst, Ordering::Relaxed);
+        let now = now_ns();
+        bucket
+            .tat_ns
+            .store(now.saturating_add(state.deficit_ns), Ordering::Relaxed);
+        Ok(bucket)
     }
 }
 
@@ -93,28 +101,23 @@ impl Persist<'_> for RateLimiter {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
 
     #[test]
     fn test_token_bucket_persistence() {
-        let mut tb = TokenBucket::new(1000, 2000, 3000).unwrap();
+        let tb = TokenBucket::new(1000, 2000, 3000).unwrap();
 
-        // Check that TokenBucket restores correctly if untouched.
         let restored_tb = TokenBucket::restore((), &tb.save()).unwrap();
         assert!(tb.partial_eq(&restored_tb));
 
-        // Check that TokenBucket restores correctly after partially consuming tokens.
         tb.reduce(100);
         let restored_tb = TokenBucket::restore((), &tb.save()).unwrap();
         assert!(tb.partial_eq(&restored_tb));
 
-        // Check that TokenBucket restores correctly after replenishing tokens.
         tb.force_replenish(100);
         let restored_tb = TokenBucket::restore((), &tb.save()).unwrap();
         assert!(tb.partial_eq(&restored_tb));
 
-        // Test serialization.
         let tb_state = tb.save();
         let serialized_data = bitcode::serialize(&tb_state).unwrap();
 
@@ -128,10 +131,8 @@ mod tests {
         let refill_time = 100_000;
         let mut rate_limiter = RateLimiter::new(100, 0, refill_time, 10, 0, refill_time).unwrap();
 
-        // Check that RateLimiter restores correctly if untouched.
         let restored_rate_limiter =
             RateLimiter::restore((), &rate_limiter.save()).expect("Unable to restore rate limiter");
-
         assert!(
             rate_limiter
                 .ops()
@@ -146,12 +147,10 @@ mod tests {
         );
         assert!(!restored_rate_limiter.timer_fd.is_armed());
 
-        // Check that RateLimiter restores correctly after partially consuming tokens.
         rate_limiter.consume(10, TokenType::Bytes);
         rate_limiter.consume(10, TokenType::Ops);
         let restored_rate_limiter =
             RateLimiter::restore((), &rate_limiter.save()).expect("Unable to restore rate limiter");
-
         assert!(
             rate_limiter
                 .ops()
@@ -166,11 +165,9 @@ mod tests {
         );
         assert!(!restored_rate_limiter.timer_fd.is_armed());
 
-        // Check that RateLimiter restores correctly after totally consuming tokens.
         rate_limiter.consume(1000, TokenType::Bytes);
         let restored_rate_limiter =
             RateLimiter::restore((), &rate_limiter.save()).expect("Unable to restore rate limiter");
-
         assert!(
             rate_limiter
                 .ops()
@@ -184,7 +181,6 @@ mod tests {
                 .partial_eq(restored_rate_limiter.bandwidth().unwrap())
         );
 
-        // Test serialization.
         let rate_limiter_state = rate_limiter.save();
         let serialized_data = bitcode::serialize(&rate_limiter_state).unwrap();
 
