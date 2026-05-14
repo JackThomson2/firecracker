@@ -295,14 +295,21 @@ impl KvmVm {
     }
 
     /// Sends a resume event to all vCPUs and waits for acknowledgement.
+    ///
+    /// Secondary vcpus are resumed and acked first, so by the time vcpu 0
+    /// starts running guest code every other vcpu is loaded into KVM and
+    /// ready to receive wake-up IPIs.
     pub fn resume_vcpus(&self) -> Result<(), crate::VmmError> {
         let mut handles = self.vcpus_handles();
-        handles
-            .iter_mut()
+        let (bsp, aps) = match handles.split_first_mut() {
+            Some(split) => split,
+            None => return Ok(()),
+        };
+
+        aps.iter_mut()
             .try_for_each(|handle| handle.send_event(crate::VcpuEvent::Resume))
             .map_err(|_| crate::VmmError::VcpuMessage)?;
-
-        if handles
+        if aps
             .iter()
             .map(|handle| {
                 handle
@@ -313,7 +320,16 @@ impl KvmVm {
         {
             return Err(crate::VmmError::VcpuMessage);
         }
-        Ok(())
+
+        bsp.send_event(crate::VcpuEvent::Resume)
+            .map_err(|_| crate::VmmError::VcpuMessage)?;
+        match bsp
+            .response_receiver()
+            .recv_timeout(crate::RECV_TIMEOUT_SEC)
+        {
+            Ok(crate::VcpuResponse::Resumed) => Ok(()),
+            _ => Err(crate::VmmError::VcpuMessage),
+        }
     }
 
     /// Saves vCPU states by requesting each vCPU thread to serialize its state.

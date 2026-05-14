@@ -305,6 +305,10 @@ impl Vcpu {
                     );
                     self.kvm_vcpu.fd.set_kvm_immediate_exit(0);
                 }
+                // Registering this vcpu so it can receive IPIs.
+                self.kvm_vcpu.fd.set_kvm_immediate_exit(1);
+                let _ = self.kvm_vcpu.fd.run();
+                self.kvm_vcpu.fd.set_kvm_immediate_exit(0);
                 self.response_sender
                     .send(VcpuResponse::Resumed)
                     .expect("vcpu channel unexpectedly closed");
