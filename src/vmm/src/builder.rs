@@ -334,9 +334,8 @@ pub fn build_microvm_for_boot(
         .iter_mut()
         .for_each(|vcpu| vcpu.attach_debug_info(gdb_tx.clone()));
 
-    // Move vcpus to their own threads and start their state machine in the 'Paused' state.
     kvm_vm
-        .start_vcpus(
+        .start_vcpus_cold_boot(
             vcpus,
             seccomp_filters
                 .get("vcpu")
@@ -344,7 +343,7 @@ pub fn build_microvm_for_boot(
                 .clone(),
         )
         .map_err(VmmError::VcpuStart)?;
-    vmm.lock().unwrap().instance_info.state = VmState::Paused;
+    vmm.lock().unwrap().instance_info.state = VmState::Running;
 
     #[cfg(feature = "gdb")]
     if let Some(gdb_socket_path) = &vm_resources.machine_config.gdb_socket_path {
@@ -386,10 +385,10 @@ pub fn build_and_boot_microvm(
     debug!("event_start: build microvm for boot");
     let vmm = build_microvm_for_boot(instance_info, vm_resources, event_manager, seccomp_filters)?;
     debug!("event_end: build microvm for boot");
-    // The vcpus start off in the `Paused` state, let them run.
-    debug!("event_start: boot microvm");
-    vmm.lock().unwrap().resume_vm()?;
-    debug!("event_end: boot microvm");
+    // Cold-boot vcpus already in KVM_RUN; only need to kick virtio devices.
+    debug!("event_start: kick devices");
+    vmm.lock().unwrap().kick_virtio_devices_after_cold_boot()?;
+    debug!("event_end: kick devices");
     Ok(vmm)
 }
 

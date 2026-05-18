@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 
 #[cfg(target_arch = "x86_64")]
@@ -38,7 +38,7 @@ use crate::vstate::memory::{
     GuestRegionMmap, GuestRegionMmapExt, MemoryError,
 };
 use crate::vstate::resources::ResourceAllocator;
-use crate::vstate::vcpu::{StartThreadedError, VcpuError, VcpuHandle};
+use crate::vstate::vcpu::{StartThreadedError, VcpuEntryState, VcpuError, VcpuHandle};
 use crate::{DirtyBitmap, Vcpu, mem_size_mib};
 
 /// Error type for [`KvmVm::start_vcpus`].
@@ -232,15 +232,65 @@ impl KvmVm {
         self.common.uffd = uffd;
     }
 
-    /// Starts the microVM vCPUs.
-    ///
-    /// Sets the terminal to raw/non-blocking mode, then spawns a thread per vCPU
-    /// and stores the resulting handles. The barrier is used to synchronize TLS
-    /// initialization across all vCPU threads before returning.
+    /// Spawns vcpu threads in the Paused state. Used by snapshot restore.
     pub fn start_vcpus(
+        self: &Arc<Self>,
+        vcpus: Vec<Vcpu>,
+        vcpu_seccomp_filter: Arc<crate::seccomp::BpfProgram>,
+    ) -> Result<(), StartVcpusError> {
+        self.spawn_vcpus(vcpus, vcpu_seccomp_filter, VcpuEntryState::Paused, None)
+    }
+
+    /// Spawns vcpu threads for cold boot.
+    ///
+    /// APs spawn first and enter KVM_RUN; with MP_STATE_INIT_RECEIVED set at
+    /// configure, each blocks in `kvm_vcpu_block` waiting for SIPI. BSP spawns
+    /// only after every AP has signalled it is about to enter KVM_RUN, so by
+    /// the time vcpu 0's guest code issues INIT/SIPI, every AP is a registered
+    /// IPI target inside the kernel block.
+    pub fn start_vcpus_cold_boot(
+        self: &Arc<Self>,
+        vcpus: Vec<Vcpu>,
+        vcpu_seccomp_filter: Arc<crate::seccomp::BpfProgram>,
+    ) -> Result<(), StartVcpusError> {
+        let ap_count = vcpus.len().saturating_sub(1);
+
+        let mut iter = vcpus.into_iter();
+        let bsp = iter.next();
+        let aps: Vec<Vcpu> = iter.collect();
+
+        let ap_ready = Arc::new(AtomicUsize::new(0));
+
+        if !aps.is_empty() {
+            self.spawn_vcpus(
+                aps,
+                vcpu_seccomp_filter.clone(),
+                VcpuEntryState::Running,
+                Some(ap_ready.clone()),
+            )?;
+            while ap_ready.load(Ordering::Acquire) < ap_count {
+                std::hint::spin_loop();
+            }
+        }
+
+        if let Some(bsp_vcpu) = bsp {
+            self.spawn_vcpus(
+                vec![bsp_vcpu],
+                vcpu_seccomp_filter,
+                VcpuEntryState::Running,
+                None,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn spawn_vcpus(
         self: &Arc<Self>,
         mut vcpus: Vec<Vcpu>,
         vcpu_seccomp_filter: Arc<crate::seccomp::BpfProgram>,
+        entry_state: VcpuEntryState,
+        ap_ready: Option<Arc<AtomicUsize>>,
     ) -> Result<(), StartVcpusError> {
         let vcpu_count = vcpus.len();
         let barrier = Arc::new(Barrier::new(vcpu_count + 1));
@@ -264,6 +314,8 @@ impl KvmVm {
                 self,
                 vcpu_seccomp_filter.clone(),
                 barrier.clone(),
+                entry_state,
+                ap_ready.clone(),
             )?);
         }
         drop(handles);

@@ -470,6 +470,17 @@ impl Vmm {
         Ok(())
     }
 
+    /// Kicks virtio devices after cold boot. Cold-boot vcpus are already in
+    /// KVM_RUN via [`KvmVm::start_vcpus_cold_boot`]; no Resume needed.
+    pub fn kick_virtio_devices_after_cold_boot(&mut self) -> Result<(), VmmError> {
+        let _ = self
+            .vm
+            .as_kvm()
+            .ok_or_else(|| VmmError::NotSupportedOnVmType(self.vm.type_name()))?;
+        self.device_manager.kick_virtio_devices();
+        Ok(())
+    }
+
     /// Sends a pause command to the vCPUs.
     pub fn pause_vm(&mut self) -> Result<(), VmmError> {
         let kvm_vm = self
