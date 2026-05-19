@@ -6,7 +6,7 @@
 
 use std::io::Write;
 
-use crc64::crc64;
+use crc_fast::{CrcAlgorithm, Digest};
 
 /// Computes the CRC64 checksum of the written bytes.
 ///
@@ -30,7 +30,7 @@ use crc64::crc64;
 pub struct CRC64Writer<T> {
     /// The underlying raw writer. Using this directly will bypass CRC computation!
     pub writer: T,
-    crc64: u64,
+    digest: Digest,
 }
 
 impl<T> CRC64Writer<T>
@@ -39,12 +39,15 @@ where
 {
     /// Create a new writer.
     pub fn new(writer: T) -> Self {
-        CRC64Writer { crc64: 0, writer }
+        CRC64Writer {
+            digest: Digest::new(CrcAlgorithm::Crc64Redis),
+            writer,
+        }
     }
 
     /// Returns the current checksum value.
     pub fn checksum(&self) -> u64 {
-        self.crc64
+        self.digest.finalize()
     }
 }
 
@@ -54,7 +57,7 @@ where
 {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let bytes_written = self.writer.write(buf)?;
-        self.crc64 = crc64(self.crc64, &buf[..bytes_written]);
+        self.digest.update(&buf[..bytes_written]);
         Ok(bytes_written)
     }
 
@@ -72,9 +75,8 @@ mod tests {
         let mut buf = vec![0; 5];
         let mut slice = buf.as_mut_slice();
         let crc_writer = CRC64Writer::new(&mut slice);
-        assert_eq!(crc_writer.crc64, 0);
-        assert_eq!(crc_writer.writer, &[0; 5]);
         assert_eq!(crc_writer.checksum(), 0);
+        assert_eq!(crc_writer.writer, &[0; 5]);
     }
 
     #[test]
@@ -87,6 +89,5 @@ mod tests {
         crc_writer.write_all(write_buf.as_slice()).unwrap();
         crc_writer.flush().unwrap();
         assert_eq!(crc_writer.checksum(), 0x29D5_3572_1632_6566);
-        assert_eq!(crc_writer.checksum(), crc_writer.crc64);
     }
 }

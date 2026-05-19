@@ -28,7 +28,7 @@ mod persist;
 use std::fmt::Debug;
 use std::io::{Read, Write};
 
-use crc64::crc64;
+use crc_fast::CrcAlgorithm;
 use semver::Version;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -203,7 +203,7 @@ impl<Data: DeserializeOwned> Snapshot<Data> {
         let (data_buf, _crc_buf) = buf.split_at(buf.len() - 8);
         let snapshot = Self::load_without_crc_check(data_buf)?;
 
-        let computed_checksum = crc64(0, buf.as_slice());
+        let computed_checksum = crc_fast::checksum(CrcAlgorithm::Crc64Redis, buf.as_slice());
         // When we read the entire file, we also read the checksum into the buffer. The CRC has the
         // property that crc(0, buf.as_slice()) == 0 iff the last 8 bytes of buf are the checksum
         // of all the preceeding bytes, and this is the property we are using here.
