@@ -100,12 +100,12 @@ pub trait DynamicDevice: Send {
 #[macro_export]
 macro_rules! fc_plugin {
     ($ty:ty, $constructor:expr) => {
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub extern "C" fn fc_plugin_abi_version() -> u32 {
             $crate::ABI_VERSION
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub extern "C" fn fc_device_create(
             config_json: *const ::std::ffi::c_char,
             err_buf: *mut ::std::ffi::c_char,
@@ -159,7 +159,7 @@ macro_rules! fc_plugin {
             }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn fc_device_destroy(handle: *mut ::std::ffi::c_void) {
             if !handle.is_null() {
                 let _ = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
@@ -168,7 +168,7 @@ macro_rules! fc_plugin {
             }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn fc_device_info(
             handle: *mut ::std::ffi::c_void,
             out: *mut $crate::FcDeviceInfo,
@@ -194,7 +194,7 @@ macro_rules! fc_plugin {
             }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn fc_device_activate(
             handle: *mut ::std::ffi::c_void,
             ctx: *const $crate::FcActivationContext,
@@ -213,7 +213,7 @@ macro_rules! fc_plugin {
             }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn fc_device_handle_queue(
             handle: *mut ::std::ffi::c_void,
             queue_idx: u32,
@@ -231,7 +231,7 @@ macro_rules! fc_plugin {
             }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn fc_device_read_config(
             handle: *mut ::std::ffi::c_void,
             offset: u64,
@@ -252,7 +252,7 @@ macro_rules! fc_plugin {
             }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn fc_device_write_config(
             handle: *mut ::std::ffi::c_void,
             offset: u64,
@@ -273,7 +273,7 @@ macro_rules! fc_plugin {
             }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn fc_device_reset(
             handle: *mut ::std::ffi::c_void,
         ) -> ::std::ffi::c_int {

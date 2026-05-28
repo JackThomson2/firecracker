@@ -1,5 +1,5 @@
 [workspace]
-members = ["src/*"]
+members = ["src/*", "tests/dynamic_device_plugin"]
 # We exclude the jailer below so that it does not get build by default. This is because "cargo build" compiles
 # for the gnu target, and the jailer needs a statically compiled binary to work correctly.
 # See https://github.com/firecracker-microvm/firecracker/commit/3bf285c8f8a815149923c562dd7edaffcaf10c4e
