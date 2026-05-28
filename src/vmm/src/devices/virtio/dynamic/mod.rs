@@ -430,3 +430,105 @@ impl VirtioDevice for DynamicVirtioDevice {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    use super::*;
+    use crate::devices::virtio::device::VirtioDevice;
+
+    fn build_test_plugin() -> PathBuf {
+        let output = Command::new("cargo")
+            .args(["build", "-p", "test-dynamic-device", "--message-format=short"])
+            .output()
+            .expect("Failed to run cargo build");
+        assert!(
+            output.status.success(),
+            "Test plugin build failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Determine target directory from cargo metadata
+        let metadata_output = Command::new("cargo")
+            .args(["metadata", "--format-version=1", "--no-deps"])
+            .output()
+            .expect("Failed to run cargo metadata");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&metadata_output.stdout).expect("Failed to parse metadata");
+        let target_dir = metadata["target_directory"]
+            .as_str()
+            .expect("No target_directory in metadata");
+
+        let so_path = PathBuf::from(target_dir).join("debug/libtest_dynamic_device.so");
+        assert!(so_path.exists(), "Plugin .so not found at {so_path:?}");
+        so_path
+    }
+
+    #[test]
+    fn test_load_plugin() {
+        let plugin_path = build_test_plugin();
+        let device = DynamicVirtioDevice::load(&plugin_path, "test-null".to_string(), "{}")
+            .expect("Failed to load plugin");
+
+        assert_eq!(device.id(), "test-null");
+        assert_eq!(device.device_type(), VirtioDeviceType::Dynamic);
+        assert_eq!(device.queues().len(), 1);
+        assert_eq!(device.avail_features(), 0);
+    }
+
+    #[test]
+    fn test_load_nonexistent_plugin() {
+        let result =
+            DynamicVirtioDevice::load(Path::new("/nonexistent.so"), "bad".to_string(), "{}");
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            DynamicDeviceError::LibraryLoad(_)
+        ));
+    }
+
+    #[test]
+    fn test_config_read_write() {
+        let plugin_path = build_test_plugin();
+        let mut device =
+            DynamicVirtioDevice::load(&plugin_path, "test-rw".to_string(), "{}").unwrap();
+
+        let data = [0x42u8; 4];
+        device.write_config(0, &data);
+
+        let mut buf = [0u8; 4];
+        device.read_config(0, &mut buf);
+        assert_eq!(buf, data);
+    }
+
+    #[test]
+    fn test_reset() {
+        let plugin_path = build_test_plugin();
+        let mut device =
+            DynamicVirtioDevice::load(&plugin_path, "test-reset".to_string(), "{}").unwrap();
+
+        device.write_config(0, &[0xff; 4]);
+
+        // Call reset via the stored fn pointer (accessible within same module)
+        let ret = unsafe { (device.fns.reset)(device.handle) };
+        assert_eq!(ret, 0);
+
+        let mut buf = [0xffu8; 4];
+        device.read_config(0, &mut buf);
+        assert_eq!(buf, [0; 4]);
+    }
+
+    #[test]
+    fn test_feature_negotiation() {
+        let plugin_path = build_test_plugin();
+        let mut device =
+            DynamicVirtioDevice::load(&plugin_path, "test-features".to_string(), "{}").unwrap();
+
+        assert_eq!(device.acked_features(), 0);
+        device.set_acked_features(0xffff);
+        // null device has avail_features = 0, so acked should be masked to 0
+        assert_eq!(device.acked_features(), 0);
+    }
+}
