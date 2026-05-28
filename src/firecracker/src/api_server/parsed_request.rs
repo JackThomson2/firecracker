@@ -16,6 +16,7 @@ use super::request::balloon::{parse_get_balloon, parse_patch_balloon, parse_put_
 use super::request::boot_source::parse_put_boot_source;
 use super::request::cpu_configuration::parse_put_cpu_config;
 use super::request::drive::{parse_patch_drive, parse_put_drive};
+use super::request::dynamic_device::parse_put_dynamic_device;
 use super::request::entropy::parse_put_entropy;
 use super::request::instance_info::parse_get_instance_info;
 use super::request::logger::parse_put_logger;
@@ -99,6 +100,7 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Put, "boot-source", Some(body)) => parse_put_boot_source(body),
             (Method::Put, "cpu-config", Some(body)) => parse_put_cpu_config(body),
             (Method::Put, "drives", Some(body)) => parse_put_drive(body, path_tokens.next()),
+            (Method::Put, "dynamic-devices", Some(body)) => parse_put_dynamic_device(body),
             (Method::Put, "pmem", Some(body)) => parse_put_pmem(body, path_tokens.next()),
             (Method::Put, "logger", Some(body)) => parse_put_logger(body),
             (Method::Put, "serial", Some(body)) => parse_put_serial(body),
