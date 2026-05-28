@@ -22,6 +22,7 @@ use crate::vmm_config::boot_source::{
     BootConfig, BootSource, BootSourceConfig, BootSourceConfigError,
 };
 use crate::vmm_config::drive::*;
+use crate::vmm_config::dynamic_device::*;
 use crate::vmm_config::entropy::*;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError, MachineConfigUpdate};
@@ -138,6 +139,8 @@ pub struct VmResources {
     pub serial_out_path: Option<PathBuf>,
     /// Optional rate limiter config for serial output.
     pub serial_rate_limiter_cfg: Option<TokenBucketConfig>,
+    /// The dynamic device builder.
+    pub dynamic_devices: DynamicDeviceBuilder,
 }
 
 impl VmResources {
@@ -386,6 +389,14 @@ impl VmResources {
         body: EntropyDeviceConfig,
     ) -> Result<(), EntropyDeviceError> {
         self.entropy.insert(body)
+    }
+
+    /// Builds a dynamic device to be attached when the VM starts.
+    pub fn build_dynamic_device(
+        &mut self,
+        config: DynamicDeviceConfig,
+    ) -> Result<(), DynamicDeviceConfigError> {
+        self.dynamic_devices.insert(config)
     }
 
     /// Builds a pmem device to be attached when the VM starts.
