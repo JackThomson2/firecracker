@@ -10,7 +10,10 @@ impl DynamicVirtioDevice {
     const PROCESS_ACTIVATE: u32 = 0;
 
     fn queue_event_data(queue_idx: usize) -> u32 {
-        (queue_idx as u32) + 1
+        // queue_idx is bounded by num_queues (max 16), so truncation is impossible
+        #[allow(clippy::cast_possible_truncation)]
+        let data = (queue_idx as u32) + 1;
+        data
     }
 
     fn register_runtime_events(&self, ops: &mut EventOps) {
@@ -73,9 +76,12 @@ impl DynamicVirtioDevice {
 
         self.process_queue(queue_idx);
 
+        // queue_idx is bounded by num_queues (max 16), fits in u16
+        #[allow(clippy::cast_possible_truncation)]
+        let queue_index = queue_idx as u16;
         if let Err(err) = self
             .interrupt_trigger()
-            .trigger(VirtioInterruptType::Queue(queue_idx as u16))
+            .trigger(VirtioInterruptType::Queue(queue_index))
         {
             error!(
                 "dynamic-device[{}]: Failed to signal interrupt for queue {}: {:?}",

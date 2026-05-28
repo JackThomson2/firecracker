@@ -5,28 +5,40 @@ use serde::{Deserialize, Serialize};
 
 use crate::devices::virtio::dynamic::{DynamicDeviceError, DynamicVirtioDevice};
 
+/// Configuration for a dynamic virtio device plugin.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DynamicDeviceConfig {
+    /// Unique identifier for this device.
     pub device_id: String,
+    /// Absolute path to the plugin shared library.
     pub plugin_path: PathBuf,
+    /// Virtio device type ID (must be >= 40).
     pub device_type: u32,
+    /// Number of virtqueues (1-16).
     pub num_queues: u32,
+    /// Queue depth, must be a power of 2 and <= 1024.
     pub queue_size: u32,
+    /// Memory access mode for the plugin.
     #[serde(default)]
     pub memory_mode: MemoryMode,
+    /// Opaque JSON passed to the plugin's constructor.
     #[serde(default)]
     pub plugin_config: Option<serde_json::Value>,
 }
 
+/// Memory access mode for dynamic device plugins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryMode {
+    /// Plugin only receives mapped virtqueue ring pointers.
     #[default]
     QueuesOnly,
+    /// Plugin receives full guest memory base pointer.
     FullGuestMemory,
 }
 
+/// Errors from dynamic device configuration.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum DynamicDeviceConfigError {
     /// Plugin path does not exist: {0}
@@ -47,17 +59,21 @@ pub enum DynamicDeviceConfigError {
 
 const MAX_DYNAMIC_DEVICES: usize = 8;
 
+/// Builder that accumulates dynamic device configs and loaded plugin instances.
 #[derive(Debug, Default)]
 pub struct DynamicDeviceBuilder {
+    /// Loaded device instances ready for attachment.
     pub devices: Vec<Arc<Mutex<DynamicVirtioDevice>>>,
     configs: Vec<DynamicDeviceConfig>,
 }
 
 impl DynamicDeviceBuilder {
+    /// Create a new empty builder.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Validate config, load the plugin, and store the device instance.
     pub fn insert(&mut self, config: DynamicDeviceConfig) -> Result<(), DynamicDeviceConfigError> {
         if !config.plugin_path.exists() {
             return Err(DynamicDeviceConfigError::PluginNotFound(
@@ -102,6 +118,7 @@ impl DynamicDeviceBuilder {
         Ok(())
     }
 
+    /// Get the stored configurations.
     pub fn configs(&self) -> &[DynamicDeviceConfig] {
         &self.configs
     }

@@ -80,7 +80,8 @@ pub struct DynamicVirtioDevice {
     fns: PluginFns,
 }
 
-// Safety: The plugin handle is only accessed from the VMM event loop thread.
+// SAFETY: The plugin handle is only accessed from the VMM event loop thread.
+// DynamicDevice trait requires Send on the plugin side.
 unsafe impl Send for DynamicVirtioDevice {}
 
 impl Debug for DynamicVirtioDevice {
@@ -116,11 +117,13 @@ impl DynamicVirtioDevice {
         id: String,
         config_json: &str,
     ) -> Result<Self, DynamicDeviceError> {
-        // Safety: loading a shared library can execute arbitrary code in its
+        // SAFETY: Loading a shared library can execute arbitrary code in its
         // constructors. This is acceptable because plugins are trusted.
         let lib = unsafe { Library::new(plugin_path) }
             .map_err(|e| DynamicDeviceError::LibraryLoad(e.to_string()))?;
 
+        // SAFETY: Symbol resolution from a loaded library. Plugin must export
+        // fc_plugin_abi_version with the correct signature per ABI contract.
         let abi_version = unsafe {
             let func: Symbol<FnAbiVersion> = lib
                 .get(b"fc_plugin_abi_version\0")
@@ -136,32 +139,35 @@ impl DynamicVirtioDevice {
             return Err(DynamicDeviceError::AbiMismatch(abi_version));
         }
 
-        // Safety: symbols are resolved from a loaded library; the plugin must
-        // export them with the correct signatures per the ABI contract.
+        // SAFETY: Plugin must export these symbols with correct signatures per ABI.
         let fn_create: FnCreate = unsafe {
             *lib.get(b"fc_device_create\0")
                 .map_err(|e| {
                     DynamicDeviceError::SymbolResolve("fc_device_create".into(), e.to_string())
                 })?
         };
+        // SAFETY: Symbol resolved from loaded plugin library.
         let fn_destroy: FnDestroy = unsafe {
             *lib.get(b"fc_device_destroy\0")
                 .map_err(|e| {
                     DynamicDeviceError::SymbolResolve("fc_device_destroy".into(), e.to_string())
                 })?
         };
+        // SAFETY: Symbol resolved from loaded plugin library.
         let fn_info: FnInfo = unsafe {
             *lib.get(b"fc_device_info\0")
                 .map_err(|e| {
                     DynamicDeviceError::SymbolResolve("fc_device_info".into(), e.to_string())
                 })?
         };
+        // SAFETY: Symbol resolved from loaded plugin library.
         let fn_activate: FnActivate = unsafe {
             *lib.get(b"fc_device_activate\0")
                 .map_err(|e| {
                     DynamicDeviceError::SymbolResolve("fc_device_activate".into(), e.to_string())
                 })?
         };
+        // SAFETY: Symbol resolved from loaded plugin library.
         let fn_handle_queue: FnHandleQueue = unsafe {
             *lib.get(b"fc_device_handle_queue\0")
                 .map_err(|e| {
@@ -171,6 +177,7 @@ impl DynamicVirtioDevice {
                     )
                 })?
         };
+        // SAFETY: Symbol resolved from loaded plugin library.
         let fn_read_config: FnReadConfig = unsafe {
             *lib.get(b"fc_device_read_config\0")
                 .map_err(|e| {
@@ -180,6 +187,7 @@ impl DynamicVirtioDevice {
                     )
                 })?
         };
+        // SAFETY: Symbol resolved from loaded plugin library.
         let fn_write_config: FnWriteConfig = unsafe {
             *lib.get(b"fc_device_write_config\0")
                 .map_err(|e| {
@@ -189,6 +197,7 @@ impl DynamicVirtioDevice {
                     )
                 })?
         };
+        // SAFETY: Symbol resolved from loaded plugin library.
         let fn_reset: FnReset = unsafe {
             *lib.get(b"fc_device_reset\0")
                 .map_err(|e| {
@@ -200,12 +209,12 @@ impl DynamicVirtioDevice {
             .map_err(|_| DynamicDeviceError::InvalidConfig("config contains null byte".into()))?;
         let mut err_buf = vec![0u8; 512];
 
-        // Safety: fn_create is the plugin's device constructor; we pass valid
+        // SAFETY: fn_create is the plugin's device constructor; we pass valid
         // pointers and lengths per the ABI contract.
         let handle = unsafe {
             fn_create(
                 config_c.as_ptr(),
-                err_buf.as_mut_ptr() as *mut c_char,
+                err_buf.as_mut_ptr().cast::<c_char>(),
                 err_buf.len(),
             )
         };
@@ -223,14 +232,16 @@ impl DynamicVirtioDevice {
             config_space_size: 0,
             memory_mode: 0,
         };
-        // Safety: handle is valid (non-null, just created), info is a valid pointer
+        // SAFETY: handle is valid (non-null, just created), info is a valid mutable pointer.
         let ret = unsafe { fn_info(handle, &mut info) };
         if ret != 0 {
+            // SAFETY: handle was created by fn_create and must be destroyed on error.
             unsafe { fn_destroy(handle) };
             return Err(DynamicDeviceError::InfoFailed);
         }
 
         if info.num_queues == 0 || info.num_queues > 16 {
+            // SAFETY: handle was created by fn_create and must be destroyed on error.
             unsafe { fn_destroy(handle) };
             return Err(DynamicDeviceError::InvalidConfig(format!(
                 "num_queues must be 1-16, got {}",
@@ -238,6 +249,7 @@ impl DynamicVirtioDevice {
             )));
         }
         if !info.queue_size.is_power_of_two() || info.queue_size > 1024 {
+            // SAFETY: handle was created by fn_create and must be destroyed on error.
             unsafe { fn_destroy(handle) };
             return Err(DynamicDeviceError::InvalidConfig(format!(
                 "queue_size must be power of 2 and <= 1024, got {}",
@@ -245,6 +257,8 @@ impl DynamicVirtioDevice {
             )));
         }
 
+        // queue_size is validated <= 1024 so fits in u16; num_queues <= 16
+        #[allow(clippy::cast_possible_truncation)]
         let queues = vec![Queue::new(info.queue_size as u16); info.num_queues as usize];
         let queue_events = (0..info.num_queues)
             .map(|_| EventFd::new(libc::EFD_NONBLOCK))
@@ -279,7 +293,8 @@ impl DynamicVirtioDevice {
     }
 
     pub(crate) fn process_queue(&mut self, queue_idx: usize) {
-        // Safety: handle is valid for the lifetime of Self, queue_idx is validated by caller
+        // SAFETY: handle is valid for the lifetime of Self, queue_idx is bounded by caller.
+        #[allow(clippy::cast_possible_truncation)]
         let ret = unsafe { (self.fns.handle_queue)(self.handle, queue_idx as u32) };
         if ret < 0 {
             error!(
@@ -293,7 +308,7 @@ impl DynamicVirtioDevice {
 impl Drop for DynamicVirtioDevice {
     fn drop(&mut self) {
         if !self.handle.is_null() {
-            // Safety: handle was created by fc_device_create and is being
+            // SAFETY: handle was created by fc_device_create and is being
             // destroyed exactly once here.
             unsafe { (self.fns.destroy)(self.handle) };
             self.handle = std::ptr::null_mut();
@@ -350,24 +365,28 @@ impl VirtioDevice for DynamicVirtioDevice {
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        // Safety: handle is valid, data pointer and length are valid
+        // SAFETY: handle is valid, data pointer and length are from a valid slice.
+        // data.len() bounded by config_space_size which is <= u32::MAX.
+        #[allow(clippy::cast_possible_truncation)]
         unsafe {
             (self.fns.read_config)(
                 self.handle,
                 offset,
-                data.as_mut_ptr() as *mut c_void,
+                data.as_mut_ptr().cast::<c_void>(),
                 data.len() as u32,
             );
         }
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
-        // Safety: handle is valid, data pointer and length are valid
+        // SAFETY: handle is valid, data pointer and length are from a valid slice.
+        // data.len() bounded by config_space_size which is <= u32::MAX.
+        #[allow(clippy::cast_possible_truncation)]
         unsafe {
             (self.fns.write_config)(
                 self.handle,
                 offset,
-                data.as_ptr() as *const c_void,
+                data.as_ptr().cast::<c_void>(),
                 data.len() as u32,
             );
         }
@@ -395,29 +414,27 @@ impl VirtioDevice for DynamicVirtioDevice {
 
         for (i, q) in self.queues.iter().enumerate() {
             fc_queues[i] = FcQueueView {
-                desc_table: q.desc_table_ptr as *mut u8,
-                avail_ring: q.avail_ring_ptr as *mut u8,
+                desc_table: q.desc_table_ptr.cast_mut().cast::<u8>(),
+                avail_ring: q.avail_ring_ptr.cast::<u8>(),
                 used_ring: q.used_ring_ptr,
+                #[allow(clippy::cast_possible_truncation)]
                 size: q.size as u32,
             };
         }
 
-        let (guest_mem_base, guest_mem_size) = if self.full_guest_memory {
-            // Full guest memory access not implemented in v1
-            (std::ptr::null_mut(), 0u64)
-        } else {
-            (std::ptr::null_mut(), 0u64)
-        };
+        let guest_mem_base = std::ptr::null_mut();
+        let guest_mem_size = 0u64;
 
         let ctx = FcActivationContext {
             guest_mem_base,
             guest_mem_size,
             queues: fc_queues,
+            #[allow(clippy::cast_possible_truncation)]
             num_queues: self.queues.len() as u32,
             acked_features: self.acked_features,
         };
 
-        // Safety: handle and ctx are valid pointers with correct layout
+        // SAFETY: handle and ctx are valid pointers with correct layout per ABI.
         let ret = unsafe { (self.fns.activate)(self.handle, &ctx) };
         if ret != 0 {
             return Err(ActivateError::EventFd);
@@ -450,7 +467,6 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        // Determine target directory from cargo metadata
         let metadata_output = Command::new("cargo")
             .args(["metadata", "--format-version=1", "--no-deps"])
             .output()
@@ -511,7 +527,7 @@ mod tests {
 
         device.write_config(0, &[0xff; 4]);
 
-        // Call reset via the stored fn pointer (accessible within same module)
+        // SAFETY: handle is valid, calling reset per ABI contract.
         let ret = unsafe { (device.fns.reset)(device.handle) };
         assert_eq!(ret, 0);
 
@@ -528,7 +544,6 @@ mod tests {
 
         assert_eq!(device.acked_features(), 0);
         device.set_acked_features(0xffff);
-        // null device has avail_features = 0, so acked should be masked to 0
         assert_eq!(device.acked_features(), 0);
     }
 }

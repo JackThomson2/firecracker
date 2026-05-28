@@ -106,7 +106,7 @@ macro_rules! fc_plugin {
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn fc_device_create(
+        pub unsafe extern "C" fn fc_device_create(
             config_json: *const ::std::ffi::c_char,
             err_buf: *mut ::std::ffi::c_char,
             err_buf_len: usize,
