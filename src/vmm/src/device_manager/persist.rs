@@ -345,6 +345,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                         device_info,
                     });
                 }
+                VirtioDeviceType::Dynamic => {}
             };
 
             Ok(())

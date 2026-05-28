@@ -68,6 +68,7 @@ pub enum VirtioDeviceType {
     Vsock = virtio_ids::VIRTIO_ID_VSOCK as u8,
     Mem = virtio_ids::VIRTIO_ID_MEM as u8,
     Pmem = virtio_ids::VIRTIO_ID_PMEM as u8,
+    Dynamic = 0xff,
 }
 
 /// Unique identifier for a virtio device: its type and string ID.

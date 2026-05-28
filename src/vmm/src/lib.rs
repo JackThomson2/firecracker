@@ -398,6 +398,7 @@ impl Vmm {
                         memory_hotplug = Some(MemoryHotplugConfig::from(m));
                     }
                 }
+                VirtioDeviceType::Dynamic => {}
             });
 
         let mmds_config = mmds_ref.map(|mmds| {

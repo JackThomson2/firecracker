@@ -419,6 +419,7 @@ impl<'a> Persist<'a> for PciDevices {
                         transport_state,
                     })
                 }
+                VirtioDeviceType::Dynamic => {}
             }
         }
 
