@@ -107,6 +107,12 @@ pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
     /// It should be the same as returned by Self::const_device_type().
     fn device_type(&self) -> VirtioDeviceType;
 
+    /// The numeric virtio device type ID exposed to the guest via transport.
+    /// Defaults to the enum discriminant. Dynamic devices override this.
+    fn virtio_device_type_id(&self) -> u32 {
+        self.device_type() as u32
+    }
+
     /// Returns unique device id
     fn id(&self) -> &str;
 

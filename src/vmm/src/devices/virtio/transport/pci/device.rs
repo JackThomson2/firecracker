@@ -306,9 +306,11 @@ impl Debug for VirtioPciDevice {
 impl VirtioPciDevice {
     fn pci_configuration(
         device_type: VirtioDeviceType,
+        virtio_device_type_id: u32,
         msix_config: &Arc<Mutex<MsixConfig>>,
     ) -> PciConfiguration {
-        let pci_device_id = VIRTIO_PCI_DEVICE_ID_BASE + device_type as u16;
+        #[allow(clippy::cast_possible_truncation)]
+        let pci_device_id = VIRTIO_PCI_DEVICE_ID_BASE + virtio_device_type_id as u16;
         let (class, subclass) = match device_type {
             VirtioDeviceType::Net => (
                 PciClassCode::NetworkController,
@@ -376,6 +378,7 @@ impl VirtioPciDevice {
         let msix_config = Arc::new(Mutex::new(MsixConfig::new(msix_vectors.clone(), sbdf)));
         let pci_config = Self::pci_configuration(
             device.lock().expect("Poisoned lock").device_type(),
+            device.lock().expect("Poisoned lock").virtio_device_type_id(),
             &msix_config,
         );
 

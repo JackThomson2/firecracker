@@ -43,7 +43,7 @@ pub enum MemoryMode {
 pub enum DynamicDeviceConfigError {
     /// Plugin path does not exist: {0}
     PluginNotFound(PathBuf),
-    /// device_type must be >= 40, got {0}
+    /// device_type must be >= 1, got {0}
     InvalidDeviceType(u32),
     /// num_queues must be 1-16, got {0}
     InvalidNumQueues(u32),
@@ -80,7 +80,7 @@ impl DynamicDeviceBuilder {
                 config.plugin_path.clone(),
             ));
         }
-        if config.device_type < 40 {
+        if config.device_type < 1 {
             return Err(DynamicDeviceConfigError::InvalidDeviceType(
                 config.device_type,
             ));

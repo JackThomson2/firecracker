@@ -14,6 +14,8 @@ use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDevice, Vir
 use crate::devices::virtio::queue::Queue;
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
 use crate::logger::error;
+use vm_memory::{Address, GuestAddress, GuestMemory};
+
 use crate::vstate::memory::GuestMemoryMmap;
 
 #[repr(C)]
@@ -328,6 +330,10 @@ impl VirtioDevice for DynamicVirtioDevice {
         VirtioDeviceType::Dynamic
     }
 
+    fn virtio_device_type_id(&self) -> u32 {
+        self.device_type_id
+    }
+
     fn id(&self) -> &str {
         &self.id
     }
@@ -422,8 +428,16 @@ impl VirtioDevice for DynamicVirtioDevice {
             };
         }
 
-        let guest_mem_base = std::ptr::null_mut();
-        let guest_mem_size = 0u64;
+        let (guest_mem_base, guest_mem_size) = if self.full_guest_memory {
+            // SAFETY: GuestAddress(0) is the start of guest RAM; get_host_address
+            // returns the corresponding host virtual address.
+            match mem.get_host_address(GuestAddress(0)) {
+                Ok(ptr) => (ptr, mem.last_addr().raw_value() + 1),
+                Err(_) => (std::ptr::null_mut(), 0u64),
+            }
+        } else {
+            (std::ptr::null_mut(), 0u64)
+        };
 
         let ctx = FcActivationContext {
             guest_mem_base,
