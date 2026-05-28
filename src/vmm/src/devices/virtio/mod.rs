@@ -28,6 +28,7 @@ pub mod test_utils;
 pub mod transport;
 pub mod vhost_user;
 pub mod vhost_user_metrics;
+pub mod dynamic;
 pub mod vsock;
 
 /// When the driver initializes the device, it lets the device know about the
