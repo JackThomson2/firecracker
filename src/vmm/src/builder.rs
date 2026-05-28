@@ -36,6 +36,7 @@ use crate::devices::virtio::mem::{VIRTIO_MEM_DEFAULT_SLOT_SIZE_MIB, VirtioMem};
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::pmem::device::Pmem;
 use crate::devices::virtio::rng::Entropy;
+use crate::devices::virtio::dynamic::DynamicVirtioDevice;
 use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
 #[cfg(feature = "gdb")]
 use crate::gdb;
@@ -269,6 +270,16 @@ pub fn build_microvm_for_boot(
             &vm,
             &mut boot_cmdline,
             entropy,
+            event_manager,
+        )?;
+    }
+
+    if !vm_resources.dynamic_devices.devices.is_empty() {
+        attach_dynamic_devices(
+            &mut device_manager,
+            &vm,
+            &mut boot_cmdline,
+            &vm_resources.dynamic_devices.devices,
             event_manager,
         )?;
     }
@@ -621,6 +632,32 @@ fn attach_entropy_device(
         event_manager,
         false,
     )
+}
+
+fn attach_dynamic_devices(
+    device_manager: &mut DeviceManager,
+    vm: &Vm,
+    cmdline: &mut LoaderKernelCmdline,
+    dynamic_devices: &[Arc<Mutex<DynamicVirtioDevice>>],
+    event_manager: &mut EventManager,
+) -> Result<(), AttachDeviceError> {
+    for device in dynamic_devices {
+        let id = device
+            .lock()
+            .expect("Poisoned lock")
+            .id()
+            .to_string();
+
+        device_manager.attach_virtio_device(
+            vm,
+            id,
+            device.clone(),
+            cmdline,
+            event_manager,
+            false,
+        )?;
+    }
+    Ok(())
 }
 
 fn allocate_virtio_mem_address(
