@@ -30,6 +30,7 @@ use crate::vmm_config::balloon::{
 };
 use crate::vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
 use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, DriveError};
+use crate::vmm_config::dynamic_device::{DynamicDeviceConfig, DynamicDeviceConfigError};
 use crate::vmm_config::entropy::{EntropyDeviceConfig, EntropyDeviceError};
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError, MachineConfigUpdate};
@@ -84,6 +85,9 @@ pub enum VmmAction {
     /// Add a new block device or update one that already exists using the `BlockDeviceConfig` as
     /// input. This action can only be called before the microVM has booted.
     InsertBlockDevice(BlockDeviceConfig),
+    /// Insert a dynamic device plugin. This action can only be called before the microVM has
+    /// booted.
+    InsertDynamicDevice(DynamicDeviceConfig),
     /// Add a virtio-pmem device.
     InsertPmemDevice(PmemConfig),
     /// Update an existing pmem device's rate limiter.
@@ -170,6 +174,8 @@ pub enum VmmActionError {
     ConfigureCpu(#[from] GuestConfigError),
     /// Drive config error: {0}
     DriveConfig(#[from] DriveError),
+    /// Dynamic device config error: {0}
+    DynamicDeviceConfig(#[from] DynamicDeviceConfigError),
     /// Entropy config error: {0}
     EntropyConfig(#[from] EntropyDeviceError),
     /// Pmem config error: {0}
@@ -472,6 +478,7 @@ impl<'a> PrebootApiController<'a> {
             GetVmInstanceInfo => Ok(VmmData::InstanceInformation(self.instance_info.clone())),
             GetVmmVersion => Ok(VmmData::VmmVersion(self.instance_info.vmm_version.clone())),
             InsertBlockDevice(config) => self.insert_block_device(config),
+            InsertDynamicDevice(config) => self.insert_dynamic_device(config),
             InsertPmemDevice(config) => self.insert_pmem_device(config),
             InsertNetworkDevice(config) => self.insert_net_device(config),
             LoadSnapshot(config) => self
@@ -535,6 +542,17 @@ impl<'a> PrebootApiController<'a> {
             .set_block_device(cfg)
             .map(|()| VmmData::Empty)
             .map_err(VmmActionError::DriveConfig)
+    }
+
+    fn insert_dynamic_device(
+        &mut self,
+        cfg: DynamicDeviceConfig,
+    ) -> Result<VmmData, VmmActionError> {
+        self.boot_path = true;
+        self.vm_resources
+            .build_dynamic_device(cfg)
+            .map(|()| VmmData::Empty)
+            .map_err(VmmActionError::DynamicDeviceConfig)
     }
 
     fn insert_net_device(
@@ -849,6 +867,7 @@ impl RuntimeApiController {
             | ConfigureLogger(_)
             | ConfigureMetrics(_)
             | ConfigureSerial(_)
+            | InsertDynamicDevice(_)
             | LoadSnapshot(_)
             | PutCpuConfiguration(_)
             | SetBalloonDevice(_)
