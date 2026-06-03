@@ -4,6 +4,8 @@
 
 """Generate Buildkite pipelines dynamically"""
 
+import os
+
 from common import BKPipeline, get_changed_files, run_all_tests
 
 # Buildkite default job priority is 0. Setting this to 1 prioritizes PRs over
@@ -13,6 +15,7 @@ DEFAULTS_PERF = {
     "priority": DEFAULT_PRIORITY + 1,
     "agents": {"ag": 1},
 }
+HOST_RESOURCE_MONITOR_LABEL = "m6i.metal-al2023-linux_6.1"
 
 changed_files = get_changed_files()
 DOC_ONLY_CHANGE = False
@@ -74,11 +77,21 @@ if run_all_tests(changed_files):
         depends_on_build=False,
     )
 
+    functional_cmd = pipeline.devtool_test(
+        pytest_opts="-n 16 --dist worksteal integration_tests/{{functional,security}}",
+    )
+    if (
+        os.environ.get("BUILDKITE_PIPELINE_SLUG") == "firecracker-pr-nightly"
+        and os.environ.get("BUILDKITE_PULL_REQUEST", "false") == "false"
+    ):
+        functional_cmd = [
+            f'if [ "{{instance}}-{{os}}-{{kv}}" = "{HOST_RESOURCE_MONITOR_LABEL}" ]; '
+            "then export FC_TEST_HOST_RESOURCE_MONITOR=1; fi; " + functional_cmd[0]
+        ]
+
     pipeline.build_group(
         "functional-and-security",
-        pipeline.devtool_test(
-            pytest_opts="-n 16 --dist worksteal integration_tests/{{functional,security}}",
-        ),
+        functional_cmd,
     )
 
     pipeline.build_group(

@@ -72,6 +72,12 @@ dev container automatically, so setting them on the host before invoking
   at the uVM chroot root. The cheap artifacts (`host-dmesg.log` and the guest
   serial console) are always collected. Default off. The nightly performance
   pipeline sets this.
+- `FC_TEST_HOST_RESOURCE_MONITOR=1` — collect timestamped host CPU, memory, and
+  I/O PSI samples plus Firecracker process counts and microVM lifecycle events
+  under `test_results/` (`host-resource-samples.jsonl` and
+  `host-vm-events*.jsonl`). Default off; used for targeted CI diagnostics.
+- `FC_TEST_HOST_RESOURCE_INTERVAL_S=<seconds>` — host resource monitor sampling
+  interval. Default: `1.0`.
 
 ### Output
 

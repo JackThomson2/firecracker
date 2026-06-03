@@ -35,6 +35,7 @@ import host_tools.network as net_tools
 from framework import utils
 from framework.defs import DEFAULT_BINARY_DIR, MAX_API_CALL_DURATION_MS
 from framework.guest import GuestDistro
+from framework.host_resource_monitor import log_vm_event
 from framework.http_api import Api
 from framework.jailer import JailerContext
 from framework.microvm_helpers import MicrovmHelpers
@@ -219,6 +220,7 @@ class Microvm:
         # Unique identifier for this machine.
         assert microvm_id is not None
         self._microvm_id = microvm_id
+        self.test_nodeid = None
 
         self.kernel_file = None
         self.rootfs_file = None
@@ -308,6 +310,7 @@ class Microvm:
         if self.firecracker_pid is not None:
             utils.wait_process_termination(self.firecracker_pid)
 
+        log_vm_event("marked_killed", self)
         self._killed = True
 
     def kill(self, might_be_dead=False):
@@ -316,6 +319,8 @@ class Microvm:
         # if it was already killed, return
         if self._killed:
             return
+
+        log_vm_event("kill_begin", self, might_be_dead=might_be_dead)
 
         # Stop any registered monitors
         for monitor in self.monitors:
@@ -403,6 +408,8 @@ class Microvm:
 
         if self.memory_monitor:
             self.memory_monitor.check_samples()
+
+        log_vm_event("killed", self, might_be_dead=might_be_dead)
 
     def _validate_api_response_times(self):
         """
@@ -740,6 +747,8 @@ class Microvm:
         if emit_metrics:
             self.monitors.append(FCMetricsMonitor(self))
 
+        log_vm_event("spawned", self)
+
         # Ensure Firecracker is in as good a state as possible wrts guest
         # responsiveness / API availability.
         # If we are using a config file and it has a network device specified,
@@ -890,6 +899,8 @@ class Microvm:
         if enable_entropy_device:
             self.enable_entropy_device()
 
+        log_vm_event("configured", self)
+
     def set_cpu_template(self, cpu_template):
         """Set guest CPU template."""
         self.cpu_template_name = get_cpu_template_name(cpu_template)
@@ -1027,16 +1038,20 @@ class Microvm:
         # Check that the VM has started
         assert self.state == "Running"
 
+        log_vm_event("started", self)
+
         if self.iface:
             self.wait_for_ssh_up()
 
     def pause(self):
         """Pauses the microVM"""
         self.api.vm.patch(state="Paused")
+        log_vm_event("paused", self)
 
     def resume(self):
         """Resume the microVM"""
         self.api.vm.patch(state="Resumed")
+        log_vm_event("resumed", self)
 
     def make_snapshot(
         self,
@@ -1167,13 +1182,19 @@ class Microvm:
             resume_vm=resume,
             **optional_kwargs,
         )
-
         if self.memory_monitor:
             response = self.api.machine_config.get()
             self.mem_size_bytes = int(response.json()["mem_size_mib"]) * 2**20
             # Notify monitor that this is a restored VM
             self.memory_monitor.set_threshold_for_restored_vm()
             self.memory_monitor.start()
+
+        log_vm_event(
+            "restored",
+            self,
+            resume=resume,
+            snapshot_type=jailed_snapshot.snapshot_type.name,
+        )
 
         # This is not a "wait for boot", but rather a "VM still works after restoration"
         if jailed_snapshot.net_ifaces and resume:
@@ -1279,6 +1300,7 @@ class MicroVMFactory:
         self.vms = []
         self.binary_path = binary_path
         self.netns_factory = kwargs.pop("netns_factory", net_tools.NetNs)
+        self.test_nodeid = kwargs.pop("test_nodeid", None)
         self.kwargs = kwargs
 
         assert self.fc_binary_path.exists(), "missing firecracker binary"
@@ -1307,6 +1329,7 @@ class MicroVMFactory:
             netns=kwargs.pop("netns", self.netns_factory(microvm_id)),
             **kwargs,
         )
+        vm.test_nodeid = self.test_nodeid
         vm.netns.setup()
         self.vms.append(vm)
         if kernel is not None:

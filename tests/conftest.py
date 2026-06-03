@@ -34,6 +34,7 @@ import host_tools.cargo_build as build_tools
 from framework import defs, utils
 from framework.artifacts import ALL_GUEST_KERNELS, disks
 from framework.defs import ARTIFACT_DIR, DEFAULT_BINARY_DIR
+from framework.host_resource_monitor import HostResourceMonitor
 from framework.microvm import HugePagesConfig, MicroVMFactory, SnapshotType
 from framework.properties import global_props
 from framework.utils_cpu_templates import get_cpu_template_name
@@ -62,6 +63,28 @@ if _libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
 
 METRICS = get_metrics_logger()
 PHASE_REPORT_KEY = pytest.StashKey[dict[str, pytest.CollectReport]]()
+_HOST_RESOURCE_MONITOR = None
+
+
+def pytest_sessionstart(session):
+    """Pytest hook to start optional session-wide host diagnostics."""
+    # Under xdist, start just one sampler in the controller process; workers
+    # log VM lifecycle events independently.
+    if hasattr(session.config, "workerinput"):
+        return
+
+    global _HOST_RESOURCE_MONITOR  # pylint: disable=global-statement
+    _HOST_RESOURCE_MONITOR = HostResourceMonitor.from_pytest_config(session.config)
+    _HOST_RESOURCE_MONITOR.start()
+
+
+def pytest_sessionfinish(session, exitstatus):  # pylint:disable=unused-argument
+    """Pytest hook to stop optional session-wide host diagnostics."""
+    if hasattr(session.config, "workerinput"):
+        return
+
+    if _HOST_RESOURCE_MONITOR is not None:
+        _HOST_RESOURCE_MONITOR.stop()
 
 
 def pytest_addoption(parser):
@@ -399,6 +422,7 @@ def microvm_factory(request, record_property, results_dir, netns_factory):
     uvm_factory = MicroVMFactory(
         binary_dir,
         netns_factory=netns_factory,
+        test_nodeid=request.node.nodeid,
         custom_cpu_template=custom_cpu_template,
     )
     yield uvm_factory
