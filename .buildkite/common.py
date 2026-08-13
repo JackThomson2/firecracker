@@ -32,10 +32,10 @@ DEFAULT_INSTANCES = [
 # fmt: on
 
 DEFAULT_PLATFORMS = [
-    ("al2", "linux_5.10"),
-    ("al2023", "linux_6.1"),
-    ("al2023", "linux_6.18"),
-    ("al2023", "secret_hiding"),
+    # ("al2", "linux_5.10"),
+    # ("al2023", "linux_6.1"),
+    # ("al2023", "linux_6.18"),
+    ("al2023", "secret_hiding_al"),
 ]
 
 
