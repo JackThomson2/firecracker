@@ -18,6 +18,18 @@ and this project adheres to
 
 ### Fixed
 
+- [#5744](https://github.com/firecracker-microvm/firecracker/issues/5744): Fixed
+  a random hang during guest boot (and potentially at any later point) on hosts
+  where the `brk()` syscall fails for the Firecracker process. musl's malloc
+  then reserves its metadata pages with `mmap(PROT_NONE)` and `mprotect()`,
+  which the vCPU and API thread seccomp filters rejected, so the first such
+  thread to allocate was killed with `SIGSYS`. The signal handler then hung on
+  the allocator lock held by the interrupted thread instead of exiting. Both
+  filters now allow these calls (still without `PROT_EXEC`), and the fatal
+  signal handlers no longer allocate, so a bad syscall always results in a
+  `Shutting down VM after intercepting a bad syscall` log line and exit code 148
+  rather than a silent hang.
+
 ## [1.17.0]
 
 ### Added
