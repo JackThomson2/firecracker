@@ -846,6 +846,19 @@
                 "comment": "Used for freeing memory"
             },
             {
+                "syscall": "mprotect",
+                "comment": "Used by musl's malloc to unprotect metadata pages it reserved with mmap(PROT_NONE) once brk() has failed",
+                "args": [
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
+                    }
+                ]
+            },
+            {
                 "syscall": "recvfrom",
                 "comment": "Used to retrieve data from the socket"
             },
@@ -1148,6 +1161,19 @@
                 "comment": "Used for freeing memory"
             },
             {
+                "syscall": "mprotect",
+                "comment": "Used by musl's malloc to unprotect metadata pages it reserved with mmap(PROT_NONE) once brk() has failed",
+                "args": [
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
+                    }
+                ]
+            },
+            {
                 "syscall": "rt_sigprocmask",
                 "comment": "rt_sigprocmask is used by Rust stdlib to remove custom signal handler during thread teardown."
             },
@@ -1259,7 +1285,7 @@
             },
             {
                 "syscall": "mmap",
-                "comment": "Used for allocating memory for FamStructWrapper called by KvmCpu::get_cpuid",
+                "comment": "Used by musl's malloc for allocation groups (e.g. the FamStructWrapper in KvmCpu::get_cpuid) and, once brk() has failed, for PROT_NONE metadata reservations",
                 "args": [
                     {
                         "index": 3,
@@ -1271,9 +1297,9 @@
                     {
                         "index": 2,
                         "type": "dword",
-                        "op": "eq",
-                        "val": 3,
-                        "comment": "libc::PROT_READ|libc::PROT_WRITE"
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
                     }
                 ]
             },
