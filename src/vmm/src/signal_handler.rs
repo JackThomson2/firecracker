@@ -158,7 +158,11 @@ fn write_all_raw(fd: c_int, mut bytes: &[u8]) {
 /// allocator's own `mmap`, `mprotect` or `brk` leaves that thread holding musl's malloc lock, so
 /// going through the regular logger (or anything else that allocates) would deadlock the process
 /// instead of letting it exit.
-fn emergency_log(file: &str, line: u32, args: fmt::Arguments<'_>) {
+///
+/// `file` and `line` are reported as the log origin when the logger is configured to show it.
+/// This is public so that the crate's `signal_safety` integration test can assert, with a
+/// counting global allocator, that the path really does not allocate.
+pub fn emergency_log(file: &str, line: u32, args: fmt::Arguments<'_>) {
     // `try_read` never blocks. The write lock is only taken by a pre-boot logger update; fall
     // back to the default target while it is held.
     let config = LOGGER.0.try_read().ok();
@@ -175,7 +179,8 @@ fn emergency_log(file: &str, line: u32, args: fmt::Arguments<'_>) {
     };
 
     // The handle of the current thread is created when the thread is spawned (and during runtime
-    // initialization for the main thread), so this only bumps a refcount.
+    // initialization for the main thread), so this only bumps a refcount; see also the pre-warm in
+    // `register_signal_handlers`.
     let thread = std::thread::current();
     let mut out = StackLine::new();
     format_emergency_line(
@@ -343,6 +348,12 @@ extern "C" fn sigpipe_handler(num: c_int, info: *mut siginfo_t, _unused: *mut c_
 /// Custom handlers are installed for: `SIGBUS`, `SIGSEGV`, `SIGSYS`
 /// `SIGXFSZ` `SIGXCPU` `SIGPIPE` `SIGHUP` and `SIGILL`.
 pub fn register_signal_handlers() -> vmm_sys_util::errno::Result<()> {
+    // The handlers read the thread name through `std::thread::current()`. For threads created by
+    // `std::thread::spawn` the handle is set before the thread runs any user code, but on the main
+    // thread the standard library is free to create it lazily on the first call, and that would be
+    // an allocation. Make this the first call, so no handler can be.
+    let _ = std::thread::current();
+
     // Call to unsafe register_signal_handler which is considered unsafe because it will
     // register a signal handler which will be called in the current thread and will interrupt
     // whatever work is done on the current thread, so we have to keep in mind that the registered
