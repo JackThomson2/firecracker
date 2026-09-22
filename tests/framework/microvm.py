@@ -18,6 +18,7 @@ import select
 import shutil
 import signal
 import socket
+import subprocess
 import time
 import uuid
 from collections import namedtuple
@@ -1167,7 +1168,10 @@ class Microvm:
             host=guest_ip,
             control_path=Path(self.chroot()) / f"ssh-{iface_idx}.sock",
             on_error=lambda exc: self._dump_debug_information(
-                f"Failure executing command via SSH in microVM: {exc}"
+                f"Failure executing command via SSH in microVM: {exc}",
+                # A timeout means the guest stopped answering; a non-zero exit
+                # means it answered with a failure and needs no extra state.
+                guest_unresponsive=isinstance(exc, subprocess.TimeoutExpired),
             ),
         )
         self._connections.append(connection)
@@ -1192,11 +1196,15 @@ class Microvm:
                 backtraces.append(f"{thread_name} ({pid=}):\n{stack}")
         return "\n".join(backtraces)
 
-    def _dump_debug_information(self, what: str):
+    def _dump_debug_information(self, what: str, *, guest_unresponsive: bool = False):
         """
         Dumps debug information about this microvm
 
         Used for example when running a command inside the guest via `SSHConnection.check_output` fails.
+
+        Set `guest_unresponsive` when the guest stopped answering (an SSH command
+        timed out rather than exiting non-zero) to also dump the state needed to
+        tell a stalled guest from a lost host-side network notification.
         """
         LOG.error(what)
         LOG.error("Firecracker logs:\n%s", self.log_data)
@@ -1204,6 +1212,61 @@ class Microvm:
             LOG.error("Uffd logs:\n%s", self.uffd_handler.log_data)
         if not self._killed:
             LOG.error("Thread backtraces:\n%s", self.thread_backtraces)
+        if guest_unresponsive:
+            self._dump_guest_unresponsive_information()
+
+    # Enough of the guest console to cover a panic, an RCU stall report or an
+    # OOM report, without repeating the whole boot log on every failure.
+    SERIAL_TAIL_LINES = 120
+
+    def _dump_guest_unresponsive_information(self):
+        """Dump the guest console tail, host tap counters and virtio-net metrics.
+
+        The Firecracker log and thread backtraces show whether the VMM is busy;
+        they say nothing about whether the guest is alive, or whether frames are
+        still crossing the tap. This fills that gap. Every step is best-effort:
+        this runs inside an error path and must not mask the original failure.
+        """
+        if self.serial_out_path is not None:
+            try:
+                lines = self.serial_out_path.read_text(errors="replace").splitlines()
+            except OSError as exc:
+                LOG.error("Guest serial console unavailable: %s", exc)
+            else:
+                LOG.error(
+                    "Guest serial console (last %d of %d lines):\n%s",
+                    min(self.SERIAL_TAIL_LINES, len(lines)),
+                    len(lines),
+                    "\n".join(lines[-self.SERIAL_TAIL_LINES :]),
+                )
+
+        for dev_name, dev in self.iface.items():
+            tap_name = dev["tap"].name
+            # `-s -s` adds the detailed error counters (fifo, missed, carrier...).
+            res = utils.run_cmd(
+                f"{self.netns.cmd_prefix()} ip -s -s link show dev {tap_name}"
+            )
+            LOG.error(
+                "Host tap %s (guest %s):\n%s%s",
+                tap_name,
+                dev_name,
+                res.stdout,
+                res.stderr,
+            )
+
+        if self._killed or self.metrics_file is None:
+            return
+        try:
+            metrics = self.flush_metrics()
+        except Exception as exc:  # pylint: disable=broad-except
+            LOG.error("Could not flush Firecracker metrics: %s", exc)
+            return
+        net_metrics = {
+            key: value
+            for key, value in metrics.items()
+            if key == "net" or key.startswith("net_")
+        }
+        LOG.error("Firecracker net metrics:\n%s", json.dumps(net_metrics, indent=2))
 
     def wait_for_ssh_up(self):
         """Wait for guest running inside the microVM to come up and respond."""
