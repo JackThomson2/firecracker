@@ -25,22 +25,34 @@ combination that keeps hanging names the culprit.
 
 Options:
   --artifacts S3_URI   guest kernel/rootfs set to test with (default: newest)
-  --count N            pytest-repeat iterations per job (default 25)
+  --fips-count N       pytest-repeat iterations of the FIPS test per job (default 25)
+  --memhp-count N      pytest-repeat iterations of the hotplug test per job (default 25)
   --parallelism N      Buildkite jobs per host/kernel combination (default 4)
+
+The FIPS test restores one VM in about a second; each hotplug iteration runs
+a dozen parametrisations at ~6 s each, so the counts are set independently.
 """
 
 from common import BKPipeline
 
 BKPipeline.parser.add_argument(
-    "--count",
-    help="pytest-repeat iterations of each test per job",
+    "--fips-count",
+    help="pytest-repeat iterations of the FIPS restore test per job",
+    type=int,
+    default=25,
+)
+BKPipeline.parser.add_argument(
+    "--memhp-count",
+    help="pytest-repeat iterations of the hotplug test per job",
     type=int,
     default=25,
 )
 BKPipeline.parser.set_defaults(parallelism=4)
 
-pipeline = BKPipeline(timeout_in_minutes=120)
-count = pipeline.args.count
+# 100 hotplug iterations take a little over two hours on m6g.metal.
+pipeline = BKPipeline(timeout_in_minutes=240)
+fips_count = pipeline.args.fips_count
+memhp_count = pipeline.args.memhp_count
 
 # Legs mirror the two failing nightly jobs: the functional job runs with
 # xdist (-n 16) and no perf tweaks; the performance job pins CPUs/memory.
@@ -51,7 +63,7 @@ LEGS = [
         "platforms": [("al2023", "linux_6.1")],
         "devtool_opts": None,
         "pytest_opts": (
-            f"-n 16 --dist worksteal --count {count} "
+            f"-n 16 --dist worksteal --count {fips_count} "
             "integration_tests/security/test_fips.py::test_fips_rng_reseed_on_snapshot_restore"
         ),
         "extra": {},
@@ -62,7 +74,7 @@ LEGS = [
         "platforms": [("al2", "linux_5.10")],
         "devtool_opts": "--performance -c 1-10 -m 0",
         "pytest_opts": (
-            f"--count {count} -k resumed "
+            f"--count {memhp_count} -k resumed "
             "../tests/integration_tests/performance/test_hotplug_memory.py::test_virtio_mem_hotplug_hotunplug"
         ),
         "extra": {"agents": {"ag": 1}},
