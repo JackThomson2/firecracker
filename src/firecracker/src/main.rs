@@ -35,7 +35,7 @@ use vmm::logger::{
 };
 use vmm::persist::SNAPSHOT_VERSION;
 use vmm::resources::VmResources;
-use vmm::seccomp::BpfThreadMap;
+use vmm::seccomp::{BpfThreadMap, SeccompFeatures, UnknownSeccompFeature};
 use vmm::signal_handler::register_signal_handlers;
 use vmm::snapshot::{SnapshotError, get_format_version};
 use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
@@ -74,6 +74,8 @@ enum MainError {
     MetricsInitialization(MetricsConfigError),
     /// Seccomp error: {0}
     SeccompFilter(FilterError),
+    /// Invalid value for seccomp-features: {0}
+    SeccompFeatures(SeccompFeaturesArgError),
     /// Failed to resize fd table: {0}
     ResizeFdtable(ResizeFdTableError),
     /// RunWithApiError error: {0}
@@ -92,11 +94,24 @@ enum ResizeFdTableError {
     Close(io::Error),
 }
 
+/// Errors parsing the value of `--seccomp-features`.
+#[derive(Debug, PartialEq, Eq, thiserror::Error, displaydoc::Display)]
+enum SeccompFeaturesArgError {
+    /// {0}. Expected `all` or a comma-separated list of feature names
+    UnknownFeature(UnknownSeccompFeature),
+    /// Empty feature name. Expected `all` or a comma-separated list of feature names
+    EmptyName,
+    /// `all` cannot be combined with other feature names
+    AllCombined,
+}
+
 impl From<MainError> for FcExitCode {
     fn from(value: MainError) -> Self {
         match value {
             MainError::ParseArguments(_) => FcExitCode::ArgParsing,
-            MainError::InvalidLogLevel(_) => FcExitCode::BadConfiguration,
+            MainError::InvalidLogLevel(_) | MainError::SeccompFeatures(_) => {
+                FcExitCode::BadConfiguration
+            }
             MainError::RunWithApi(ApiServerError::MicroVMStoppedWithError(code)) => code,
             MainError::RunWithoutApiError(RunWithoutApiError::Shutdown(code)) => code,
             _ => FcExitCode::GenericError,
@@ -154,131 +169,144 @@ fn main_exec() -> Result<(), MainError> {
 
     let http_max_payload_size_str = HTTP_MAX_PAYLOAD_SIZE.to_string();
 
-    let mut arg_parser =
-        ArgParser::new()
-            .arg(
-                Argument::new("api-sock")
-                    .takes_value(true)
-                    .default_value(DEFAULT_API_SOCK_PATH)
-                    .help("Path to unix domain socket used by the API."),
-            )
-            .arg(
-                Argument::new("id")
-                    .takes_value(true)
-                    .default_value(vmm::logger::DEFAULT_INSTANCE_ID)
-                    .help("MicroVM unique identifier."),
-            )
-            .arg(
-                Argument::new("seccomp-filter")
-                    .takes_value(true)
-                    .forbids(vec!["no-seccomp"])
-                    .help(
-                        "Optional parameter which allows specifying the path to a custom seccomp \
+    let mut arg_parser = ArgParser::new()
+        .arg(
+            Argument::new("api-sock")
+                .takes_value(true)
+                .default_value(DEFAULT_API_SOCK_PATH)
+                .help("Path to unix domain socket used by the API."),
+        )
+        .arg(
+            Argument::new("id")
+                .takes_value(true)
+                .default_value(vmm::logger::DEFAULT_INSTANCE_ID)
+                .help("MicroVM unique identifier."),
+        )
+        .arg(
+            Argument::new("seccomp-filter")
+                .takes_value(true)
+                .forbids(vec!["no-seccomp"])
+                .help(
+                    "Optional parameter which allows specifying the path to a custom seccomp \
                          filter. For advanced users.",
-                    ),
-            )
-            .arg(
-                Argument::new("no-seccomp")
-                    .takes_value(false)
-                    .forbids(vec!["seccomp-filter"])
-                    .help(
-                        "Optional parameter which allows starting and using a microVM without \
+                ),
+        )
+        .arg(
+            Argument::new("no-seccomp")
+                .takes_value(false)
+                .forbids(vec!["seccomp-filter", "seccomp-features"])
+                .help(
+                    "Optional parameter which allows starting and using a microVM without \
                          seccomp filtering. Not recommended.",
-                    ),
-            )
-            .arg(
-                Argument::new("start-time-us").takes_value(true).help(
-                    "Process start time (wall clock, microseconds). This parameter is optional.",
                 ),
-            )
-            .arg(Argument::new("start-time-cpu-us").takes_value(true).help(
+        )
+        .arg(
+            Argument::new("seccomp-features")
+                .takes_value(true)
+                .forbids(vec!["no-seccomp"])
+                .help(
+                    "Optional parameter which enables the seccomp rules of additional features, \
+                         on top of the ones the microVM configuration needs. Takes `all` or a \
+                         comma-separated list of feature names. For advanced users.",
+                ),
+        )
+        .arg(
+            Argument::new("start-time-us")
+                .takes_value(true)
+                .help("Process start time (wall clock, microseconds). This parameter is optional."),
+        )
+        .arg(
+            Argument::new("start-time-cpu-us").takes_value(true).help(
                 "Process start CPU time (wall clock, microseconds). This parameter is optional.",
-            ))
-            .arg(Argument::new("parent-cpu-time-us").takes_value(true).help(
-                "Parent process CPU time (wall clock, microseconds). This parameter is optional.",
-            ))
-            .arg(
-                Argument::new("config-file")
-                    .takes_value(true)
-                    .help("Path to a file that contains the microVM configuration in JSON format."),
-            )
-            .arg(
-                Argument::new(MMDS_CONTENT_ARG).takes_value(true).help(
-                    "Path to a file that contains metadata in JSON format to add to the mmds.",
-                ),
-            )
-            .arg(
-                Argument::new("no-api")
-                    .takes_value(false)
-                    .requires("config-file")
-                    .help(
-                        "Optional parameter which allows starting and using a microVM without an \
+            ),
+        )
+        .arg(Argument::new("parent-cpu-time-us").takes_value(true).help(
+            "Parent process CPU time (wall clock, microseconds). This parameter is optional.",
+        ))
+        .arg(
+            Argument::new("config-file")
+                .takes_value(true)
+                .help("Path to a file that contains the microVM configuration in JSON format."),
+        )
+        .arg(
+            Argument::new(MMDS_CONTENT_ARG)
+                .takes_value(true)
+                .help("Path to a file that contains metadata in JSON format to add to the mmds."),
+        )
+        .arg(
+            Argument::new("no-api")
+                .takes_value(false)
+                .requires("config-file")
+                .help(
+                    "Optional parameter which allows starting and using a microVM without an \
                          active API socket.",
-                    ),
-            )
-            .arg(
-                Argument::new("log-path")
-                    .takes_value(true)
-                    .help("Path to a fifo or a file used for configuring the logger on startup."),
-            )
-            .arg(
-                Argument::new("level")
-                    .takes_value(true)
-                    .help("Set the logger level."),
-            )
-            .arg(
-                Argument::new("module")
-                    .takes_value(true)
-                    .help("Set the logger module filter."),
-            )
-            .arg(
-                Argument::new("show-level")
-                    .takes_value(false)
-                    .help("Whether or not to output the level in the logs."),
-            )
-            .arg(Argument::new("show-log-origin").takes_value(false).help(
+                ),
+        )
+        .arg(
+            Argument::new("log-path")
+                .takes_value(true)
+                .help("Path to a fifo or a file used for configuring the logger on startup."),
+        )
+        .arg(
+            Argument::new("level")
+                .takes_value(true)
+                .help("Set the logger level."),
+        )
+        .arg(
+            Argument::new("module")
+                .takes_value(true)
+                .help("Set the logger module filter."),
+        )
+        .arg(
+            Argument::new("show-level")
+                .takes_value(false)
+                .help("Whether or not to output the level in the logs."),
+        )
+        .arg(
+            Argument::new("show-log-origin").takes_value(false).help(
                 "Whether or not to include the file path and line number of the log's origin.",
-            ))
-            .arg(
-                Argument::new("metrics-path")
-                    .takes_value(true)
-                    .help("Path to a fifo or a file used for configuring the metrics on startup."),
-            )
-            .arg(Argument::new("boot-timer").takes_value(false).help(
-                "Whether or not to load boot timer device for logging elapsed time since \
+            ),
+        )
+        .arg(
+            Argument::new("metrics-path")
+                .takes_value(true)
+                .help("Path to a fifo or a file used for configuring the metrics on startup."),
+        )
+        .arg(Argument::new("boot-timer").takes_value(false).help(
+            "Whether or not to load boot timer device for logging elapsed time since \
                  InstanceStart command.",
-            ))
-            .arg(
-                Argument::new("version")
-                    .takes_value(false)
-                    .help("Print the binary version number."),
-            )
-            .arg(
-                Argument::new("snapshot-version")
-                    .takes_value(false)
-                    .help("Print the supported data format version."),
-            )
-            .arg(
-                Argument::new("describe-snapshot")
-                    .takes_value(true)
-                    .help("Print the data format version of the provided snapshot state file."),
-            )
-            .arg(
-                Argument::new("http-api-max-payload-size")
-                    .takes_value(true)
-                    .default_value(&http_max_payload_size_str)
-                    .help("Http API request payload max size, in bytes."),
-            )
-            .arg(
-                Argument::new("mmds-size-limit")
-                    .takes_value(true)
-                    .help("Mmds data store limit, in bytes."),
-            )
-            .arg(
-                Argument::new("enable-pci")
-                    .takes_value(false)
-                    .help("Enables PCIe support."),
-            );
+        ))
+        .arg(
+            Argument::new("version")
+                .takes_value(false)
+                .help("Print the binary version number."),
+        )
+        .arg(
+            Argument::new("snapshot-version")
+                .takes_value(false)
+                .help("Print the supported data format version."),
+        )
+        .arg(
+            Argument::new("describe-snapshot")
+                .takes_value(true)
+                .help("Print the data format version of the provided snapshot state file."),
+        )
+        .arg(
+            Argument::new("http-api-max-payload-size")
+                .takes_value(true)
+                .default_value(&http_max_payload_size_str)
+                .help("Http API request payload max size, in bytes."),
+        )
+        .arg(
+            Argument::new("mmds-size-limit")
+                .takes_value(true)
+                .help("Mmds data store limit, in bytes."),
+        )
+        .arg(
+            Argument::new("enable-pci")
+                .takes_value(false)
+                .help("Enables PCIe support."),
+        );
 
     arg_parser.parse_from_cmdline()?;
     let arguments = arg_parser.arguments();
@@ -397,6 +425,12 @@ fn main_exec() -> Result<(), MainError> {
     let boot_timer_enabled = arguments.flag_present("boot-timer");
     let pci_enabled = arguments.flag_present("enable-pci");
     let api_enabled = !arguments.flag_present("no-api");
+    let seccomp_features = arguments
+        .single_value("seccomp-features")
+        .map(|list| parse_seccomp_features(list))
+        .transpose()
+        .map_err(MainError::SeccompFeatures)?
+        .unwrap_or_default();
     let api_payload_limit = arg_parser
         .arguments()
         .single_value("http-api-max-payload-size")
@@ -450,6 +484,7 @@ fn main_exec() -> Result<(), MainError> {
             process_time_reporter,
             boot_timer_enabled,
             pci_enabled,
+            seccomp_features,
             api_payload_limit,
             mmds_size_limit,
             metadata_json.as_deref(),
@@ -466,11 +501,28 @@ fn main_exec() -> Result<(), MainError> {
             instance_info,
             boot_timer_enabled,
             pci_enabled,
+            seccomp_features,
             mmds_size_limit,
             metadata_json.as_deref(),
         )
         .map_err(MainError::RunWithoutApiError)
     }
+}
+
+/// Parse the value of `--seccomp-features`: `all` or a comma-separated list of feature names.
+fn parse_seccomp_features(list: &str) -> Result<SeccompFeatures, SeccompFeaturesArgError> {
+    if list.trim() == "all" {
+        return Ok(SeccompFeatures::all());
+    }
+    list.split(',')
+        .map(|name| match name.trim() {
+            "" => Err(SeccompFeaturesArgError::EmptyName),
+            "all" => Err(SeccompFeaturesArgError::AllCombined),
+            name => name
+                .parse()
+                .map_err(SeccompFeaturesArgError::UnknownFeature),
+        })
+        .collect()
 }
 
 /// Attempts to resize the processes file descriptor table to match RLIMIT_NOFILE or 2048 if no
@@ -592,6 +644,7 @@ fn build_microvm_from_json(
     boot_timer_enabled: bool,
     pci_enabled: bool,
     api_enabled: bool,
+    seccomp_features: SeccompFeatures,
     mmds_size_limit: usize,
     metadata_json: Option<&str>,
 ) -> Result<Arc<Mutex<vmm::Vmm>>, BuildFromJsonError> {
@@ -605,6 +658,7 @@ fn build_microvm_from_json(
     .map_err(BuildFromJsonError::ParseFromJson)?;
     vm_resources.boot_timer = boot_timer_enabled;
     vm_resources.api_enabled = api_enabled;
+    vm_resources.seccomp_features = seccomp_features;
     let vmm = vmm::builder::build_and_boot_microvm(
         &instance_info,
         &vm_resources,
@@ -630,12 +684,14 @@ enum RunWithoutApiError {
     SeccompFilter(vmm::seccomp::InstallationError),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_without_api(
     seccomp_filters: &BpfThreadMap,
     config_json: Option<String>,
     instance_info: InstanceInfo,
     bool_timer_enabled: bool,
     pci_enabled: bool,
+    seccomp_features: SeccompFeatures,
     mmds_size_limit: usize,
     metadata_json: Option<&str>,
 ) -> Result<(), RunWithoutApiError> {
@@ -655,6 +711,7 @@ fn run_without_api(
         bool_timer_enabled,
         pci_enabled,
         false,
+        seccomp_features,
         mmds_size_limit,
         metadata_json,
     )
@@ -687,4 +744,47 @@ fn run_without_api(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use vmm::seccomp::SeccompFeature;
+
+    use super::*;
+
+    #[test]
+    fn test_parse_seccomp_features() {
+        assert_eq!(
+            parse_seccomp_features("all").unwrap(),
+            SeccompFeatures::all()
+        );
+        assert_eq!(
+            parse_seccomp_features("net").unwrap(),
+            SeccompFeature::Net.into()
+        );
+        assert_eq!(
+            parse_seccomp_features("net, block,hotplug").unwrap(),
+            SeccompFeatures::from(SeccompFeature::Net)
+                | SeccompFeature::Block
+                | SeccompFeature::Hotplug
+        );
+        assert_eq!(
+            parse_seccomp_features("net,all").unwrap_err(),
+            SeccompFeaturesArgError::AllCombined
+        );
+        assert_eq!(
+            parse_seccomp_features("").unwrap_err(),
+            SeccompFeaturesArgError::EmptyName
+        );
+        assert_eq!(
+            parse_seccomp_features("net,,block").unwrap_err(),
+            SeccompFeaturesArgError::EmptyName
+        );
+        assert_eq!(
+            parse_seccomp_features("net,warp-drive").unwrap_err(),
+            SeccompFeaturesArgError::UnknownFeature(UnknownSeccompFeature(
+                "warp-drive".to_string()
+            ))
+        );
+    }
 }
