@@ -36,6 +36,51 @@ For a certain release, the default JSON filters used to build Firecracker are
 also included in the respective release archive, viewable on the
 [releases page](https://github.com/firecracker-microvm/firecracker/releases).
 
+### Feature-tagged rules
+
+Not every rule in the default filters is needed by every microVM: the ioctls a
+virtio-net device issues are useless, and therefore an unnecessary attack
+surface, for a microVM without network interfaces. Rules in the JSON files can
+therefore be tagged with the microVM *feature* they are needed for, for example
+`"feature": "net"`. seccompiler compiles tagged rules into separate BPF
+fragments, and Firecracker only installs the fragments of the features the
+microVM in front of it actually uses. The decision is taken once per thread,
+right before the filter is installed, when the device configuration is known
+(the vmm and vcpu filters are installed after the microVM is built, see above).
+The features are:
+
+| Feature          | Enabled when                                                                                                                                             |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `api`            | the API is enabled (pausing and snapshotting a microVM is only possible through the API), or a gdb socket is configured in builds with the `gdb` feature |
+| `pci`            | `--enable-pci` is used (or the restored snapshot uses the PCI transport)                                                                                 |
+| `hotplug`        | the API is enabled and the PCI transport is used, i.e. devices can be hot-plugged                                                                        |
+| `block`          | a virtio-block device is configured                                                                                                                      |
+| `async-io`       | a virtio-block device uses the `Async` io engine                                                                                                         |
+| `net`            | a virtio-net device is configured                                                                                                                        |
+| `vsock`          | a vsock device is configured                                                                                                                             |
+| `pmem`           | a virtio-pmem device is configured                                                                                                                       |
+| `memory-hotplug` | virtio-mem memory hotplug is configured                                                                                                                  |
+
+Untagged rules are always installed. The set of features a microVM gets is
+logged at `INFO` level when the microVM is built, e.g.
+`Seccomp features required by the microVM: [api,block,net]`.
+
+> [!NOTE]
+>
+> When devices can be hot-plugged (`--enable-pci` together with the API), the
+> device set is not final when the filters are installed, so the rules of every
+> hot-pluggable device type (`block`, `async-io`, `net`, `pmem`) are kept along
+> with `hotplug`. Without PCI or with `--no-api`, no device can be added after
+> boot and only the configured device types are allowed.
+
+The optional `--seccomp-features` parameter enables additional features on top
+of the derived ones, for every thread. It takes `all` or a comma-separated list
+of feature names, e.g. `--seccomp-features net,block`. Use it when a custom
+filter tags rules in a way the derivation does not cover, or to rule out the
+feature derivation while investigating a seccomp violation (which Firecracker
+reports as `Shutting down VM after intercepting a bad syscall`, together with
+the `seccomp.num_faults` metric).
+
 ## Custom filters (advanced users only)
 
 > [!NOTE]
@@ -57,7 +102,10 @@ with fully customisable alternatives, leveraging the same JSON/seccompiler
 tooling, at startup time.
 
 Via Firecracker's optional `--seccomp-filter` parameter, one can supply the path
-to a custom filter file compiled with seccompiler-bin.
+to a custom filter file compiled with seccompiler-bin. Rules tagged with
+features in a custom filter are composed exactly like the default ones, so a tag
+must be one of the feature names listed above; Firecracker refuses to start with
+a filter tagged with a name it does not know.
 
 Potential use cases:
 

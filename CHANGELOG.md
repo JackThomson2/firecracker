@@ -13,6 +13,16 @@ and this project adheres to
 - [#6237](https://github.com/firecracker-microvm/firecracker/pull/6237): Added
   balloon and virtio-mem memory reclamation for shared memfd-backed guest
   memory, such as memory shared with vhost-user devices.
+- [#TBD](https://github.com/firecracker-microvm/firecracker/pull/TBD): Seccomp
+  rules can be tagged with the microVM feature they are needed for (`api`,
+  `pci`, `hotplug`, `block`, `async-io`, `net`, `vsock`, `pmem`,
+  `memory-hotplug`). Firecracker now installs only the rules of the features a
+  microVM uses, derived from its configuration when the filters are installed;
+  when devices can be hot-plugged (PCI transport with the API), the rules of all
+  hot-pluggable device types are kept. The ioctl rules of the default filters
+  are tagged. The new optional `--seccomp-features` parameter enables the rules
+  of additional features (`all` or a comma-separated list) on top of the derived
+  ones. See [docs/seccomp.md](docs/seccomp.md#feature-tagged-rules).
 
 ### Changed
 
@@ -35,6 +45,11 @@ and this project adheres to
   partial huge pages either failed or kept their old contents. Because zeroing
   allocates huge pages that were not backed yet, use free page reporting or
   hinting instead of the traditional balloon with hugetlbfs.
+- [#TBD](https://github.com/firecracker-microvm/firecracker/pull/TBD): The
+  format of the binary filters produced by `seccompiler-bin` and consumed by
+  `--seccomp-filter` changed to carry the feature-tagged rules separately.
+  Custom filters must be recompiled with the `seccompiler-bin` of this release;
+  a tag with a feature name Firecracker does not know is rejected at startup.
 
 ### Deprecated
 
