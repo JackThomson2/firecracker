@@ -18,10 +18,11 @@ filters to limit the system calls allowed by the host OS to the required
 minimum.
 
 By default, Firecracker uses the most restrictive filters, which is the
-recommended option for production usage.
+recommended option for production usage. Only the rules of the
+[features](seccomp.md#feature-tagged-rules) a microVM uses are installed.
 
-Production usage of the `--seccomp-filter` or `--no-seccomp` parameters is not
-recommended.
+Production usage of the `--seccomp-filter`, `--seccomp-features` or
+`--no-seccomp` parameters is not recommended.
 
 ### 8250 Serial Device
 
@@ -461,6 +462,6 @@ sudo modprobe $KVM_VENDOR_MOD
 To validate that the change took effect, the file
 `/sys/module/kvm/parameters/nx_huge_pages` should say `never`.
 
-[^1]: Look for `GRUB_CMDLINE_LINUX` in file `/etc/default/grub` in RPM-based
-    systems, and
-    [this doc for Ubuntu](https://wiki.ubuntu.com/Kernel/KernelBootParameters).
+\[^1\]: Look for `GRUB_CMDLINE_LINUX` in file `/etc/default/grub` in RPM-based
+systems, and
+[this doc for Ubuntu](https://wiki.ubuntu.com/Kernel/KernelBootParameters).
