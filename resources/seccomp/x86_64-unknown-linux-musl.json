@@ -535,6 +535,7 @@
             {
                 "syscall": "ioctl",
                 "comment": "Used to make vsock UDS nonblocking",
+                "feature": "vsock",
                 "args": [
                     {
                         "index": 1,
@@ -587,6 +588,7 @@
             {
                 "syscall": "ioctl",
                 "comment": "Used by the VirtIO block device to pass discard through to block-device backing files",
+                "feature": "block",
                 "args": [
                     {
                         "index": 1,
@@ -599,6 +601,7 @@
             },
             {
                 "syscall": "ioctl",
+                "feature": "api",
                 "args": [
                     {
                         "index": 1,
@@ -611,6 +614,7 @@
             },
             {
                 "syscall": "ioctl",
+                "feature": "api",
                 "args": [
                     {
                         "index": 1,
@@ -623,6 +627,7 @@
             },
             {
                 "syscall": "ioctl",
+                "feature": "api",
                 "args": [
                     {
                         "index": 1,
@@ -635,6 +640,7 @@
             },
             {
                 "syscall": "ioctl",
+                "feature": "api",
                 "args": [
                     {
                         "index": 1,
@@ -647,19 +653,21 @@
             },
             {
                 "syscall": "ioctl",
+                "features": ["memory-hotplug", "pmem"],
                 "args": [
                     {
                         "index": 1,
                         "type": "dword",
                         "op": "eq",
                         "val": 1075883590,
-                        "comment": "KVM_SET_USER_MEMORY_REGION, used to (un)plug memory for the virtio-mem device"
+                        "comment": "KVM_SET_USER_MEMORY_REGION, used to (un)plug memory for the virtio-mem device and to map and unmap virtio-pmem devices"
                     }
                 ]
             },
             {
                 "syscall": "ioctl",
                 "comment": "Needed for registering ioeventfds during device hotplug",
+                "feature": "hotplug",
                 "args": [
                     {
                         "index": 1,
@@ -673,6 +681,7 @@
             {
                 "syscall": "ioctl",
                 "comment": "Needed for unregistering irqfds during device hot-unplug and VM teardown (called from MsixVectorGroup::drop)",
+                "feature": "pci",
                 "args": [
                     {
                         "index": 1,
@@ -686,6 +695,7 @@
             {
                 "syscall": "ioctl",
                 "comment": "Needed for opening tap device during net hotplug",
+                "feature": "hotplug",
                 "args": [
                     {
                         "index": 1,
@@ -699,6 +709,7 @@
             {
                 "syscall": "ioctl",
                 "comment": "Needed for configuring tap offload during net hotplug",
+                "feature": "hotplug",
                 "args": [
                     {
                         "index": 1,
@@ -712,6 +723,7 @@
             {
                 "syscall": "ioctl",
                 "comment": "Needed for setting tap vnet header size during net hotplug",
+                "feature": "hotplug",
                 "args": [
                     {
                         "index": 1,
@@ -725,6 +737,7 @@
             {
                 "syscall": "ioctl",
                 "comment": "Needed for querying the logical sector size when opening a virtio-block backing file",
+                "feature": "hotplug",
                 "args": [
                     {
                         "index": 1,
@@ -738,6 +751,7 @@
             {
                 "syscall": "ioctl",
                 "comment": "Needed for querying the physical block size of a block-device backing file during virtio-block init",
+                "feature": "hotplug",
                 "args": [
                     {
                         "index": 1,
@@ -751,6 +765,7 @@
             {
                 "syscall": "ioctl",
                 "comment": "Needed for querying the minimum I/O size of a block-device backing file during virtio-block init",
+                "feature": "hotplug",
                 "args": [
                     {
                         "index": 1,
@@ -764,6 +779,7 @@
             {
                 "syscall": "ioctl",
                 "comment": "Needed for querying the optimal I/O size of a block-device backing file during virtio-block init",
+                "feature": "hotplug",
                 "args": [
                     {
                         "index": 1,
@@ -1330,6 +1346,7 @@
             {
                 "syscall": "ioctl",
                 "comment": "Needed to relocate notify ioeventfds when the guest reprograms a BAR",
+                "feature": "pci",
                 "args": [
                     {
                         "index": 1,
@@ -1354,6 +1371,7 @@
             },
             {
                 "syscall": "ioctl",
+                "feature": "api",
                 "args": [
                     {
                         "index": 1,
@@ -1366,6 +1384,7 @@
             },
             {
                 "syscall": "ioctl",
+                "feature": "api",
                 "args": [
                     {
                         "index": 1,
@@ -1378,6 +1397,7 @@
             },
             {
                 "syscall": "ioctl",
+                "feature": "api",
                 "args": [
                     {
                         "index": 1,
@@ -1390,6 +1410,7 @@
             },
             {
                 "syscall": "ioctl",
+                "feature": "api",
                 "args": [
                     {
                         "index": 1,
@@ -1402,6 +1423,7 @@
             },
             {
                 "syscall": "ioctl",
+                "feature": "api",
                 "args": [
                     {
                         "index": 1,
@@ -1414,6 +1436,7 @@
             },
             {
                 "syscall": "ioctl",
+                "feature": "api",
                 "args": [
                     {
                         "index": 1,
@@ -1426,6 +1449,7 @@
             },
             {
                 "syscall": "ioctl",
+                "feature": "api",
                 "args": [
                     {
                         "index": 1,
@@ -1438,6 +1462,7 @@
             },
             {
                 "syscall": "ioctl",
+                "feature": "api",
                 "args": [
                     {
                         "index": 1,
@@ -1450,6 +1475,7 @@
             },
             {
                 "syscall": "ioctl",
+                "feature": "api",
                 "args": [
                     {
                         "index": 1,
@@ -1462,6 +1488,7 @@
             },
             {
                 "syscall": "ioctl",
+                "feature": "api",
                 "args": [
                     {
                         "index": 1,
@@ -1474,6 +1501,7 @@
             },
             {
                 "syscall": "ioctl",
+                "feature": "api",
                 "args": [
                     {
                         "index": 1,
@@ -1486,6 +1514,7 @@
             },
             {
                 "syscall": "ioctl",
+                "feature": "api",
                 "args": [
                     {
                         "index": 1,
@@ -1498,6 +1527,7 @@
             },
             {
                 "syscall": "ioctl",
+                "feature": "net",
                 "args": [
                     {
                         "index": 1,
@@ -1510,6 +1540,7 @@
             },
             {
                 "syscall": "ioctl",
+                "feature": "api",
                 "args": [
                     {
                         "index": 1,
@@ -1534,6 +1565,7 @@
             },
             {
                 "syscall": "ioctl",
+                "feature": "pci",
                 "args": [
                     {
                         "index": 1,
@@ -1553,6 +1585,7 @@
             },
             {
                 "syscall": "ioctl",
+                "feature": "pci",
                 "args": [
                     {
                         "index": 1,
@@ -1565,6 +1598,7 @@
             },
             {
                 "syscall": "ioctl",
+                "feature": "pci",
                 "args": [
                     {
                         "index": 1,
