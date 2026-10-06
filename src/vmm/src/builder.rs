@@ -39,12 +39,12 @@ use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
 #[cfg(feature = "gdb")]
 use crate::gdb;
 use crate::initrd::{InitrdConfig, InitrdError};
-use crate::logger::debug;
 #[cfg(target_arch = "aarch64")]
 use crate::logger::warn;
+use crate::logger::{debug, info};
 use crate::persist::{MicrovmState, MicrovmStateError};
 use crate::resources::VmResources;
-use crate::seccomp::{BpfThreadMap, SeccompFeatures};
+use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Persist;
 use crate::utils::{u32_mib_to_bytes, u64_to_usize};
 use crate::vmm_config::boot_source::{
@@ -321,6 +321,9 @@ pub fn build_microvm_for_boot(
         boot_cmdline,
     )?;
 
+    let seccomp_features = vm_resources.required_seccomp_features();
+    info!("Seccomp features required by the microVM: [{seccomp_features}]");
+
     let vmm = Vmm {
         instance_info: instance_info.clone(),
         machine_config: vm_resources.machine_config.clone(),
@@ -328,6 +331,7 @@ pub fn build_microvm_for_boot(
         shutdown_exit_code: None,
         vm,
         device_manager,
+        seccomp_features,
     };
     let vmm = Arc::new(Mutex::new(vmm));
 
@@ -343,7 +347,7 @@ pub fn build_microvm_for_boot(
     let vcpu_seccomp_filter = seccomp_filters
         .get("vcpu")
         .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vcpu".to_string()))?
-        .compose(SeccompFeatures::all());
+        .compose(seccomp_features);
     kvm_vm
         .start_vcpus(vcpus, Arc::new(vcpu_seccomp_filter))
         .map_err(VmmError::VcpuStart)?;
@@ -550,6 +554,10 @@ pub fn build_microvm_from_snapshot(
     let mut device_manager =
         DeviceManager::restore(device_ctor_args, &microvm_state.device_states)?;
 
+    // The restored devices have been added to `vm_resources` by now.
+    let seccomp_features = vm_resources.required_seccomp_features();
+    info!("Seccomp features required by the microVM: [{seccomp_features}]");
+
     let vmm = Vmm {
         instance_info: instance_info.clone(),
         machine_config: vm_resources.machine_config.clone(),
@@ -557,13 +565,14 @@ pub fn build_microvm_from_snapshot(
         shutdown_exit_code: None,
         vm,
         device_manager,
+        seccomp_features,
     };
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
     let vcpu_seccomp_filter = seccomp_filters
         .get("vcpu")
         .ok_or(BuildMicrovmFromSnapshotError::MissingVcpuSeccompFilters)?
-        .compose(SeccompFeatures::all());
+        .compose(seccomp_features);
     kvm_vm.start_vcpus(vcpus, Arc::new(vcpu_seccomp_filter))?;
 
     let vmm = Arc::new(Mutex::new(vmm));
@@ -819,6 +828,7 @@ pub(crate) mod tests {
     use crate::devices::virtio::vsock::VSOCK_DEV_ID;
     use crate::mmds::data_store::{Mmds, MmdsVersion};
     use crate::mmds::ns::MmdsNetworkStack;
+    use crate::seccomp::SeccompFeatures;
     use crate::utils::mib_to_bytes;
     use crate::vmm_config::balloon::{BALLOON_DEV_ID, BalloonBuilder, BalloonDeviceConfig};
     use crate::vmm_config::boot_source::BootSourceConfig;
@@ -936,6 +946,7 @@ pub(crate) mod tests {
             shutdown_exit_code: None,
             vm: Vm::Kvm(Arc::new(vm)),
             device_manager: default_device_manager(),
+            seccomp_features: SeccompFeatures::empty(),
         }
     }
 
@@ -954,6 +965,7 @@ pub(crate) mod tests {
             shutdown_exit_code: None,
             vm: Vm::Kvm(vm),
             device_manager,
+            seccomp_features: SeccompFeatures::empty(),
         }
     }
 
