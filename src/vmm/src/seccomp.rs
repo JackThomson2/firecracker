@@ -5,6 +5,10 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::Read;
 
+use serde::Deserialize;
+#[cfg(test)]
+use serde::Serialize;
+
 // This byte limit is passed to `bitcode` to guard against a potential memory
 // allocation DOS caused by binary filters that are too large.
 // This limit can be safely determined since the maximum length of a BPF
@@ -114,6 +118,13 @@ impl SeccompFilter {
 /// Type that associates a thread category to its seccomp filter.
 pub type BpfThreadMap = HashMap<String, SeccompFilter>;
 
+/// First bytes of a compiled filter file, followed by [`FILTER_FORMAT_VERSION`] as a little
+/// endian `u32` and the bitcode serialized map of thread names to lists of [`SerializedPart`]s.
+const FILTER_FORMAT_MAGIC: [u8; 4] = *b"FCBF";
+
+/// The compiled filter file format version this Firecracker reads.
+const FILTER_FORMAT_VERSION: u32 = 1;
+
 /// Binary filter deserialization errors.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum DeserializationError {
@@ -121,8 +132,25 @@ pub enum DeserializationError {
     InputRead(std::io::Error),
     /// Input size {0} exceeds limit of {1} bytes
     SizeLimitExceeded(usize, usize),
+    /// Not a compiled seccomp filter; filters must be compiled with this version's seccompiler-bin
+    UnknownFormat,
+    /// Unsupported compiled filter format version {0}; recompile the filter with this version's seccompiler-bin
+    UnsupportedVersion(u32),
     /// Bitcode deserialization failed: {0}
     Bitcode(#[from] bitcode::Error),
+    /// Filter part tagged with an unknown feature: {0}
+    UnknownFeature(#[from] UnknownSeccompFeature),
+}
+
+/// Serialized form of [`FilterPart`], as written by seccompiler (`BpfPart` in its types).
+///
+/// Firecracker does not depend on seccompiler, which links libseccomp, so the layout is mirrored
+/// here and must be kept in sync.
+#[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct SerializedPart {
+    features: Vec<String>,
+    code: BpfProgram,
 }
 
 /// Retrieve empty seccomp filters.
@@ -150,18 +178,40 @@ pub fn deserialize_binary<R: Read>(reader: R) -> Result<BpfThreadMap, Deserializ
         ));
     }
 
-    let result: HashMap<String, BpfProgram> = bitcode::deserialize(&buf)?;
+    let header_len = FILTER_FORMAT_MAGIC.len() + std::mem::size_of::<u32>();
+    if buf.len() < header_len || buf[..FILTER_FORMAT_MAGIC.len()] != FILTER_FORMAT_MAGIC {
+        return Err(DeserializationError::UnknownFormat);
+    }
+    let version = u32::from_le_bytes(
+        buf[FILTER_FORMAT_MAGIC.len()..header_len]
+            .try_into()
+            .expect("the header length was checked"),
+    );
+    if version != FILTER_FORMAT_VERSION {
+        return Err(DeserializationError::UnsupportedVersion(version));
+    }
 
-    Ok(result
-        .into_iter()
-        .map(|(k, code)| {
-            let features = SeccompFeatures::empty();
-            (
-                k.to_lowercase(),
-                SeccompFilter(vec![FilterPart { features, code }]),
-            )
+    let result: HashMap<String, Vec<SerializedPart>> = bitcode::deserialize(&buf[header_len..])?;
+
+    // A typo in a feature tag fails here rather than silently leaving a rule out.
+    let part = |part: SerializedPart| {
+        let features = part
+            .features
+            .iter()
+            .map(|name| SeccompFeatures::from_tag(name))
+            .collect::<Result<_, _>>()?;
+        Ok::<_, DeserializationError>(FilterPart {
+            features,
+            code: part.code,
         })
-        .collect())
+    };
+    result
+        .into_iter()
+        .map(|(k, parts)| {
+            let parts = parts.into_iter().map(part).collect::<Result<_, _>>()?;
+            Ok((k.to_lowercase(), SeccompFilter(parts)))
+        })
+        .collect()
 }
 
 /// Filter installation errors.
@@ -240,33 +290,92 @@ mod tests {
 
     use super::*;
 
+    /// Serialize `filters` the way seccompiler writes a compiled filter file.
+    fn encode(filters: Vec<(&str, Vec<SerializedPart>)>) -> Vec<u8> {
+        let filters: HashMap<_, _> = filters.into_iter().collect();
+        let mut bytes = FILTER_FORMAT_MAGIC.to_vec();
+        bytes.extend_from_slice(&FILTER_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&bitcode::serialize(&filters).unwrap());
+        bytes
+    }
+
+    fn serialized(features: &[&str], code: BpfProgram) -> SerializedPart {
+        let features = features.iter().map(|name| name.to_string()).collect();
+        SerializedPart { features, code }
+    }
+
     #[test]
     fn test_deserialize_binary() {
-        // Malformed bitcode binary.
-        let data = "adassafvc".to_string();
-        deserialize_binary(data.as_bytes()).unwrap_err();
+        // Not a compiled filter at all, or one written without the header by an older
+        // seccompiler.
+        for data in [
+            &b"adassafvc"[..],
+            &b"FCB"[..],
+            &bitcode::serialize(&HashMap::<String, Vec<u64>>::new()).unwrap(),
+        ] {
+            assert!(matches!(
+                deserialize_binary(data).unwrap_err(),
+                DeserializationError::UnknownFormat
+            ));
+        }
+
+        // A format version this Firecracker does not read.
+        let mut bytes = encode(vec![]);
+        bytes[4..8].copy_from_slice(&(FILTER_FORMAT_VERSION + 1).to_le_bytes());
+        assert!(matches!(
+            deserialize_binary(&bytes[..]).unwrap_err(),
+            DeserializationError::UnsupportedVersion(version) if version == FILTER_FORMAT_VERSION + 1
+        ));
+
+        // Garbage after a valid header.
+        let mut bytes = encode(vec![]);
+        bytes.extend_from_slice(b"adassafvc");
+        assert!(matches!(
+            deserialize_binary(&bytes[..]).unwrap_err(),
+            DeserializationError::Bitcode(_)
+        ));
 
         // Test that the binary deserialization is correct, and that the thread keys
         // have been lowercased.
-        let bpf_prog = vec![0; 2];
-        let mut filter_map: HashMap<String, BpfProgram> = HashMap::new();
-        filter_map.insert("VcpU".to_string(), bpf_prog.clone());
-        let bytes = bitcode::serialize(&filter_map).unwrap();
+        let bytes = encode(vec![
+            (
+                "VcpU",
+                vec![
+                    serialized(&[], vec![0; 2]),
+                    serialized(&["net", "hotplug"], vec![1; 3]),
+                    serialized(&[], vec![2]),
+                ],
+            ),
+            ("vmm", vec![]),
+        ]);
+        let part = |features, code| FilterPart { features, code };
+        let expected = BpfThreadMap::from([
+            (
+                "vcpu".to_string(),
+                SeccompFilter(vec![
+                    part(SeccompFeatures::empty(), vec![0; 2]),
+                    part(SeccompFeatures::NET | SeccompFeatures::HOTPLUG, vec![1; 3]),
+                    part(SeccompFeatures::empty(), vec![2]),
+                ]),
+            ),
+            ("vmm".to_string(), SeccompFilter::default()),
+        ]);
+        assert_eq!(deserialize_binary(&bytes[..]).unwrap(), expected);
 
-        let mut expected_res = BpfThreadMap::new();
-        expected_res.insert(
-            "vcpu".to_string(),
-            SeccompFilter(vec![FilterPart {
-                features: SeccompFeatures::empty(),
-                code: bpf_prog,
-            }]),
-        );
-        assert_eq!(deserialize_binary(&bytes[..]).unwrap(), expected_res);
+        // Parts tagged with a feature this Firecracker does not know are rejected.
+        let bytes = encode(vec![("vmm", vec![serialized(&["warp-drive"], vec![1])])]);
+        assert!(matches!(
+            deserialize_binary(&bytes[..]).unwrap_err(),
+            DeserializationError::UnknownFeature(UnknownSeccompFeature(name)) if name == "warp-drive"
+        ));
 
         // Test filter too large - create data that will exceed the deserialization limit
         // Create a large buffer that when serialized will exceed DESERIALIZATION_BYTES_LIMIT
         let large_data = vec![0u8; DESERIALIZATION_BYTES_LIMIT + 1000];
-        deserialize_binary(&large_data[..]).unwrap_err();
+        assert!(matches!(
+            deserialize_binary(&large_data[..]).unwrap_err(),
+            DeserializationError::SizeLimitExceeded(..)
+        ));
     }
 
     #[test]

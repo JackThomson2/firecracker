@@ -146,10 +146,34 @@ impl SeccompAction {
 /// If all conditions match then rule gets matched.
 /// The action of the first rule that matches will be applied to the calling process.
 /// If no rule matches the default action is applied.
+///
+/// A rule can be tagged with the features of the microVM it is needed for, either as
+/// `"feature": "net"` or as `"features": ["pmem", "memory-hotplug"]`. Tagged rules are compiled
+/// into separate BPF fragments which Firecracker only installs when one of the features is in use;
+/// untagged rules are always installed.
 #[derive(Debug, Deserialize)]
 pub struct SyscallRule {
     pub syscall: CString,
     pub args: Option<Vec<SeccompCondition>>,
+    #[serde(default, alias = "feature", deserialize_with = "deserialize_features")]
+    pub features: Option<Vec<String>>,
+}
+
+/// Accept a single feature name as well as a list of them.
+fn deserialize_features<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Features {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    Ok(Some(match Features::deserialize(deserializer)? {
+        Features::One(feature) => vec![feature],
+        Features::Many(features) => features,
+    }))
 }
 
 /// Filter containing rules assigned to syscall numbers.
@@ -163,6 +187,55 @@ pub struct Filter {
 /// Deserializable object that represents the Json filter file.
 #[derive(Debug, Deserialize)]
 pub struct BpfJson(pub BTreeMap<String, Filter>);
+
+/// One part of the compiled filter of a thread category, as stored in the compiled filter file.
+///
+/// Firecracker reads this layout in `vmm::seccomp`, which must be kept in sync with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BpfPart {
+    /// The features the part is needed for, any one of them being in use is sufficient; empty for
+    /// the parts that are always needed.
+    pub features: Vec<String>,
+    /// The BPF instructions of the part.
+    pub code: Vec<u64>,
+}
+
+/// The compiled filter of one thread category.
+///
+/// Without tagged rules this is a single part holding the libseccomp program of all rules.
+/// Otherwise the first part holds the libseccomp program of the untagged rules, every following
+/// part but the last the one of the tagged rules sharing a set of features, each with its default
+/// returns redirected so that it falls through into the next part, and the last part returns the
+/// default action.
+pub type BpfFilter = Vec<BpfPart>;
+
+/// The program of `filter` with the untagged parts and the ones tagged with one of `features`.
+/// `all` selects every part, and a name no part is tagged with, such as `none`, selects none.
+pub fn compose<S: AsRef<str>>(filter: &[BpfPart], features: &[S]) -> Vec<u64> {
+    let selected = |part: &BpfPart| {
+        part.features.is_empty()
+            || features.iter().any(|feature| {
+                let feature = feature.as_ref();
+                feature == "all" || part.features.iter().any(|tag| tag == feature)
+            })
+    };
+    filter
+        .iter()
+        .filter(|part| selected(part))
+        .flat_map(|part| part.code.iter().copied())
+        .collect()
+}
+
+/// The compiled filters of all thread categories, keyed by thread name.
+pub type BpfMap = BTreeMap<String, BpfFilter>;
+
+/// First bytes of a compiled filter file, followed by [`BPF_FILTER_FORMAT_VERSION`] as a little
+/// endian `u32` and the bitcode serialized [`BpfMap`].
+pub const BPF_FILTER_MAGIC: [u8; 4] = *b"FCBF";
+
+/// Version of the compiled filter file format, bumped whenever the layout of [`BpfFilter`] or
+/// its serialization changes.
+pub const BPF_FILTER_FORMAT_VERSION: u32 = 1;
 
 /// Supported target architectures.
 #[derive(Debug)]
