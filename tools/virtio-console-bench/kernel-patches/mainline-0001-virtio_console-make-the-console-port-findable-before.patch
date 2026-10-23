@@ -1,0 +1,106 @@
+From c5e00463f06baa8743d3c37b36783bdc5bda16c6 Mon Sep 17 00:00:00 2001
+From: Jack Thomson <jackabt@amazon.com>
+Date: Fri, 23 Oct 2026 14:36:21 +0000
+Subject: [PATCH] virtio_console: make the console port findable before
+ registering hvc
+
+init_port_console() calls hvc_alloc() before it adds the port to
+pdrvdata.consoles, and add_port() adds the port to portdev->ports only
+after init_port_console() has returned. When the port is the console
+selected with console=hvc0, hvc_alloc() registers the hvc console, and
+with CON_PRINTBUFFER registration prints the whole kernel log through
+put_chars() right away. put_chars() looks the port up in
+pdrvdata.consoles, does not find it and returns -EPIPE, and
+hvc_console_print() throws the characters away. console=hvc0 therefore
+loses every message printed before the driver probed.
+
+Moving only that insertion earlier makes the log go through the output
+queue while the port is still missing from portdev->ports. An output
+queue interrupt then makes out_intr() call flush_bufs() on the queue,
+which races with put_chars() polling the same queue for its buffer: the
+driver reports "output:id 0 is not a head!" and breaks the queue, and
+all later console output is lost.
+
+Add the port to both lists before the console is set up, and remove it
+from them if that fails.
+
+Signed-off-by: Jack Thomson <jackabt@amazon.com>
+---
+ drivers/char/virtio_console.c | 35 +++++++++++++++++++++++++++--------
+ 1 file changed, 27 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/char/virtio_console.c b/drivers/char/virtio_console.c
+index 9a33217..1046924 100644
+--- a/drivers/char/virtio_console.c
++++ b/drivers/char/virtio_console.c
+@@ -1217,18 +1217,28 @@ static int init_port_console(struct port *port)
+ 		return ret;
+ 
+ 	port->cons.vtermno = ret;
++
++	/*
++	 * hvc_alloc() can register the console, which prints the kernel log
++	 * through put_chars() straight away, so put_chars() has to be able to
++	 * find the port by its vtermno before then.
++	 */
++	spin_lock_irq(&pdrvdata_lock);
++	list_add_tail(&port->cons.list, &pdrvdata.consoles);
++	spin_unlock_irq(&pdrvdata_lock);
++
+ 	port->cons.hvc = hvc_alloc(port->cons.vtermno, 0, &hv_ops, PAGE_SIZE);
+ 	if (IS_ERR(port->cons.hvc)) {
+ 		ret = PTR_ERR(port->cons.hvc);
+ 		dev_err(port->dev,
+ 			"error %d allocating hvc for port\n", ret);
+ 		port->cons.hvc = NULL;
++		spin_lock_irq(&pdrvdata_lock);
++		list_del(&port->cons.list);
++		spin_unlock_irq(&pdrvdata_lock);
+ 		ida_free(&vtermno_ida, port->cons.vtermno);
+ 		return ret;
+ 	}
+-	spin_lock_irq(&pdrvdata_lock);
+-	list_add_tail(&port->cons.list, &pdrvdata.consoles);
+-	spin_unlock_irq(&pdrvdata_lock);
+ 	port->guest_connected = true;
+ 
+ 	/* Notify host of port being opened */
+@@ -1391,6 +1401,15 @@ static int add_port(struct ports_device *portdev, u32 id)
+ 		goto free_device;
+ 	}
+ 
++	/*
++	 * Registering a console prints the kernel log through the port, and
++	 * the interrupt handler of its output queue must find it meanwhile, or
++	 * it takes the buffers that put_chars() is waiting for.
++	 */
++	spin_lock_irq(&portdev->ports_lock);
++	list_add_tail(&port->list, &port->portdev->ports);
++	spin_unlock_irq(&portdev->ports_lock);
++
+ 	if (is_rproc_serial(port->portdev->vdev))
+ 		/*
+ 		 * For rproc_serial assume remote processor is connected.
+@@ -1404,14 +1423,14 @@ static int add_port(struct ports_device *portdev, u32 id)
+ 		 * this has to be a console port.
+ 		 */
+ 		err = init_port_console(port);
+-		if (err)
++		if (err) {
++			spin_lock_irq(&portdev->ports_lock);
++			list_del(&port->list);
++			spin_unlock_irq(&portdev->ports_lock);
+ 			goto free_inbufs;
++		}
+ 	}
+ 
+-	spin_lock_irq(&portdev->ports_lock);
+-	list_add_tail(&port->list, &port->portdev->ports);
+-	spin_unlock_irq(&portdev->ports_lock);
+-
+ 	/*
+ 	 * Tell the Host we're set so that it can send us various
+ 	 * configuration parameters for this port (eg, port name,
+-- 
+2.43.0
+

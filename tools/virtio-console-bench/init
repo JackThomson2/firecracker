@@ -1,0 +1,30 @@
+#!/bin/busybox sh
+/bin/busybox --install -s /bin
+mount -t devtmpfs dev /dev
+mount -t proc proc /proc
+# Guest boot time ends here, for Firecracker's --boot-timer.
+devmem 0xc0000000 8 123
+now() { awk '/^now at/ { print $3; exit }' /proc/timer_list; }
+case "$fcmode" in
+tput)
+    # 2048 lines of 100 bytes.
+    yes 012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678 | head -c 204800 > /tmp/payload
+    t0=$(now); dd if=/tmp/payload of=/dev/kmsg bs=100 2>/dev/null; t1=$(now)
+    res="kmsg_ns=$((t1 - t0))"
+    for tty in ttyS0 hvc0; do
+        [ -c /dev/$tty ] || continue
+        t0=$(now); dd if=/tmp/payload of=/dev/$tty bs=4096 2>/dev/null; stty -F /dev/$tty 115200; t1=$(now)
+        res="$res ${tty}_ns=$((t1 - t0))"
+    done
+    echo "RESULT $res"
+    ;;
+logs)
+    { echo "DMESG-BEGIN"; dmesg; echo "DMESG-END"; } > /dev/ttyS0
+    ;;
+log)
+    echo "DMESG-BEGIN"
+    dmesg
+    echo "DMESG-END"
+    ;;
+esac
+reboot -f
