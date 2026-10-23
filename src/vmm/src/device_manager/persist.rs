@@ -402,6 +402,9 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
                         device_info,
                     })
                 }
+                VirtioDeviceType::Console => {
+                    unreachable!("virtio-console devices cannot be snapshotted")
+                }
                 VirtioDeviceType::Mem => {
                     let mem = locked_device
                         .as_mut_any()

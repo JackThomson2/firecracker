@@ -30,6 +30,7 @@ use crate::device_manager::{
 };
 use crate::devices::virtio::balloon::Balloon;
 use crate::devices::virtio::block::device::Block;
+use crate::devices::virtio::console::{CONSOLE_DEV_ID, Console, ConsoleOutput};
 use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::mem::{VIRTIO_MEM_DEFAULT_SLOT_SIZE_MIB, VirtioMem};
 use crate::devices::virtio::net::Net;
@@ -50,6 +51,7 @@ use crate::utils::{u32_mib_to_bytes, u64_to_usize};
 use crate::vmm_config::boot_source::{
     DEFAULT_KERNEL_CMDLINE, append_root_device_cmdline, build_cmdline,
 };
+use crate::vmm_config::console::VirtioConsoleConfig;
 use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::MachineConfigError;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
@@ -115,6 +117,10 @@ pub enum StartMicrovmError {
     SetVmResources(MachineConfigError),
     /// Cannot create the entropy device: {0}
     CreateEntropyDevice(crate::devices::virtio::rng::EntropyError),
+    /// Cannot create the virtio console device: {0}
+    CreateConsoleDevice(crate::devices::virtio::console::ConsoleError),
+    /// Cannot open the virtio console output: {0}
+    OpenConsoleOutput(io::Error),
     /// Failed to allocate guest resource: {0}
     AllocateResources(#[from] vm_allocator::Error),
     /// Error starting GDB debug session: {0}
@@ -275,6 +281,16 @@ pub fn build_microvm_for_boot(
             &vm,
             &mut boot_cmdline,
             entropy,
+            event_manager,
+        )?;
+    }
+
+    if let Some(console_config) = &vm_resources.console {
+        attach_console_device(
+            &mut device_manager,
+            &vm,
+            &mut boot_cmdline,
+            console_config,
             event_manager,
         )?;
     }
@@ -648,6 +664,36 @@ fn attach_entropy_device(
         event_manager,
         false,
     )
+}
+
+fn attach_console_device(
+    device_manager: &mut DeviceManager,
+    vm: &Vm,
+    cmdline: &mut LoaderKernelCmdline,
+    config: &VirtioConsoleConfig,
+    event_manager: &mut EventManager,
+) -> Result<(), StartMicrovmError> {
+    let output = match &config.output_path {
+        Some(path) => ConsoleOutput::File(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(StartMicrovmError::OpenConsoleOutput)?,
+        ),
+        None => ConsoleOutput::Stdout,
+    };
+    let console = Console::new(config.output_path.clone(), output)
+        .map_err(StartMicrovmError::CreateConsoleDevice)?;
+    device_manager.attach_boot_virtio_device(
+        vm,
+        CONSOLE_DEV_ID.to_string(),
+        Arc::new(Mutex::new(console)),
+        cmdline,
+        event_manager,
+        false,
+    )?;
+    Ok(())
 }
 
 fn allocate_virtio_mem_address(

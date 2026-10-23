@@ -13,6 +13,8 @@ use crate::vmm_config::pmem::PmemConfig;
 pub mod balloon;
 /// Wrapper for configuring the microVM boot source.
 pub mod boot_source;
+/// Wrapper for configuring the virtio console device.
+pub mod console;
 /// Wrapper for configuring the block devices.
 pub mod drive;
 /// Wrapper for configuring the entropy device attached to the microVM.

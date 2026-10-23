@@ -21,6 +21,7 @@ use crate::vmm_config::balloon::*;
 use crate::vmm_config::boot_source::{
     BootConfig, BootSource, BootSourceConfig, BootSourceConfigError,
 };
+use crate::vmm_config::console::VirtioConsoleConfig;
 use crate::vmm_config::drive::*;
 use crate::vmm_config::entropy::*;
 use crate::vmm_config::instance_info::InstanceInfo;
@@ -95,6 +96,7 @@ pub struct VmmConfig {
     pub network_interfaces: Vec<NetworkInterfaceConfig>,
     pub vsock: Option<VsockDeviceConfig>,
     pub entropy: Option<EntropyDeviceConfig>,
+    pub console: Option<VirtioConsoleConfig>,
     #[serde(default, rename = "pmem")]
     pub pmem_devices: Vec<PmemConfig>,
     #[serde(skip)]
@@ -120,6 +122,8 @@ pub struct VmResources {
     pub net_builder: NetBuilder,
     /// The entropy device builder.
     pub entropy: EntropyDeviceBuilder,
+    /// The virtio console configuration.
+    pub console: Option<VirtioConsoleConfig>,
     /// The pmem device configs.
     pub pmem: PmemBuilder,
     /// The memory hotplug configuration.
@@ -227,6 +231,8 @@ impl VmResources {
         if let Some(entropy_device_config) = vmm_config.entropy {
             resources.build_entropy_device(entropy_device_config)?;
         }
+
+        resources.console = vmm_config.console;
 
         for pmem_config in vmm_config.pmem_devices.into_iter() {
             resources.build_pmem_device(pmem_config)?;
@@ -588,6 +594,7 @@ impl From<&VmResources> for VmmConfig {
             network_interfaces: resources.net_builder.configs(),
             vsock: resources.vsock.config(),
             entropy: resources.entropy.config(),
+            console: resources.console.clone(),
             pmem_devices: resources.pmem.configs.clone(),
             // serial_config is marked serde(skip) so that it doesnt end up in snapshots.
             serial_config: None,
@@ -708,6 +715,7 @@ mod tests {
             boot_timer: false,
             mmds_size_limit: HTTP_MAX_PAYLOAD_SIZE,
             entropy: Default::default(),
+            console: None,
             pmem: Default::default(),
             pci_enabled: false,
             serial_out_path: None,

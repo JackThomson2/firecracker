@@ -137,6 +137,7 @@ use crate::devices::virtio::balloon::{
 };
 use crate::devices::virtio::block::BlockError;
 use crate::devices::virtio::block::device::Block;
+use crate::devices::virtio::console::Console;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceId, VirtioDeviceType};
 use crate::devices::virtio::mem::device::VirtioMem;
 use crate::devices::virtio::mem::{VIRTIO_MEM_DEV_ID, VirtioMemError, VirtioMemStatus};
@@ -354,6 +355,7 @@ impl Vmm {
         let mut balloon = None;
         let mut vsock = None;
         let mut entropy = None;
+        let mut console = None;
         let mut memory_hotplug = None;
         let mut mmds_ipv4_address = None;
         let mut mmds_ref = None;
@@ -397,6 +399,11 @@ impl Vmm {
                         entropy = Some(EntropyDeviceConfig::from(e));
                     }
                 }
+                VirtioDeviceType::Console => {
+                    if let Some(c) = device.as_any().downcast_ref::<Console>() {
+                        console = Some(c.config());
+                    }
+                }
                 VirtioDeviceType::Mem => {
                     if let Some(m) = device.as_any().downcast_ref::<VirtioMem>() {
                         memory_hotplug = Some(MemoryHotplugConfig::from(m));
@@ -429,6 +436,7 @@ impl Vmm {
             network_interfaces: net,
             vsock,
             entropy,
+            console,
             pmem_devices: pmem,
             // serial_config is marked serde(skip) so that it doesnt end up in snapshots
             serial_config: None,
@@ -446,6 +454,9 @@ impl Vmm {
                     && b.is_vhost_user()
                 {
                     tuples.push(("vhost-user-block", b.id().to_owned()));
+                }
+                if let VirtioDeviceType::Console = device_type {
+                    tuples.push(("virtio-console", device.id().to_owned()));
                 }
             });
         if tuples.is_empty() {

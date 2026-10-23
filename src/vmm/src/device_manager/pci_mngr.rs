@@ -555,6 +555,9 @@ impl<'a> Persist<'a> for PciDevices {
                         transport_state,
                     });
                 }
+                VirtioDeviceType::Console => {
+                    unreachable!("virtio-console devices cannot be snapshotted")
+                }
                 VirtioDeviceType::Mem => {
                     let mem_dev = locked_virtio_dev
                         .as_mut_any()
