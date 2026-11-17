@@ -118,6 +118,8 @@ pub enum KvmVcpuError {
     VcpuSetXcrs(kvm_ioctls::Error),
     /// Failed to set KVM vcpu xsave: {0}
     VcpuSetXsave(kvm_ioctls::Error),
+    /// Failed to restore the guest TSC: {0}
+    RestoreTsc(kvm_ioctls::Error),
 }
 
 /// Error type for [`KvmVcpu::get_tsc_khz`] and [`KvmVcpu::is_tsc_scaling_required`].
@@ -444,6 +446,68 @@ impl KvmVcpu {
             return Err(errno::Error::last());
         }
         Ok(())
+    }
+
+    /// Reads one MSR of this vCPU.
+    fn get_msr(&self, index: u32) -> Result<u64, KvmVcpuError> {
+        let mut msrs = Msrs::from_entries(&[kvm_bindings::kvm_msr_entry {
+            index,
+            ..Default::default()
+        }])?;
+        match self
+            .fd
+            .get_msrs(&mut msrs)
+            .map_err(KvmVcpuError::VcpuGetMsrs)?
+        {
+            1 => Ok(msrs.as_slice()[0].data),
+            _ => Err(KvmVcpuError::VcpuGetMsr(index)),
+        }
+    }
+
+    /// Writes one MSR of this vCPU.
+    fn set_msr(&self, index: u32, data: u64) -> Result<(), KvmVcpuError> {
+        let msrs = Msrs::from_entries(&[kvm_bindings::kvm_msr_entry {
+            index,
+            data,
+            ..Default::default()
+        }])?;
+        match self.fd.set_msrs(&msrs).map_err(KvmVcpuError::VcpuSetMsrs)? {
+            1 => Ok(()),
+            _ => Err(KvmVcpuError::VcpuSetMsrsIncomplete),
+        }
+    }
+
+    /// Moves the guest TSC of this vCPU back to its value in a snapshot, and arms the TSC
+    /// deadline timer again from there.
+    ///
+    /// Returns the resulting TSC offset where KVM exposes it. The vCPU must not be running.
+    pub fn restore_tsc(&self, restore: &TscRestore) -> Result<Option<i64>, KvmVcpuError> {
+        let (offset, deadline) = match *restore {
+            TscRestore::Rewind(state) => {
+                let ahead = self.get_msr(MSR_IA32_TSC)?.wrapping_sub(state.tsc);
+                let offset = self
+                    .get_tsc_offset()
+                    .map_err(KvmVcpuError::RestoreTsc)?
+                    .wrapping_sub_unsigned(ahead);
+                self.set_tsc_offset(offset)
+                    .map_err(KvmVcpuError::RestoreTsc)?;
+                (Some(offset), state.deadline)
+            }
+            TscRestore::Write(state) => {
+                self.set_msr(MSR_IA32_TSC, state.tsc)?;
+                (None, state.deadline)
+            }
+            TscRestore::Offset { offset, deadline } => {
+                self.set_tsc_offset(offset)
+                    .map_err(KvmVcpuError::RestoreTsc)?;
+                (Some(offset), deadline)
+            }
+        };
+        // KVM arms the deadline timer from the value the TSC has when the deadline is written.
+        if let Some(deadline) = deadline {
+            self.set_msr(MSR_IA32_TSC_DEADLINE, deadline)?;
+        }
+        Ok(offset)
     }
 
     /// Get CPUID for this vCPU.
@@ -872,6 +936,66 @@ pub struct VcpuState {
     pub tsc_khz: Option<u32>,
 }
 
+/// TSC state of a vCPU, as saved in a snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TscState {
+    /// Value of the guest TSC.
+    pub tsc: u64,
+    /// TSC deadline of the local APIC timer, if saved.
+    pub deadline: Option<u64>,
+}
+
+/// How to move the guest TSC of a paused vCPU back to its value in a snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TscRestore {
+    /// Shift the TSC offset by however far the guest TSC ran past the saved value.
+    Rewind(TscState),
+    /// Write the saved value to the TSC MSR, on hosts that do not expose the TSC offset.
+    ///
+    /// KVM takes a write within a second of the running TSC as a request to synchronize the
+    /// vCPUs and ignores its value, so this only hides pauses longer than that.
+    Write(TscState),
+    /// Use the TSC offset another vCPU of the microVM ended up with.
+    Offset {
+        /// TSC offset to set.
+        offset: i64,
+        /// Saved TSC deadline of this vCPU.
+        deadline: Option<u64>,
+    },
+}
+
+impl VcpuState {
+    /// Returns the TSC state saved in this state, if it holds a TSC value.
+    pub fn tsc_state(&self) -> Option<TscState> {
+        let saved = |index| {
+            self.saved_msrs
+                .iter()
+                .flat_map(|msrs| msrs.as_slice())
+                .find(|msr| msr.index == index)
+                .map(|msr| msr.data)
+        };
+        Some(TscState {
+            tsc: saved(MSR_IA32_TSC)?,
+            deadline: saved(MSR_IA32_TSC_DEADLINE),
+        })
+    }
+
+    /// Replaces the TSC state saved in this state.
+    pub fn set_tsc_state(&mut self, tsc: TscState) {
+        let saved = self
+            .saved_msrs
+            .iter_mut()
+            .flat_map(|msrs| msrs.as_mut_slice());
+        for msr in saved {
+            match msr.index {
+                MSR_IA32_TSC => msr.data = tsc.tsc,
+                MSR_IA32_TSC_DEADLINE => msr.data = tsc.deadline.unwrap_or(msr.data),
+                _ => {}
+            }
+        }
+    }
+}
+
 impl Debug for VcpuState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut debug_kvm_regs: Vec<kvm_bindings::kvm_msrs> = Vec::new();
@@ -938,6 +1062,72 @@ pub(crate) mod tests {
         vm.setup_irqchip().unwrap();
         let vcpu = KvmVcpu::new(0, &vm).unwrap();
         (vm, vcpu)
+    }
+
+    #[test]
+    fn test_restore_tsc() {
+        let (vm, vcpu) = setup_vcpu(0x10000);
+        let saved = TscState {
+            tsc: vcpu.get_msr(MSR_IA32_TSC).unwrap(),
+            deadline: None,
+        };
+        // Move the guest TSC far past the saved value, as a long pause would.
+        let ahead = TscState {
+            tsc: saved.tsc.wrapping_add(1 << 50),
+            deadline: None,
+        };
+        vcpu.restore_tsc(&TscRestore::Write(ahead)).unwrap();
+        assert!(vcpu.get_msr(MSR_IA32_TSC).unwrap() >= ahead.tsc);
+
+        let restore = if vcpu.supports_tsc_offset_attr() {
+            TscRestore::Rewind(saved)
+        } else {
+            TscRestore::Write(saved)
+        };
+        let offset = vcpu.restore_tsc(&restore).unwrap();
+        assert_eq!(offset.is_some(), vcpu.supports_tsc_offset_attr());
+        // Only the time spent in this test separates the two values, far less than 2^40 ticks.
+        let elapsed = vcpu.get_msr(MSR_IA32_TSC).unwrap().wrapping_sub(saved.tsc);
+        assert!(
+            elapsed < 1 << 40,
+            "TSC is {elapsed} ticks past the saved value"
+        );
+
+        // A second vCPU given the offset of the first one runs on the same TSC.
+        if let Some(offset) = offset {
+            let other = KvmVcpu::new(1, &vm).unwrap();
+            let restore = TscRestore::Offset {
+                offset,
+                deadline: None,
+            };
+            assert_eq!(other.restore_tsc(&restore).unwrap(), Some(offset));
+            assert_eq!(other.get_tsc_offset().unwrap(), offset);
+        }
+    }
+
+    #[test]
+    fn test_vcpu_state_tsc() {
+        let mut state = VcpuState {
+            saved_msrs: vec![
+                msrs_from_entries(&[(MSR_IA32_TSC_DEADLINE, 7)]),
+                msrs_from_entries(&[(MSR_IA32_TSC, 42)]),
+            ],
+            ..Default::default()
+        };
+        let tsc = TscState {
+            tsc: 42,
+            deadline: Some(7),
+        };
+        assert_eq!(state.tsc_state(), Some(tsc));
+
+        let tsc = TscState {
+            tsc: 5,
+            deadline: Some(6),
+        };
+        state.set_tsc_state(tsc);
+        assert_eq!(state.tsc_state(), Some(tsc));
+
+        assert_eq!(VcpuState::default().tsc_state(), None);
     }
 
     /// Size in bytes of the guest's MMIO load instruction (`mov al, [si]`).

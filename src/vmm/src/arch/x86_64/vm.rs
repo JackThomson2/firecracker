@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use kvm_bindings::{
     KVM_CLOCK_REALTIME, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE,
@@ -12,13 +12,16 @@ use kvm_ioctls::Cap;
 use serde::{Deserialize, Serialize};
 
 use crate::arch::x86_64::msr::MsrError;
+use crate::arch::x86_64::vcpu::{TscRestore, TscState};
 use crate::snapshot::Persist;
 use crate::utils::u64_to_usize;
 use crate::vstate::bus::Bus;
 use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{GuestMemoryExtension, GuestMemoryState};
 use crate::vstate::resources::{ResourceAllocator, ResourceAllocatorState};
+use crate::vstate::vcpu::{VcpuEvent, VcpuResponse, VcpuState};
 use crate::vstate::vm::{VmCommon, VmError};
+use crate::{RECV_TIMEOUT_SEC, VmmError};
 
 /// Error type for [`KvmVm::restore_state`]
 #[allow(missing_docs)]
@@ -55,6 +58,17 @@ pub enum KvmVmError {
     ResourceAllocator(#[from] vm_allocator::Error),
 }
 
+/// Guest clocks of a restored snapshot, kept to restore them again when the vCPUs are resumed.
+#[derive(Debug)]
+struct DeferredClock {
+    /// The kvmclock of the snapshot.
+    clock: kvm_clock_data,
+    /// The TSC state of each vCPU in the snapshot.
+    tsc: Vec<Option<TscState>>,
+    /// Whether KVM exposes the TSC offset of the vCPUs.
+    tsc_offset_attr: bool,
+}
+
 /// Structure representing the current architecture's understand of what a "virtual machine" is.
 #[derive(Debug)]
 pub struct KvmVm {
@@ -67,6 +81,8 @@ pub struct KvmVm {
     xsave2_size: Option<usize>,
     /// Port IO bus
     pub pio_bus: Arc<Bus>,
+    // Guest clocks to restore again on the next resume, see `KvmVm::defer_clock_restore`.
+    deferred_clock: Mutex<Option<DeferredClock>>,
 }
 
 impl KvmVm {
@@ -110,6 +126,7 @@ impl KvmVm {
             msrs_to_save,
             xsave2_size,
             pio_bus,
+            deferred_clock: Mutex::new(None),
         })
     }
 
@@ -162,6 +179,82 @@ impl KvmVm {
         Ok(())
     }
 
+    /// Keeps the guest clocks of a restored snapshot, to restore them again when the vCPUs are
+    /// next resumed.
+    ///
+    /// KVM runs the kvmclock and the TSC of the guest from the moment they are restored, also
+    /// while the vCPUs are paused. Without restoring them again, a guest resumed some time after
+    /// its snapshot was loaded sees all that time pass at once.
+    pub fn defer_clock_restore(
+        &self,
+        state: &VmState,
+        tsc: Vec<Option<TscState>>,
+        tsc_offset_attr: bool,
+    ) {
+        *self.deferred_clock.lock().expect("Poisoned lock") = Some(DeferredClock {
+            clock: state.clock,
+            tsc,
+            tsc_offset_attr,
+        });
+    }
+
+    /// Restores the guest clocks kept by [`KvmVm::defer_clock_restore`], if any.
+    ///
+    /// The vCPUs must be paused. The first vCPU moves its TSC back to the value in the snapshot
+    /// and the other vCPUs take its TSC offset, so that they all keep running on one TSC.
+    pub fn restore_deferred_clocks(&self) -> Result<(), VmmError> {
+        let mut deferred = self.deferred_clock.lock().expect("Poisoned lock");
+        let Some(clocks) = deferred.as_ref() else {
+            return Ok(());
+        };
+        let mut offset = None;
+        for (handle, tsc) in self.vcpus_handles().iter_mut().zip(clocks.tsc.iter()) {
+            let Some(tsc) = *tsc else {
+                continue;
+            };
+            let restore = match (clocks.tsc_offset_attr, offset) {
+                (false, _) => TscRestore::Write(tsc),
+                (true, None) => TscRestore::Rewind(tsc),
+                (true, Some(offset)) => TscRestore::Offset {
+                    offset,
+                    deadline: tsc.deadline,
+                },
+            };
+            handle
+                .send_event(VcpuEvent::RestoreTsc(restore))
+                .map_err(|_| VmmError::VcpuMessage)?;
+            match handle.response_receiver().recv_timeout(RECV_TIMEOUT_SEC) {
+                Ok(VcpuResponse::RestoredTsc(restored)) => offset = offset.or(restored),
+                Ok(VcpuResponse::Error(err)) => return Err(VmmError::RestoreGuestClock(err)),
+                _ => return Err(VmmError::VcpuMessage),
+            }
+        }
+        let mut clock = clocks.clock;
+        clock.flags = 0;
+        self.fd()
+            .set_clock(&clock)
+            .map_err(|err| VmError::Arch(KvmVmError::SetClock(err)))?;
+        *deferred = None;
+        Ok(())
+    }
+
+    /// Replaces the TSC state in `vcpu_states` with the one kept by
+    /// [`KvmVm::defer_clock_restore`], if any.
+    ///
+    /// A snapshot of a restored microVM that was never resumed then carries the guest clocks of
+    /// the snapshot it was restored from.
+    pub fn apply_deferred_clocks(&self, vcpu_states: &mut [VcpuState]) {
+        let deferred = self.deferred_clock.lock().expect("Poisoned lock");
+        let Some(clocks) = deferred.as_ref() else {
+            return;
+        };
+        for (state, tsc) in vcpu_states.iter_mut().zip(clocks.tsc.iter()) {
+            if let Some(tsc) = *tsc {
+                state.set_tsc_state(tsc);
+            }
+        }
+    }
+
     /// Creates the irq chip and an in-kernel device model for the PIT.
     pub fn setup_irqchip(&self) -> Result<(), KvmVmError> {
         self.fd()
@@ -182,7 +275,14 @@ impl KvmVm {
     pub fn save_state(&self) -> Result<VmState, KvmVmError> {
         let pitstate = self.fd().get_pit2().map_err(KvmVmError::VmGetPit2)?;
 
-        let clock = self.fd().get_clock().map_err(KvmVmError::VmGetClock)?;
+        // Until a deferred restore of the guest clocks is done, the guest is still at the
+        // kvmclock of the snapshot it was restored from.
+        let deferred = self.deferred_clock.lock().expect("Poisoned lock");
+        let clock = match deferred.as_ref() {
+            Some(clocks) => clocks.clock,
+            None => self.fd().get_clock().map_err(KvmVmError::VmGetClock)?,
+        };
+        drop(deferred);
 
         let mut pic_master = kvm_irqchip {
             chip_id: KVM_IRQCHIP_PIC_MASTER,
@@ -381,5 +481,61 @@ mod tests {
         let restored_state: VmState = bitcode::deserialize(&serialized_data).unwrap();
 
         vm.restore_state(&restored_state, false).unwrap();
+    }
+
+    #[test]
+    fn test_deferred_clock_restore() {
+        use kvm_bindings::{Msrs, kvm_msr_entry};
+
+        use crate::arch::x86_64::generated::msr_index::MSR_IA32_TSC;
+        use crate::arch::x86_64::vcpu::TscState;
+        use crate::vstate::vcpu::VcpuState;
+
+        let vm = setup_vm_with_memory(0x1000);
+        vm.setup_irqchip().unwrap();
+        let state_with_tsc = |tsc| VcpuState {
+            saved_msrs: vec![
+                Msrs::from_entries(&[kvm_msr_entry {
+                    index: MSR_IA32_TSC,
+                    data: tsc,
+                    ..Default::default()
+                }])
+                .unwrap(),
+            ],
+            ..Default::default()
+        };
+        let mut states = vec![state_with_tsc(1000), state_with_tsc(1001)];
+        // A snapshot whose kvmclock is far from the one of a VM created a moment ago.
+        let mut snapshot = vm.save_state().unwrap();
+        snapshot.clock.clock = 1 << 50;
+        let clock = snapshot.clock;
+
+        // Nothing is deferred yet, so the saved state holds the current clocks.
+        vm.apply_deferred_clocks(&mut states);
+        assert_eq!(states[0].tsc_state().unwrap().tsc, 1000);
+        assert!(vm.save_state().unwrap().clock.clock < clock.clock);
+
+        // While the restore is deferred, the saved state holds the clocks to restore.
+        let tsc = TscState {
+            tsc: 42,
+            deadline: None,
+        };
+        vm.defer_clock_restore(&snapshot, vec![Some(tsc), None], false);
+        vm.apply_deferred_clocks(&mut states);
+        assert_eq!(states[0].tsc_state().unwrap().tsc, 42);
+        assert_eq!(states[1].tsc_state().unwrap().tsc, 1001);
+        assert_eq!(vm.save_state().unwrap().clock.clock, clock.clock);
+
+        // This VM has no vCPU threads, so only the kvmclock is restored: it runs on from the
+        // deferred value.
+        vm.restore_deferred_clocks().unwrap();
+        let elapsed = vm.save_state().unwrap().clock.clock - clock.clock;
+        assert!(
+            elapsed < 60_000_000_000,
+            "kvmclock is {elapsed} ns past the restored value"
+        );
+        states[0] = state_with_tsc(1000);
+        vm.apply_deferred_clocks(&mut states);
+        assert_eq!(states[0].tsc_state().unwrap().tsc, 1000);
     }
 }

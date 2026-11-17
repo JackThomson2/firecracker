@@ -775,6 +775,18 @@
                         "index": 1,
                         "type": "dword",
                         "op": "eq",
+                        "val": 1076932219,
+                        "comment": "KVM_SET_CLOCK"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
                         "val": 2154868383,
                         "comment": "KVM_GET_PIT2"
                     }
@@ -1620,6 +1632,42 @@
                         "op": "eq",
                         "val": 3221794440,
                         "comment": "KVM_GET_MSRS"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1074310793,
+                        "comment": "KVM_SET_MSRS"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1075359458,
+                        "comment": "KVM_GET_DEVICE_ATTR"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1075359457,
+                        "comment": "KVM_SET_DEVICE_ATTR"
                     }
                 ]
             },

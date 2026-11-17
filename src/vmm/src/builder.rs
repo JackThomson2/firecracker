@@ -501,9 +501,8 @@ fn synchronize_tsc_offsets(vcpus: &[crate::Vcpu]) {
 /// An `Arc` reference of the built `Vmm` is also plugged in the `EventManager`, while another
 /// is returned.
 ///
-/// On aarch64, unless `resume_vm` is set, the guest counters of the snapshot are written again
-/// when the microVM is first resumed, so that the guest does not see the time it spends paused in
-/// between.
+/// Unless `resume_vm` is set, the guest clocks of the snapshot are restored again when the
+/// microVM is first resumed, so that the guest does not see the time it spends paused in between.
 #[allow(clippy::too_many_arguments)]
 pub fn build_microvm_from_snapshot(
     instance_info: &InstanceInfo,
@@ -514,7 +513,7 @@ pub fn build_microvm_from_snapshot(
     seccomp_filters: &BpfThreadMap,
     vm_resources: &mut VmResources,
     clock_realtime: bool,
-    #[cfg_attr(target_arch = "x86_64", allow(unused_variables))] resume_vm: bool,
+    resume_vm: bool,
 ) -> Result<Arc<Mutex<Vmm>>, BuildMicrovmFromSnapshotError> {
     // Build Vmm.
     debug!("event_start: build microvm from snapshot");
@@ -588,6 +587,22 @@ pub fn build_microvm_from_snapshot(
     // Restore kvm vm state.
     #[cfg(target_arch = "x86_64")]
     kvm_vm.restore_state(&microvm_state.vm_state, clock_realtime)?;
+    // KVM runs the guest clocks from the moment they are restored. Unless the microVM is resumed
+    // right away, or is asked to catch up with real time, restore them again on resume.
+    #[cfg(target_arch = "x86_64")]
+    if !resume_vm && !clock_realtime {
+        kvm_vm.defer_clock_restore(
+            &microvm_state.vm_state,
+            microvm_state
+                .vcpu_states
+                .iter()
+                .map(|state| state.tsc_state())
+                .collect(),
+            vcpus
+                .first()
+                .is_some_and(|vcpu| vcpu.kvm_vcpu.supports_tsc_offset_attr()),
+        );
+    }
 
     // Restore the boot source config paths.
     vm_resources.boot_source.config = microvm_state.vm_info.boot_source;

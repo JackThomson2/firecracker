@@ -262,7 +262,6 @@ pub enum VmmError {
     /// Failed to message the vCPUs.
     VcpuMessage,
     /// Failed to restore the guest clock: {0}
-    #[cfg(target_arch = "aarch64")]
     RestoreGuestClock(vstate::vcpu::VcpuError),
     /// Operation not supported on {0} VMs.
     NotSupportedOnVmType(&'static str),
@@ -487,7 +486,6 @@ impl Vmm {
             .as_kvm()
             .ok_or_else(|| VmmError::NotSupportedOnVmType(self.vm.type_name()))?;
         self.device_manager.kick_virtio_devices();
-        #[cfg(target_arch = "aarch64")]
         kvm_vm.restore_deferred_clocks()?;
         kvm_vm.resume_vcpus()?;
         self.instance_info.state = VmState::Running;
@@ -568,9 +566,7 @@ impl Vmm {
             .vm
             .as_kvm()
             .ok_or_else(|| MicrovmStateError::NotAllowed("save_state requires KVM".into()))?;
-        #[allow(unused_mut)]
         let mut vcpu_states = kvm_vm.save_vcpu_states()?;
-        #[cfg(target_arch = "aarch64")]
         kvm_vm.apply_deferred_clocks(&mut vcpu_states);
         let kvm_state = kvm_vm.kvm().save_state();
         let vm_state = {
