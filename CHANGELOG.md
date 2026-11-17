@@ -112,6 +112,16 @@ and this project adheres to
 
 ### Fixed
 
+- Fixed guests seeing the time a microVM loaded with `resume_vm: false` spent
+  paused before it was resumed. KVM runs the guest clocks from the moment the
+  snapshot is loaded, so a guest resumed long after the load saw all that time
+  pass at once: its clock jumped, its expired timers all fired together and, on
+  aarch64, it reported RCU stalls on its vCPUs. Firecracker now restores the
+  guest clocks of the snapshot again on the first resume (the counters on
+  aarch64, the TSC and kvmclock on x86_64), so the guest clock continues from
+  the moment of the snapshot creation. Loads with `clock_realtime: true` are
+  unchanged.
+
 - [#6302](https://github.com/firecracker-microvm/firecracker/issues/6302): Fixed
   AMX tile state being lost after a snapshot restore. The IA32_XFD and
   IA32_XFD_ERR MSRs are now saved in snapshots. Without them a restored guest
