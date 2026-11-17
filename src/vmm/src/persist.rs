@@ -510,6 +510,7 @@ pub fn restore_from_snapshot(
         seccomp_filters,
         vm_resources,
         params.clock_realtime,
+        params.resume_vm,
     )
     .map_err(RestoreFromSnapshotError::Build)
 }

@@ -1567,6 +1567,18 @@
                         "index": 1,
                         "type": "dword",
                         "op": "eq",
+                        "val": 1074835116,
+                        "comment": "KVM_SET_ONE_REG"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
                         "val": 3221794480,
                         "comment": "KVM_GET_REG_LIST"
                     }

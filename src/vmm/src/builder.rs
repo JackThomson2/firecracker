@@ -500,6 +500,10 @@ fn synchronize_tsc_offsets(vcpus: &[crate::Vcpu]) {
 ///
 /// An `Arc` reference of the built `Vmm` is also plugged in the `EventManager`, while another
 /// is returned.
+///
+/// On aarch64, unless `resume_vm` is set, the guest counters of the snapshot are written again
+/// when the microVM is first resumed, so that the guest does not see the time it spends paused in
+/// between.
 #[allow(clippy::too_many_arguments)]
 pub fn build_microvm_from_snapshot(
     instance_info: &InstanceInfo,
@@ -510,6 +514,7 @@ pub fn build_microvm_from_snapshot(
     seccomp_filters: &BpfThreadMap,
     vm_resources: &mut VmResources,
     clock_realtime: bool,
+    #[cfg_attr(target_arch = "x86_64", allow(unused_variables))] resume_vm: bool,
 ) -> Result<Arc<Mutex<Vmm>>, BuildMicrovmFromSnapshotError> {
     // Build Vmm.
     debug!("event_start: build microvm from snapshot");
@@ -573,6 +578,11 @@ pub fn build_microvm_from_snapshot(
         let mpidrs = construct_kvm_mpidrs(&microvm_state.vcpu_states);
         // Restore kvm vm state.
         kvm_vm.restore_state(&mpidrs, &microvm_state.vm_state)?;
+        // The guest counters run from the moment the vCPU registers are restored. Unless the
+        // microVM is resumed right away, write them again on resume.
+        if !resume_vm && let Some(state) = microvm_state.vcpu_states.first() {
+            kvm_vm.defer_counter_restore(state.counters());
+        }
     }
 
     // Restore kvm vm state.

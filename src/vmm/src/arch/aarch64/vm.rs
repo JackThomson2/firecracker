@@ -1,7 +1,7 @@
 // Copyright 2025 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use kvm_bindings::{KVM_CAP_ARM_WRITABLE_IMP_ID_REGS, KVMIO, kvm_enable_cap};
 use serde::{Deserialize, Serialize};
@@ -9,13 +9,15 @@ use vmm_sys_util::errno;
 use vmm_sys_util::ioctl::ioctl_with_ref;
 use vmm_sys_util::ioctl_iow_nr;
 
-use crate::Kvm;
 use crate::arch::aarch64::gic::GicState;
+use crate::arch::aarch64::regs::Aarch64RegisterVec;
 use crate::logger::warn;
 use crate::snapshot::Persist;
 use crate::vstate::memory::{GuestMemoryExtension, GuestMemoryState};
 use crate::vstate::resources::{ResourceAllocator, ResourceAllocatorState};
+use crate::vstate::vcpu::{VcpuEvent, VcpuResponse, VcpuState};
 use crate::vstate::vm::{VmCommon, VmError};
+use crate::{Kvm, RECV_TIMEOUT_SEC, VmmError};
 
 // TODO(https://github.com/rust-vmm/kvm/pull/382): kvm-ioctls does not expose
 // `VmFd::enable_cap` on aarch64 yet; this is the same definition it uses
@@ -34,6 +36,8 @@ pub struct KvmVm {
     pub common: VmCommon,
     // On aarch64 we need to keep around the fd obtained by creating the VGIC device.
     irqchip_handle: OnceLock<crate::arch::aarch64::gic::GICDevice>,
+    // Guest counters to write again on the next resume, see `KvmVm::defer_counter_restore`.
+    deferred_counters: Mutex<Option<Aarch64RegisterVec>>,
 }
 
 /// Error type for [`KvmVm::restore_state`]
@@ -89,6 +93,7 @@ impl KvmVm {
         Ok(KvmVm {
             common,
             irqchip_handle: OnceLock::new(),
+            deferred_counters: Mutex::new(None),
         })
     }
 
@@ -145,6 +150,58 @@ impl KvmVm {
 
         Ok(())
     }
+
+    /// Keeps the guest counters of a restored snapshot, to write them again when the vCPUs are
+    /// next resumed.
+    ///
+    /// Restoring the vCPU registers starts the guest counters, and KVM keeps them counting while
+    /// the vCPUs are paused. Without writing them again, a guest resumed some time after its
+    /// snapshot was loaded sees all that time pass at once, as if every vCPU had stalled for that
+    /// long, and reports RCU stalls.
+    pub fn defer_counter_restore(&self, counters: Aarch64RegisterVec) {
+        *self.deferred_counters.lock().expect("Poisoned lock") = Some(counters);
+    }
+
+    /// Writes the guest counters kept by [`KvmVm::defer_counter_restore`], if any, on vCPU 0.
+    ///
+    /// The vCPUs must be paused. Writing the counters on one vCPU moves them for all vCPUs.
+    pub fn restore_deferred_clocks(&self) -> Result<(), VmmError> {
+        let mut deferred = self.deferred_counters.lock().expect("Poisoned lock");
+        let Some(counters) = deferred.as_ref() else {
+            return Ok(());
+        };
+        let mut handles = self.vcpus_handles();
+        let handle = handles.first_mut().ok_or(VmmError::VcpuMessage)?;
+        handle
+            .send_event(VcpuEvent::RestoreCounters(counters.clone()))
+            .map_err(|_| VmmError::VcpuMessage)?;
+        match handle.response_receiver().recv_timeout(RECV_TIMEOUT_SEC) {
+            Ok(VcpuResponse::RestoredCounters) => {}
+            Ok(VcpuResponse::Error(err)) => return Err(VmmError::RestoreGuestClock(err)),
+            _ => return Err(VmmError::VcpuMessage),
+        }
+        *deferred = None;
+        Ok(())
+    }
+
+    /// Replaces the guest counters in `vcpu_states` with the ones kept by
+    /// [`KvmVm::defer_counter_restore`], if any.
+    ///
+    /// A snapshot of a restored microVM that was never resumed then carries the guest counters of
+    /// the snapshot it was restored from.
+    pub fn apply_deferred_clocks(&self, vcpu_states: &mut [VcpuState]) {
+        let deferred = self.deferred_counters.lock().expect("Poisoned lock");
+        let Some(counters) = deferred.as_ref() else {
+            return;
+        };
+        for state in vcpu_states {
+            for mut reg in state.regs.iter_mut() {
+                if let Some(saved) = counters.iter().find(|saved| saved.id == reg.id) {
+                    reg.set_value(saved.value::<u64, 8>());
+                }
+            }
+        }
+    }
 }
 
 /// Structure holding an general specific VM state.
@@ -156,4 +213,51 @@ pub struct VmState {
     pub gic: GicState,
     /// resource allocator
     pub resource_allocator: ResourceAllocatorState,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch::aarch64::regs::{Aarch64RegisterRef, KVM_REG_ARM_TIMER_CNT, MIDR_EL1};
+    use crate::vstate::vm::tests::setup_vm_with_memory;
+
+    fn state_with(regs: &[(u64, u64)]) -> VcpuState {
+        let mut state = VcpuState::default();
+        for (id, value) in regs {
+            state
+                .regs
+                .push(Aarch64RegisterRef::new(*id, &value.to_le_bytes()));
+        }
+        state
+    }
+
+    fn reg_value(state: &VcpuState, id: u64) -> u64 {
+        state
+            .regs
+            .iter()
+            .find(|reg| reg.id == id)
+            .unwrap()
+            .value::<u64, 8>()
+    }
+
+    #[test]
+    fn test_apply_deferred_clocks() {
+        let vm = setup_vm_with_memory(0x1000);
+        let mut states = vec![
+            state_with(&[(KVM_REG_ARM_TIMER_CNT, 1000), (MIDR_EL1, 7)]),
+            state_with(&[(KVM_REG_ARM_TIMER_CNT, 1001), (MIDR_EL1, 7)]),
+        ];
+
+        // Nothing is deferred yet, so the states keep their own counters.
+        vm.apply_deferred_clocks(&mut states);
+        assert_eq!(reg_value(&states[0], KVM_REG_ARM_TIMER_CNT), 1000);
+        assert_eq!(reg_value(&states[1], KVM_REG_ARM_TIMER_CNT), 1001);
+
+        vm.defer_counter_restore(state_with(&[(KVM_REG_ARM_TIMER_CNT, 5)]).regs);
+        vm.apply_deferred_clocks(&mut states);
+        for state in &states {
+            assert_eq!(reg_value(state, KVM_REG_ARM_TIMER_CNT), 5);
+            assert_eq!(reg_value(state, MIDR_EL1), 7);
+        }
+    }
 }

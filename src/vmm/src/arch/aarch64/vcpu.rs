@@ -96,6 +96,8 @@ pub enum KvmVcpuError {
     ApplyCpuTemplate(VcpuArchError),
     /// Failed to restore the state of the vcpu: {0}
     RestoreState(VcpuArchError),
+    /// Failed to restore the guest counters: {0}
+    RestoreCounters(VcpuArchError),
     /// Failed to save the state of the vcpu: {0}
     SaveState(VcpuArchError),
     /// Found unsupported KVM_ARM_VCPU_PMU_V3 bit set in vcpu features.
@@ -288,6 +290,18 @@ impl KvmVcpu {
                 .map_err(KvmVcpuError::RestoreState)?;
         }
 
+        Ok(())
+    }
+
+    /// Writes the guest counter registers in `counters`.
+    ///
+    /// KVM keeps one offset per counter for the whole VM, so writing them on one vCPU moves the
+    /// counters of all vCPUs. No vCPU may be running.
+    pub fn restore_counters(&self, counters: &Aarch64RegisterVec) -> Result<(), KvmVcpuError> {
+        for reg in counters.iter() {
+            self.set_register(reg)
+                .map_err(KvmVcpuError::RestoreCounters)?;
+        }
         Ok(())
     }
 
@@ -521,6 +535,19 @@ pub struct VcpuState {
     pub kvi: kvm_vcpu_init,
     /// ipa for steal_time region
     pub pvtime_ipa: Option<u64>,
+}
+
+impl VcpuState {
+    /// Returns the guest counter registers saved in this state.
+    pub fn counters(&self) -> Aarch64RegisterVec {
+        let mut counters = Aarch64RegisterVec::default();
+        for reg in self.regs.iter() {
+            if matches!(reg.id, KVM_REG_ARM_TIMER_CNT | KVM_REG_ARM_PTIMER_CNT) {
+                counters.push(reg);
+            }
+        }
+        counters
+    }
 }
 
 impl Debug for VcpuState {
@@ -790,6 +817,43 @@ pub(crate) mod tests {
         assert!(!state.regs.is_empty());
         vcpu.restore_state(&state)
             .expect("Cannot restore state of vcpu");
+    }
+
+    #[test]
+    fn test_restore_counters() {
+        let (_vm, vcpu) = setup_vcpu(0x10000);
+        let counters = vcpu.save_state().unwrap().counters();
+        // The virtual counter is always saved, the physical one only by hosts that expose it.
+        assert!(counters.iter().any(|reg| reg.id == KVM_REG_ARM_TIMER_CNT));
+        assert!(
+            counters
+                .iter()
+                .all(|reg| matches!(reg.id, KVM_REG_ARM_TIMER_CNT | KVM_REG_ARM_PTIMER_CNT))
+        );
+        let saved = counters
+            .iter()
+            .find(|reg| reg.id == KVM_REG_ARM_TIMER_CNT)
+            .unwrap()
+            .value::<u64, 8>();
+
+        // Move the virtual counter far past the saved value, as a long pause would.
+        let ahead = saved + (1 << 50);
+        vcpu.fd
+            .set_one_reg(KVM_REG_ARM_TIMER_CNT, &ahead.to_le_bytes())
+            .unwrap();
+
+        vcpu.restore_counters(&counters).unwrap();
+
+        let mut bytes = [0u8; 8];
+        vcpu.fd
+            .get_one_reg(KVM_REG_ARM_TIMER_CNT, &mut bytes)
+            .unwrap();
+        let elapsed = u64::from_le_bytes(bytes) - saved;
+        // Only the time spent in this test separates the two values, far less than 2^32 ticks.
+        assert!(
+            elapsed < 1 << 32,
+            "counter is {elapsed} ticks past the saved value"
+        );
     }
 
     #[test]

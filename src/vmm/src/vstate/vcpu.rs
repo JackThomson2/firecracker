@@ -19,6 +19,8 @@ use vmm_sys_util::errno;
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::FcExitCode;
+#[cfg(target_arch = "aarch64")]
+use crate::arch::aarch64::regs::Aarch64RegisterVec;
 pub use crate::arch::{KvmVcpu, KvmVcpuConfigureError, KvmVcpuError, Peripherals, VcpuState};
 use crate::cpu_config::templates::{CpuConfiguration, GuestConfigError};
 #[cfg(feature = "gdb")]
@@ -301,6 +303,15 @@ impl Vcpu {
                     )))
                     .expect("vcpu channel unexpectedly closed");
             }
+            // Guest counters are only written while no vCPU runs.
+            #[cfg(target_arch = "aarch64")]
+            Ok(VcpuEvent::RestoreCounters(_)) => {
+                self.response_sender
+                    .send(VcpuResponse::NotAllowed(String::from(
+                        "guest counters can only be restored while paused",
+                    )))
+                    .expect("vcpu channel unexpectedly closed");
+            }
             Ok(VcpuEvent::Finish) => return VcpuRunState::Finished,
             // Unhandled exit of the other end.
             Err(TryRecvError::Disconnected) => {
@@ -369,6 +380,17 @@ impl Vcpu {
                             .expect("vcpu channel unexpectedly closed");
                     });
 
+                VcpuRunState::Paused
+            }
+            #[cfg(target_arch = "aarch64")]
+            Ok(VcpuEvent::RestoreCounters(counters)) => {
+                let response = match self.kvm_vcpu.restore_counters(&counters) {
+                    Ok(()) => VcpuResponse::RestoredCounters,
+                    Err(err) => VcpuResponse::Error(VcpuError::VcpuResponse(err)),
+                };
+                self.response_sender
+                    .send(response)
+                    .expect("vcpu channel unexpectedly closed");
                 VcpuRunState::Paused
             }
             Ok(VcpuEvent::Finish) => VcpuRunState::Finished,
@@ -536,6 +558,9 @@ pub enum VcpuEvent {
     SaveState,
     /// Event to dump CPU configuration of a paused Vcpu.
     DumpCpuConfig,
+    /// Event to write the given guest counter registers on a paused Vcpu.
+    #[cfg(target_arch = "aarch64")]
+    RestoreCounters(Aarch64RegisterVec),
 }
 
 /// List of responses that the Vcpu reports.
@@ -554,6 +579,9 @@ pub enum VcpuResponse {
     SavedState(Box<VcpuState>),
     /// Vcpu is in the state where CPU config is dumped.
     DumpedCpuConfig(Box<CpuConfiguration>),
+    /// Guest counter registers are written.
+    #[cfg(target_arch = "aarch64")]
+    RestoredCounters,
 }
 
 impl fmt::Debug for VcpuResponse {
@@ -567,6 +595,8 @@ impl fmt::Debug for VcpuResponse {
             Error(err) => write!(f, "VcpuResponse::Error({:?})", err),
             NotAllowed(reason) => write!(f, "VcpuResponse::NotAllowed({})", reason),
             DumpedCpuConfig(_) => write!(f, "VcpuResponse::DumpedCpuConfig"),
+            #[cfg(target_arch = "aarch64")]
+            RestoredCounters => write!(f, "VcpuResponse::RestoredCounters"),
         }
     }
 }
@@ -837,6 +867,8 @@ pub(crate) mod tests {
             match self {
                 Paused | Resumed | Exited(_) => (),
                 Error(_) | NotAllowed(_) | SavedState(_) | DumpedCpuConfig(_) => (),
+                #[cfg(target_arch = "aarch64")]
+                RestoredCounters => (),
             };
             match (self, other) {
                 (Paused, Paused) | (Resumed, Resumed) => true,
@@ -844,6 +876,8 @@ pub(crate) mod tests {
                 (NotAllowed(_), NotAllowed(_))
                 | (SavedState(_), SavedState(_))
                 | (DumpedCpuConfig(_), DumpedCpuConfig(_)) => true,
+                #[cfg(target_arch = "aarch64")]
+                (RestoredCounters, RestoredCounters) => true,
                 (Error(err), Error(other_err)) => {
                     format!("{:?}", err) == format!("{:?}", other_err)
                 }
@@ -1171,6 +1205,41 @@ pub(crate) mod tests {
         queue_event_expect_response(
             &mut vcpu_handle,
             VcpuEvent::DumpCpuConfig,
+            VcpuResponse::NotAllowed(String::new()),
+        );
+
+        vcpu_handle.send_event(VcpuEvent::Finish).unwrap();
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_vcpu_restore_counters_events() {
+        let (_vm, mut vcpu_handle, _) = vcpu_configured_for_boot();
+
+        vcpu_handle
+            .send_event(VcpuEvent::SaveState)
+            .expect("failed to send event to vcpu");
+        let counters = match vcpu_handle
+            .response_receiver()
+            .recv_timeout(RECV_TIMEOUT_SEC)
+            .expect("did not receive event response from vcpu")
+        {
+            VcpuResponse::SavedState(state) => state.counters(),
+            _ => panic!("unexpected response"),
+        };
+
+        // Counters can be restored on a paused vCPU.
+        queue_event_expect_response(
+            &mut vcpu_handle,
+            VcpuEvent::RestoreCounters(counters.clone()),
+            VcpuResponse::RestoredCounters,
+        );
+
+        // But not on a running one.
+        queue_event_expect_response(&mut vcpu_handle, VcpuEvent::Resume, VcpuResponse::Resumed);
+        queue_event_expect_response(
+            &mut vcpu_handle,
+            VcpuEvent::RestoreCounters(counters),
             VcpuResponse::NotAllowed(String::new()),
         );
 

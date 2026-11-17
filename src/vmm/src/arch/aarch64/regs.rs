@@ -110,6 +110,13 @@ arm64_sys_reg!(SYS_CNTPCT_EL0, 3, 3, 14, 0, 1);
 // https://elixir.bootlin.com/linux/v6.12.6/source/arch/arm64/include/uapi/asm/kvm.h#L259
 arm64_sys_reg!(KVM_REG_ARM_PTIMER_CNT, 3, 3, 14, 0, 1);
 
+// Virtual Timer count register, as KVM exposes it.
+// KVM swapped the encodings of the virtual counter and of the virtual timer compare value by
+// mistake and kept them as ABI, so this id carries the encoding of CNTV_CVAL_EL0 (see
+// SYS_CNTV_CVAL_EL0).
+// https://elixir.bootlin.com/linux/v6.12.6/source/arch/arm64/include/uapi/asm/kvm.h
+arm64_sys_reg!(KVM_REG_ARM_TIMER_CNT, 3, 3, 14, 3, 2);
+
 // Translation Table Base Register
 // https://developer.arm.com/documentation/ddi0595/2021-03/AArch64-Registers/TTBR1-EL1--Translation-Table-Base-Register-1--EL1-
 arm64_sys_reg!(TTBR1_EL1, 3, 0, 2, 0, 1);
