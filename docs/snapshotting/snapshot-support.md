@@ -541,6 +541,13 @@ TSC-based clock source (for example `tsc`). Otherwise KVM does not save the
 realtime clock in the snapshot, and loading it with `clock_realtime: true` fails
 with `clock_realtime requested but not present in the snapshot state`.
 
+The guest clock also leaves out the time between loading a snapshot with
+`resume_vm: false` and resuming the microVM: Firecracker restores the guest
+clocks of the snapshot again on the first resume (the counters on `aarch64`, the
+TSC and kvmclock on `x86_64`). Otherwise a guest resumed long after the load
+would see all that time pass at once. This does not apply to loads with
+`clock_realtime` set, which ask for the guest clock to catch up with real time.
+
 #### Overriding host resources
 
 If a host resource is at a different location when the snapshot is loaded, for
