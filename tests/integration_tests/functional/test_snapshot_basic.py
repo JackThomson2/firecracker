@@ -982,3 +982,45 @@ def test_clocksource_snapshot_restore(
     if clocksource == "tsc":
         check_guest_monotonic_across_vcpus(restored_vm)
         assert read_guest_clocksource(restored_vm) == "tsc"
+
+
+@pytest.mark.parametrize("clocksource", CLOCK_SOURCES)
+def test_paused_restore_hides_pause(uvm, microvm_factory, clocksource):
+    """Check that a microVM loaded paused does not see the time until its resume.
+
+    KVM runs the guest clocks from the moment the snapshot is loaded. Firecracker
+    restores them again on the first resume, so the guest clock continues from
+    the snapshot however long the microVM stayed paused, rather than jumping by
+    that long.
+    """
+    boot_args = (
+        "reboot=k panic=1 nomodule swiotlb=noforce console=ttyS0"
+        f" clocksource={clocksource}"
+    )
+
+    vm = uvm
+    vm.spawn()
+    vm.basic_config(vcpu_count=2, mem_size_mib=256, boot_args=boot_args)
+    vm.add_net_iface()
+    vm.start()
+
+    if read_guest_clocksource(vm) != clocksource:
+        pytest.skip(f"Clocksource {clocksource} not available")
+
+    guest_before = read_guest_monotonic(vm)
+    snapshot = vm.snapshot_full()
+    vm.kill()
+
+    restored_vm = microvm_factory.build()
+    restored_vm.spawn()
+    restored_vm.restore_from_snapshot(snapshot, resume=False)
+    time.sleep(SLEEP_SECONDS)
+    restored_vm.resume()
+
+    guest_delta = read_guest_monotonic(restored_vm) - guest_before
+    assert (
+        0 <= guest_delta < 5.0
+    ), f"Guest clock moved {guest_delta:.3f}s across a {SLEEP_SECONDS}s pause"
+
+    check_guest_monotonic_across_vcpus(restored_vm)
+    assert read_guest_clocksource(restored_vm) == clocksource
